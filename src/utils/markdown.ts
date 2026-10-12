@@ -1,0 +1,181 @@
+/**
+ * 轻量 Markdown 渲染（v2.7.0.6 重写）。
+ *
+ * 之前是一串正则逐行替换：标题 / 粗斜体 / 列表项各自换成标签，段落靠 `\n\n` 硬切——
+ * 表格根本不认（模型一画 `| 属性 | 加点 |` 竖线就原样露出来，用户上报「富文本表格没被排版」），
+ * 列表项也没有 ul/ol 成组。这里改成按块解析：
+ *   - 块级：标题 / 分割线 / 引用 / 围栏代码 / 表格 / 有序无序列表 / 段落
+ *   - 行内：粗体 / 斜体 / 删除线 / 行内代码 / 行首【说话人】
+ *   - 流式友好：半截输入也能出合法 HTML（半截表格先按段落画，分隔行一到就成表）
+ *
+ * 输出是**完整的块级 HTML**（自带 <p>），调用方直接 DOMPurify.sanitize 后塞进去，
+ * 不要再在外面包一层 <p>。类名兼顾 Tailwind 工具类与 md-* 语义类（index.css 按频道换装）。
+ */
+
+const esc = (s: string): string =>
+  s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+/** 行内代码的占位符：私用区字符，模型输出里不会出现（写成转义，文件保持纯文本） */
+const PH = '\uE000';
+
+/** 行内元素：先转义再替换，保证模型输出里的尖括号不会变成标签 */
+function inline(raw: string): string {
+  let t = esc(raw);
+  // 行内代码优先（里面的 * _ 不该再被当作强调）
+  const codes: string[] = [];
+  t = t.replace(/`([^`\n]+)`/g, (_m, c: string) => {
+    codes.push(`<code class="md-code">${c}</code>`);
+    return `${PH}${codes.length - 1}${PH}`;
+  });
+  t = t.replace(/\*\*([^*\n]+?)\*\*/g, '<strong>$1</strong>');
+  t = t.replace(/__([^_\n]+?)__/g, '<strong>$1</strong>');
+  // 斜体：星号前不能是字母数字或另一个星号（避免把 "2*3*4" 或残缺粗体当斜体）
+  t = t.replace(/(^|[^*\w])\*([^*\n]+?)\*(?!\*)/g, '$1<em>$2</em>');
+  t = t.replace(/~~([^~\n]+?)~~/g, '<del>$1</del>');
+  // 链接只留文字：总结 / 解读里的链接没有点击价值，也避免 DOMPurify 属性策略之争
+  t = t.replace(/\[([^\]\n]+)\]\((?:[^)\n]*)\)/g, '$1');
+  // 行首的【说话人】（双子审官之类的对话体）
+  t = t.replace(/^【([^】\n]{1,10})】/, '<span class="md-speaker">【$1】</span>');
+  t = t.replace(/\uE000(\d+)\uE000/g, (_m, i: string) => codes[Number(i)] ?? '');
+  return t;
+}
+
+const RE_HEADING = /^(#{1,6})\s+(.+?)\s*#*\s*$/;
+const RE_HR = /^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/;
+const RE_FENCE = /^\s*```/;
+const RE_QUOTE = /^\s*>\s?(.*)$/;
+const RE_UL = /^\s*[-*+•]\s+(.+)$/;
+const RE_OL = /^\s*(\d+)[.、)]\s+(.+)$/;
+const RE_TABLE_ROW = /^\s*\|?.*\|.*$/;
+const RE_TABLE_SEP = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
+const RE_INDENT_CONT = /^\s{2,}(\S.*)$/;
+
+const H_CLASS: Record<number, string> = {
+  1: 'md-h1 text-xl font-black mt-5 mb-2 text-primary',
+  2: 'md-h2 text-lg font-extrabold mt-5 mb-2 text-primary',
+  3: 'md-h3 text-base font-bold mt-4 mb-1 text-primary',
+};
+
+function splitCells(line: string): string[] {
+  let s = line.trim();
+  if (s.startsWith('|')) s = s.slice(1);
+  if (s.endsWith('|')) s = s.slice(0, -1);
+  // 转义的竖线 \| 不当分隔。手动切，不用后行断言（iOS 16.4 以前的 WebKit 不认 (?<!…)，整个模块会解析失败）
+  const cells: string[] = [];
+  let cur = '';
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '\\' && s[i + 1] === '|') { cur += '|'; i++; continue; }
+    if (ch === '|') { cells.push(cur.trim()); cur = ''; continue; }
+    cur += ch;
+  }
+  cells.push(cur.trim());
+  return cells;
+}
+
+function alignOf(sep: string): ('left' | 'center' | 'right' | null) {
+  const s = sep.trim();
+  const l = s.startsWith(':'), r = s.endsWith(':');
+  if (l && r) return 'center';
+  if (r) return 'right';
+  if (l) return 'left';
+  return null;
+}
+
+export function renderMarkdown(text: string): string {
+  const lines = text.replace(/\r\n?/g, '\n').split('\n');
+  const out: string[] = [];
+  let i = 0;
+  const n = lines.length;
+
+  while (i < n) {
+    const line = lines[i];
+
+    if (!line.trim()) { i++; continue; }
+
+    // 围栏代码
+    if (RE_FENCE.test(line)) {
+      const buf: string[] = [];
+      i++;
+      while (i < n && !RE_FENCE.test(lines[i])) { buf.push(lines[i]); i++; }
+      if (i < n) i++; // 吃掉收尾 ```（流式半截时可能没有）
+      out.push(`<pre class="md-pre"><code>${esc(buf.join('\n'))}</code></pre>`);
+      continue;
+    }
+
+    // 标题
+    const h = RE_HEADING.exec(line);
+    if (h) {
+      const level = Math.min(3, h[1].length);
+      out.push(`<h${level} class="${H_CLASS[level]}">${inline(h[2])}</h${level}>`);
+      i++;
+      continue;
+    }
+
+    // 分割线
+    if (RE_HR.test(line)) { out.push('<hr class="md-hr"/>'); i++; continue; }
+
+    // 引用（连续 > 行合并）
+    if (RE_QUOTE.test(line)) {
+      const buf: string[] = [];
+      while (i < n && RE_QUOTE.test(lines[i])) { buf.push(RE_QUOTE.exec(lines[i])![1]); i++; }
+      out.push(`<blockquote class="md-quote border-l-2 border-primary/40 pl-3 italic text-gray-600 dark:text-gray-400 my-2">${buf.map(inline).join('<br/>')}</blockquote>`);
+      continue;
+    }
+
+    // 表格：本行像表头 + 下一行是分隔行
+    if (RE_TABLE_ROW.test(line) && i + 1 < n && RE_TABLE_SEP.test(lines[i + 1])) {
+      const head = splitCells(line);
+      const aligns = splitCells(lines[i + 1]).map(alignOf);
+      i += 2;
+      const rows: string[][] = [];
+      while (i < n && lines[i].trim() && lines[i].includes('|')) { rows.push(splitCells(lines[i])); i++; }
+      const cols = head.length;
+      const styleOf = (ci: number) => (aligns[ci] ? ` style="text-align:${aligns[ci]}"` : '');
+      const th = head.map((c, ci) => `<th${styleOf(ci)}>${inline(c)}</th>`).join('');
+      const tb = rows.map(r => {
+        const cells = Array.from({ length: cols }, (_v, ci) => `<td${styleOf(ci)}>${inline(r[ci] ?? '')}</td>`).join('');
+        return `<tr>${cells}</tr>`;
+      }).join('');
+      out.push(`<div class="md-table-wrap"><table class="md-table"><thead><tr>${th}</tr></thead>${tb ? `<tbody>${tb}</tbody>` : ''}</table></div>`);
+      continue;
+    }
+
+    // 列表（同类连续项成组；缩进续行并入上一项）
+    if (RE_UL.test(line) || RE_OL.test(line)) {
+      const ordered = RE_OL.test(line);
+      const re = ordered ? RE_OL : RE_UL;
+      const items: string[] = [];
+      while (i < n) {
+        const m = re.exec(lines[i]);
+        if (m) { items.push(ordered ? m[2] : m[1]); i++; continue; }
+        const cont = RE_INDENT_CONT.exec(lines[i]);
+        if (cont && items.length && !RE_UL.test(lines[i]) && !RE_OL.test(lines[i])) {
+          items[items.length - 1] += ' ' + cont[1];
+          i++;
+          continue;
+        }
+        break;
+      }
+      const tag = ordered ? 'ol' : 'ul';
+      const cls = ordered ? 'md-ol list-decimal' : 'md-ul list-disc';
+      out.push(`<${tag} class="${cls} ml-5 my-1.5 space-y-0.5">${items.map(it => `<li>${inline(it)}</li>`).join('')}</${tag}>`);
+      continue;
+    }
+
+    // 段落：连续的普通行
+    const buf: string[] = [];
+    while (i < n) {
+      const l = lines[i];
+      if (!l.trim()) break;
+      if (RE_HEADING.test(l) || RE_HR.test(l) || RE_QUOTE.test(l) || RE_FENCE.test(l) || RE_UL.test(l) || RE_OL.test(l)) break;
+      if (RE_TABLE_ROW.test(l) && i + 1 < n && RE_TABLE_SEP.test(lines[i + 1])) break;
+      buf.push(l);
+      i++;
+    }
+    if (buf.length) out.push(`<p class="md-p mb-2">${buf.map(inline).join('<br/>')}</p>`);
+    else i++; // 防御：不该到这里，但别死循环
+  }
+
+  return out.join('');
+}

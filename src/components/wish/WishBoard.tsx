@@ -1,0 +1,333 @@
+/**
+ * WishBoard —— 首页「今日任务 ⇄ 愿望」里的愿望面（PRD_V2.6 §1 / §3）。
+ *
+ * 为什么是一块共享件而不是各频道各写一份：
+ *   三个 Dashboard 变体（中性 / P3 / P5 / P4）的今日任务卡外壳差异很大，
+ *   但**愿望面的信息结构是同一套**（窄条 → 列表 → 添加）。
+ *   所以外壳留给宿主，内容收在这里，靠 skin 参数吃频道差分。
+ *
+ * 内容自上而下：
+ *   ① 弹幕投稿窄条（仅 terminalDanmakuTokens > 0 时显形，§3）
+ *   ② 愿望列表：标题 + 「已完成相关任务 N 次」+ ⋯ 二级菜单
+ *   ③ 添加一行
+ *
+ * 愿望**不进今日任务列表**——它是"远处的灯"，不是今天要打的卡。
+ */
+import { useEffect, useMemo, useState } from 'react';
+import { motion, AnimatePresence } from 'motion/react';
+import { useAppStore } from '@/store';
+import type { Wish } from '@/types';
+import { DanmakuCompose } from '@/components/danmaku/DanmakuCompose';
+import { pendingDanmakuCount } from '@/services/danmakuWatch';
+import { WishFulfillDialog } from './WishFulfillDialog';
+import { WishPanel } from './WishPanel';
+import { WishRing } from './WishRing';
+import { BufferedTextInput } from '@/components/ui/BufferedTextInput';
+import { triggerLightHaptic } from '@/utils/feedback';
+
+export interface WishBoardSkin {
+  /** 正文字色 */
+  ink: string;
+  /** 次级字色 */
+  sub: string;
+  /** 强调色（计数、加号） */
+  accent: string;
+  /** 行分隔线 */
+  line: string;
+  /** 行底（列表项背景） */
+  rowBg: string;
+  /**
+   * 「直接落在舞台上」的字色 / 线色——空态那段说明、底部「＋ 记下一个愿望」。
+   *
+   * 这两处和上面那批不是一个衬底：ink/sub/line 是画在 rowBg 那张卡**里面**的，
+   * 舞台底则是页面自己的底色。黄频道夜间正好把这两者掰成了相反极性——愿望行仍是
+   * 奶油卡（inline background 不吃夜间毯式规则），舞台却翻成深紫，于是同一个
+   * sub=#131313 在卡里合适、在舞台上直接隐身（用户上报「愿望页字是黑的」）。
+   * 缺省回落到 ink/sub/line，只有需要区分的频道才覆写。
+   */
+  stageSub?: string;
+  stageLine?: string;
+  /** 直角/斜切等形状：留给宿主传 clipPath，缺省圆角 */
+  rowClip?: string;
+  radius: number;
+}
+
+export function WishBoard({ skin }: { skin: WishBoardSkin }) {
+  const wishes = useAppStore(s => s.wishes);
+  const settings = useAppStore(s => s.settings);
+  const addWish = useAppStore(s => s.addWish);
+  const getWishRing = useAppStore(s => s.getWishRing);
+  const setWishStatus = useAppStore(s => s.setWishStatus);
+  const deleteWish = useAppStore(s => s.deleteWish);
+
+  const [draft, setDraft] = useState('');
+  const [adding, setAdding] = useState(false);
+  const [menuFor, setMenuFor] = useState<string | null>(null);
+  const [fulfilling, setFulfilling] = useState<Wish | null>(null);
+  const [composeOpen, setComposeOpen] = useState(false);
+  const [panelFor, setPanelFor] = useState<string | null>(null);
+
+  const stageSub = skin.stageSub ?? skin.sub;
+  const stageLine = skin.stageLine ?? skin.line;
+
+  const tokens = settings.terminalDanmakuTokens ?? 0;
+  // 在审条数存在 localStorage，不进 store——它是本机自查用的凭据表，
+  // 不该上云也不该进备份（见 services/danmakuWatch.ts）。
+  // 靠 composeOpen 做刷新触发点：投完稿关窗时重算一次，够用且不必轮询。
+  const pendingReview = useMemo(() => pendingDanmakuCount(), [composeOpen]);
+  // 只显示"在途"愿望；实现/归档的进归档区（Menu → 归档）
+  const active = wishes.filter(w => w.status === 'active' && !w.parentId);
+
+  const submit = async () => {
+    const t = draft.trim();
+    if (!t) return;
+    await addWish({ title: t, source: 'manual' });
+    setDraft('');
+    setAdding(false);
+    triggerLightHaptic();
+  };
+
+  return (
+    <div className="space-y-2">
+      {/* ① 弹幕投稿窄条（§3）——有机会、或有在审的稿子时才占位，平时不打扰。
+          在审条目也要显形：投完就没下文的话，用户不知道那条去哪了（FS4 C 路线） */}
+      {(tokens > 0 || pendingReview > 0) && (
+        <button
+          type="button"
+          onClick={() => setComposeOpen(true)}
+          className="flex w-full items-center gap-2 px-3 py-1.5 text-left"
+          style={{
+            background: skin.rowBg,
+            border: `1px solid ${skin.accent}`,
+            borderRadius: skin.radius,
+            clipPath: skin.rowClip,
+          }}
+        >
+          <span className="shrink-0 text-[13px]" style={{ color: skin.accent }}>✦</span>
+          <span className="min-w-0 flex-1 truncate text-[11px] font-bold" style={{ color: skin.ink }}>
+            {tokens > 0
+              ? `你还有 ${tokens} 次机会鼓励同样努力的人`
+              : `${pendingReview} 条鼓励正在审核中`}
+            {tokens > 0 && pendingReview > 0 && (
+              <span style={{ color: skin.sub }}> · {pendingReview} 条审核中</span>
+            )}
+          </span>
+          {tokens > 0 && <span className="shrink-0 text-[10px] font-black" style={{ color: skin.accent }}>去写 ›</span>}
+        </button>
+      )}
+
+      {/* ② 愿望列表 */}
+      {active.length === 0 ? (
+        <p className="px-1 py-5 text-center text-[12px] leading-relaxed" style={{ color: stageSub }}>
+          还没有愿望。<br />
+          写下一个远一点的——记录时把事挂上去，就能看见自己在靠近它。
+        </p>
+      ) : (
+        active.map((w) => {
+          // ring 内部已经数过一遍挂载记录，别再调一次 getWishProgress——
+          // 那是个 O(全部活动) 的扫描，每条愿望每帧跑两遍纯属浪费
+          const ring = getWishRing(w.id);
+          const times = ring.times;
+          const stepsTotal = w.steps?.length ?? 0;
+          return (
+            <div
+              key={w.id}
+              className="relative px-3 py-2"
+              style={{ background: skin.rowBg, borderRadius: skin.radius, clipPath: skin.rowClip }}
+            >
+              <div className="flex items-start gap-2">
+                {/* 距离环：点它进二级面板（拆子任务 / 重新评估）。
+                    环本身就是这个功能的招牌——「看得见自己在靠近」（§1 核心体验目标） */}
+                <button
+                  type="button"
+                  onClick={() => setPanelFor(w.id)}
+                  aria-label={`打开「${w.title}」的进度面板`}
+                  className="mt-0.5 shrink-0"
+                >
+                  <WishRing
+                    pct={ring.pct}
+                    evaluated={ring.evaluated}
+                    size={36}
+                    color={skin.accent}
+                    track={skin.line}
+                    ink={skin.ink}
+                  />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPanelFor(w.id)}
+                  className="min-w-0 flex-1 text-left"
+                >
+                  <div className="truncate text-[14px] font-black" style={{ color: skin.ink }}>{w.title}</div>
+                  {/* 副行按"有没有东西可说"三分支。
+                      别把「还没有记录挂到这里」和「子任务 1/3」拼在一起——
+                      前半句在说这条愿望是空的，后半句在说它有进展，读起来自相矛盾 */}
+                  <div className="mt-0.5 text-[11px] font-bold" style={{ color: times > 0 ? skin.accent : skin.sub }}>
+                    {times > 0 ? (
+                      <>
+                        已完成相关任务 {times} 次
+                        {stepsTotal > 0 && (
+                          <span style={{ color: skin.sub }}> · 子任务 {ring.done}/{stepsTotal}</span>
+                        )}
+                      </>
+                    ) : stepsTotal > 0 ? (
+                      `子任务 ${ring.done}/${stepsTotal}`
+                    ) : (
+                      '还没有记录挂到这里'
+                    )}
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMenuFor(menuFor === w.id ? null : w.id)}
+                  aria-label={`「${w.title}」的操作`}
+                  className="shrink-0 px-1.5 py-0.5 text-[15px] font-black leading-none"
+                  style={{ color: skin.sub }}
+                >
+                  ⋯
+                </button>
+              </div>
+
+              <AnimatePresence>
+                {menuFor === w.id && (
+                  <motion.div
+                    initial={{ opacity: 0, height: 0 }}
+                    animate={{ opacity: 1, height: 'auto' }}
+                    exit={{ opacity: 0, height: 0 }}
+                    transition={{ duration: 0.16 }}
+                    className="overflow-hidden"
+                  >
+                    <div className="mt-2 flex gap-1.5 border-t pt-2" style={{ borderColor: skin.line }}>
+                      <button
+                        type="button"
+                        onClick={() => { setMenuFor(null); setPanelFor(w.id); }}
+                        className="flex-1 py-1.5 text-[11px] font-black"
+                        style={{ border: `1px solid ${skin.accent}`, color: skin.accent, borderRadius: skin.radius }}
+                      >
+                        拆子任务
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => { setMenuFor(null); setFulfilling(w); }}
+                        className="flex-1 py-1.5 text-[11px] font-black"
+                        style={{ background: skin.accent, color: skin.rowBg, borderRadius: skin.radius }}
+                      >
+                        愿望已实现
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => { setMenuFor(null); void setWishStatus(w.id, 'archived'); }}
+                        className="flex-1 py-1.5 text-[11px] font-black"
+                        style={{ border: `1px solid ${skin.line}`, color: skin.sub, borderRadius: skin.radius }}
+                      >
+                        收起
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => { setMenuFor(null); void deleteWish(w.id); }}
+                        className="shrink-0 px-3 py-1.5 text-[11px] font-black"
+                        style={{ border: `1px solid ${skin.line}`, color: skin.sub, borderRadius: skin.radius }}
+                      >
+                        删除
+                      </button>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+          );
+        })
+      )}
+
+      {/* ③ 添加 */}
+      {adding ? (
+        <div className="flex gap-1.5">
+          <BufferedTextInput
+            value={draft}
+            onCommit={setDraft}
+            debounceMs={150}
+            placeholder="想实现的事…"
+            className="min-w-0 flex-1 px-3 py-2 text-[13px] font-bold outline-none"
+            // 输入框跟愿望行同一张纸（rowBg + ink），不然它在舞台上是块没有底的透明区
+            style={{ background: skin.rowBg, color: skin.ink, borderRadius: skin.radius }}
+            aria-label="愿望标题"
+          />
+          <button
+            type="button"
+            onClick={() => void submit()}
+            className="shrink-0 px-3 py-2 text-[11px] font-black"
+            style={{ background: skin.accent, color: skin.rowBg, borderRadius: skin.radius }}
+          >
+            记下
+          </button>
+          <button
+            type="button"
+            onClick={() => { setAdding(false); setDraft(''); }}
+            className="shrink-0 px-2 py-2 text-[11px] font-black"
+            style={{ color: stageSub }}
+          >
+            ×
+          </button>
+        </div>
+      ) : (
+        <button
+          type="button"
+          onClick={() => setAdding(true)}
+          className="w-full py-2 text-[11px] font-black"
+          style={{ border: `1px dashed ${stageLine}`, color: stageSub, borderRadius: skin.radius }}
+        >
+          ＋ 记下一个愿望
+        </button>
+      )}
+
+      <WishFulfillDialog wish={fulfilling} onClose={() => setFulfilling(null)} />
+      <WishPanel wishId={panelFor} onClose={() => setPanelFor(null)} />
+      <DanmakuCompose isOpen={composeOpen} onClose={() => setComposeOpen(false)} />
+    </div>
+  );
+}
+
+/**
+ * 任务页的「今日任务 ⇄ 愿望」开关。
+ * 第 17 批（用户口径「愿望容易被搞错」）：不再记住——以前落在 settings.homeTaskPane，切去别的页再回来还停在愿望面，
+ * 用户以为今日任务没了。现在只在这次停留里有效：离开任务页（页面卸载，或切到别的页）再回来一律是今日任务。
+ * settings.homeTaskPane 留着不读（老存档里有这个字段，无害）。
+ */
+export function useWishPane() {
+  const wishes = useAppStore(s => s.wishes);
+  const currentPage = useAppStore(s => s.currentPage);
+  const [isWishPane, setWishPane] = useState(false);
+  // 任务页常驻挂载时（行动页的子页切换不一定卸载）也要回到今日任务
+  useEffect(() => { if (currentPage !== 'todos') setWishPane(false); }, [currentPage]);
+  return {
+    isWishPane,
+    togglePane: () => setWishPane(v => !v),
+    paneLabel: isWishPane ? '愿望（点击切回今日任务）' : '今日任务（点击切到愿望）',
+    activeWishCount: wishes.filter(w => w.status === 'active' && !w.parentId).length,
+  };
+}
+
+/** 频道 → WishBoard 皮。与各页卡面同源，避免愿望面在红/黄里读成「一块外来的灰卡」。 */
+export function wishSkinFor(channel: 'p5' | 'p4' | 'p3' | 'neutral'): WishBoardSkin {
+  switch (channel) {
+    case 'p5':
+      return { ink: '#050505', sub: '#494540', accent: '#c00008', line: 'rgba(5,5,5,0.22)',
+               rowBg: '#f0e9df', radius: 0,
+               rowClip: 'polygon(2px 0, 100% 1.5px, calc(100% - 2px) 100%, 0 calc(100% - 1.5px))' };
+    case 'p4':
+      // stage* 走两个**只在夜间声明**的变量，回落值即白天值：
+      // --p4-menu-ink 是用户上一轮为黄频道夜间点名的浅蓝（#a9c6ff），--p4-rule 是配套的浅横线。
+      return { ink: '#131313', sub: 'rgba(19,19,19,0.6)', accent: 'var(--p4-orange, #f9a11b)',
+               line: 'rgba(19,19,19,0.16)', rowBg: '#fff9e3', radius: 14,
+               stageSub: 'var(--p4-menu-ink, rgba(19,19,19,0.6))',
+               stageLine: 'var(--p4-rule, rgba(19,19,19,0.16))' };
+    case 'p3':
+      return { ink: 'var(--p3r-ink, #0a1230)', sub: 'var(--p3r-ink-soft, #3d4a66)',
+               accent: 'var(--p3r-blue, #1b57ff)', line: 'rgba(147,190,222,0.5)',
+               rowBg: 'var(--p3r-panel, #ffffff)', radius: 12 };
+    default:
+      return { ink: 'var(--ui-surface-ink, #111827)', sub: 'var(--ui-muted, #6b7280)',
+               accent: 'var(--color-primary)', line: 'var(--ui-line, #e5e7eb)',
+               rowBg: 'var(--ui-surface, #ffffff)', radius: 12 };
+  }
+}

@@ -1,0 +1,214 @@
+/**
+ * StarChartP3 —— 数据驱动的五角星象仪（角长 = 等级，升级即"长角"）。
+ *
+ * 原为 DashboardP3 的局部件（白日水面版）；FS2.2 起提取共用：
+ *   · 蓝/粉（p3 频道）→ 走默认调色板，即 P3R 变量族（粉主题在 CSS 层换过色）；
+ *   · 自定义主题（neutral）→ 传 palette 覆写成 --color-primary 派生的中性色，
+ *     取代此前那套过时的深色舞台 StarChart（用户口径：把 P3 的迁过来）。
+ *
+ * 几何：正立五角星，"上窄下宽"的透视感由容器 skewX + scaleY 承担（不用 3D）。
+ * 铁律照旧：SVG 装饰 aria-hidden，五个角是完整 button（命中区），标签反变换回正。
+ */
+import { useSideLabelClamp } from '@/components/starLabelClamp';
+import type { MouseEvent as ReactMouseEvent } from 'react';
+import type { AttributeId } from '@/types';
+import { mixSrgb, paint } from '@/utils/cssColor';
+
+const STAR_CX = 180;
+const STAR_CY = 178;
+const STAR_R = 150;
+const rad = (d: number) => (d * Math.PI) / 180;
+const armAngle = (i: number) => -90 + i * 72;
+const STAR_SKEW = -13;    // 平行四边形斜切：上边右移、下边左移（下左上右）
+const STAR_SCALEY = 1.16; // 整体高度拉伸一点
+const pt = (ang: number, r: number): [number, number] => [STAR_CX + r * Math.cos(rad(ang)), STAR_CY + r * Math.sin(rad(ang))];
+
+/**
+ * 五角星路径：radii[i] 为第 i 个外角半径；凹点随相邻两角联动，保持尖锐星形。
+ *
+ * 循环恒定跑 5 次，而 radii 是从 items 映射来的——**items 不足 5 条时
+ * radii[i] 是 undefined，算出来整条路径全是 NaN**，浏览器直接拒绝绘制并报
+ * `<path> attribute d: Expected number, "MNaN,NaN…"`。
+ * 实际触发点：导入备份时 initializeApp 会先清表再写回，中间那一帧属性表是空的
+ * （上线审计用 setAttribute 钩子抓到，一次导入报两条）。新建档的首帧同理。
+ * 这里对缺位取 0.24R 保底——画一颗最小星，比不画和报错都体面。
+ */
+const MIN_R = STAR_R * 0.24;
+const starPathAt = (radii: number[]) => {
+  const r = (i: number) => (Number.isFinite(radii[i]) ? radii[i] : MIN_R);
+  let d = '';
+  for (let i = 0; i < 5; i++) {
+    const [ox, oy] = pt(armAngle(i), r(i));
+    const innerR = ((r(i) + r((i + 1) % 5)) / 2) * 0.4;
+    const [ix, iy] = pt(armAngle(i) + 36, innerR);
+    d += `${i === 0 ? 'M' : 'L'}${ox.toFixed(1)},${oy.toFixed(1)} L${ix.toFixed(1)},${iy.toFixed(1)} `;
+  }
+  return `${d}Z`;
+};
+
+/** 等级 → 外角半径：保底 0.24R 起步，满级顶到底星轮廓（升级即可见地"长角"） */
+const levelRadius = (level: number, maxLevel: number) =>
+  STAR_R * (0.24 + 0.76 * Math.max(0, Math.min(1, level / Math.max(1, maxLevel))));
+
+export interface StarItem {
+  id: AttributeId;
+  name: string;
+  level: number;
+  maxLevel: number;
+  /** 满级后的精通星数（第 6 轮），0 / 缺省 = 不显示 */
+  stars?: number;
+  title: string;
+}
+
+/** 调色板：默认即 P3R 变量族（含浅色 fallback），中性皮传一套 --color-primary 派生值 */
+export interface StarPalette {
+  /** 数据星填充 */
+  data: string;
+  /** 属性名 */
+  ink: string;
+  /** 称号小字 */
+  inkSoft: string;
+  /** 等级数字 */
+  accent: string;
+  /** 角端延长细线 */
+  arm: string;
+  /** 同心环：内浅端 */
+  ringPale: string;
+  /** 同心环：外深端 */
+  ringDeep: string;
+  /** 焦点环颜色 */
+  focus: string;
+}
+
+const P3_PALETTE: StarPalette = {
+  data: 'var(--p3r-blue-deep, #0a3bd6)',
+  ink: 'var(--p3r-ink, #0a1230)',
+  inkSoft: 'var(--p3r-ink-soft, #3d4a66)',
+  accent: 'var(--p3r-blue, #1b57ff)',
+  arm: 'rgba(var(--p3r-cyan-rgb, 53,209,232), 0.55)',
+  ringPale: 'var(--p3r-star-ring-pale, rgb(233, 247, 252))',
+  ringDeep: 'var(--p3r-star-ring-deep, rgb(124, 201, 234))',
+  focus: 'var(--p3r-blue, #1b57ff)',
+};
+
+/** 中性皮（自定义主题）：整族从 --color-primary 派生，深浅由 color-mix 拉开。
+ *  字色用 --ui-surface-ink 而非 --ui-ink：星图画在卡片（surface）上，不是舞台底（bg）上——
+ *  两者在夜间是相反的极性，用错那一个属性名就会和卡片底同色而隐身（FS7 审查实测对比度 1.00）。
+ *  同理同心环不再硬取 #ffffff，改向 --ui-surface 混色，夜间才不会在深卡上炸出白圈。 */
+export const NEUTRAL_STAR_PALETTE: StarPalette = {
+  data: 'color-mix(in srgb, var(--color-primary) 82%, #0b1020)',
+  ink: 'var(--ui-surface-ink, #111827)',
+  inkSoft: 'color-mix(in srgb, var(--ui-surface-ink, #111827) 62%, transparent)',
+  accent: 'var(--color-primary)',
+  arm: 'color-mix(in srgb, var(--color-primary) 45%, transparent)',
+  ringPale: 'color-mix(in srgb, var(--color-primary) 12%, var(--ui-surface, #ffffff))',
+  ringDeep: 'color-mix(in srgb, var(--color-primary) 62%, var(--ui-surface, #ffffff))',
+  focus: 'var(--color-primary)',
+};
+
+export const StarChartP3 = ({ items, onSelect, showLabels = true, palette = P3_PALETTE, compact = false, showTitles = true }: {
+  items: StarItem[];
+  onSelect: (id: AttributeId, e: ReactMouseEvent) => void;
+  showLabels?: boolean;
+  palette?: StarPalette;
+  /** 小尺寸（组织成员牌背面）：留白、字号收一档，宽度跟着容器走 */
+  compact?: boolean;
+  /** 角上要不要写称号小字（太窄的地方关掉） */
+  showTitles?: boolean;
+}) => {
+  // 中性皮那套调色板整族由 color-mix 派生，其中 data / arm 直接喂给 SVG 的
+  // fill / stroke。旧 WebView 不认 color-mix → 非法值 → 落回初始值黑。
+  // 每次渲染过一遍 paint()：原生支持时原样返回，不支持才在 JS 里把混色算实。
+  const P: StarPalette = {
+    data: paint(palette.data), ink: paint(palette.ink), inkSoft: paint(palette.inkSoft),
+    accent: paint(palette.accent), arm: paint(palette.arm),
+    ringPale: palette.ringPale, ringDeep: palette.ringDeep, focus: paint(palette.focus),
+  };
+  const dataPath = starPathAt(items.slice(0, 5).map((it) => levelRadius(it.level, it.maxLevel)));
+  // 同心等级星环（用户定稿）：每一档一圈同色系五角星、内浅外深（最多 10 档），
+  // 由外到内实心覆盖形成环带——升级即数据星角尖走向更深的一圈，档位一眼可读
+  const ringCount = Math.min(10, Math.max(1, items[0]?.maxLevel ?? 5));
+  /**
+   * 内圈浅 → 外圈深：两端点走调色板、中间档插值——JS 不感知亮暗，
+   * 夜间只在 CSS 覆盖两端点，星环整族自动跟随。
+   *
+   * ⚠️ 插值**必须在 JS 里算完再交给 fill**，不能吐 `color-mix()` 字符串。
+   * 安卓 9 一档的 WebView（Chrome < 111）不认 color-mix，SVG 的 fill 拿到非法值
+   * 会落回初始值 **black**——整圈等级星环塌成一坨黑压在数据星后面，
+   * 就是用户上报的「五角星底部表示全部等级的那颗变黑了」。见 utils/cssColor.ts。
+   */
+  const ringColor = (lvl: number) => mixSrgb(palette.ringDeep, palette.ringPale, (lvl / ringCount) * 100);
+  // 标签锚点：紧贴角端外侧（viewBox 坐标 → 百分比），在同一个变换平面内自动跟随；
+  // 按锚点相对中心的方位智能对齐——左角右靠、右角左靠、顶底居中
+  // 侧边标签量宽防裁切（两位数等级 + 精通星会伸出卡片）
+  // 第 17 批：斜切平面算进边界（320 宽时同样会切掉两侧），showLabels / 名字进 deps
+  const { containerRef, register } = useSideLabelClamp(
+    [showLabels, items.map((it) => `${it.name}/${it.level}/${it.stars ?? 0}/${it.title}`).join('|')],
+    { skewXDeg: STAR_SKEW, scaleY: STAR_SCALEY },
+  );
+  const labelAt = (i: number) => {
+    const [x, y] = pt(armAngle(i), STAR_R * 1.04);
+    const dx = x - STAR_CX;
+    const dy = y - STAR_CY;
+    const tx = dx < -30 ? -86 : dx > 30 ? -14 : -50;
+    const ty = dy < -30 ? -74 : dy > 30 ? -26 : -50;
+    return { leftPct: (x / 360) * 100, topPct: (y / 356) * 100, tx, ty };
+  };
+  return (
+    // padding 用固定 px：百分比 padding 按父宽解析，宽屏下会把星整体顶下去裁掉底部标签（用户上报）
+    // paddingTop 23 → 31（v2.7.0.5）：最上方标签的数字会被首页那层
+    // `min-h-[344px] overflow-hidden` 削掉顶部（375 宽实测 1.7px，窄屏更多）。
+    // 星随容器宽等比缩放、标签自身高度固定 px，两者不同步，任何宽度都差一口气；
+    // 加 8px 净空，首页外层 min-h 同步 +8 以免底部标签被挤出。
+    <div className={`relative mx-auto w-full ${compact ? '' : 'max-w-[288px]'}`} style={{ paddingTop: compact ? 20 : 31, paddingBottom: compact ? (showTitles ? 20 : 14) : 32 }}>
+      {/* 平行四边形斜切(下左上右) + 高度拉伸；星与标签同处一个 transform，标签再反变换回正 */}
+      {/* compact：星缩到八成宽、居中，两侧角上的字有地方放（成员牌背面很窄，外层还会裁边） */}
+      <div ref={containerRef} className={`relative ${compact ? 'mx-auto w-[78%]' : ''}`} style={{ transform: `skewX(${STAR_SKEW}deg) scaleY(${STAR_SCALEY})` }}>
+        <svg viewBox="0 0 360 356" className="w-full overflow-visible" aria-hidden>
+          {/* 同心星环：从最外档画到最内档，后画的小星盖出环带 */}
+          {Array.from({ length: ringCount }).map((_, k) => {
+            const lvl = ringCount - k;
+            const r = levelRadius(lvl, ringCount);
+            return <path key={lvl} d={starPathAt([r, r, r, r, r])} fill={ringColor(lvl)} />;
+          })}
+          {/* 角端 → 标签方向的臂延长细线（设计稿细节） */}
+          {items.slice(0, 5).map((it, i) => {
+            const [x1, y1] = pt(armAngle(i), STAR_R * 0.99);
+            const [x2, y2] = pt(armAngle(i), STAR_R + 12);
+            return <line key={it.id} x1={x1} y1={y1} x2={x2} y2={y2} stroke={P.arm} strokeWidth={1.5} />;
+          })}
+          {/* 数据星：深色纯色实心（去描边，用户定稿——形状即信息） */}
+          <path d={dataPath} fill={P.data} strokeLinejoin="miter" />
+        </svg>
+        {/* 五属性标签（可点击 → 属性档案）；反变换把文字转正对屏幕 */}
+        {showLabels && items.slice(0, 5).map((it, i) => {
+          const pos = labelAt(i);
+          return (
+            <button
+              key={it.id}
+              ref={register(i, pos.leftPct, pos.tx, pos.topPct, pos.ty)}
+              type="button"
+              onClick={(e) => onSelect(it.id, e)}
+              className="absolute flex flex-col items-center whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-1"
+              style={{
+                left: `${pos.leftPct}%`,
+                top: `${pos.topPct}%`,
+                transform: `translate(${pos.tx}%, ${pos.ty}%) skewX(${-STAR_SKEW}deg) scaleY(${1 / STAR_SCALEY})`,
+                // 焦点环颜色跟调色板（Tailwind 的任意值类拿不到运行期变量）
+                ['--tw-ring-color' as string]: P.focus,
+              }}
+              aria-label={`${it.name} 等级 ${it.level}，${it.title}`}
+            >
+              {/* 精通星（第 6 轮，用户口径）：小一点、贴在数字右下角，四套皮一个位置 */}
+              <span className="flex items-baseline gap-1.5">
+                <span className={`${compact ? 'text-[10px]' : 'text-[15px]'} font-black leading-none`} style={{ color: P.ink }}>{it.name}</span>
+                <span className={`${compact ? 'text-[15px]' : 'text-[26px]'} font-black italic leading-none`} style={{ color: P.accent }}>{it.level}{it.stars ? <span className={`ml-px ${compact ? 'text-[8px]' : 'text-[11px]'} font-black not-italic`}>★{it.stars}</span> : null}</span>
+              </span>
+              {showTitles && it.title && <span className={`mt-0.5 block ${compact ? 'text-[8px]' : 'text-[11px]'} font-semibold leading-none`} style={{ color: P.inkSoft }}>{it.title}</span>}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+};

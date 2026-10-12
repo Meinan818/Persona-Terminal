@@ -1,0 +1,2683 @@
+export type AttributeId = 'knowledge' | 'guts' | 'dexterity' | 'kindness' | 'charm';
+
+export type AttributeNames = {
+  knowledge: string;
+  guts: string;
+  dexterity: string;
+  kindness: string;
+  charm: string;
+};
+
+export type AttributeLevelTitles = Record<AttributeId, string[]>;
+
+export type AttributeNamesKey = keyof AttributeNames;
+
+export type ThemeType = 'blue' | 'yellow' | 'red' | 'pink' | 'custom';
+
+export interface User {
+  id: string;
+  name: string;
+  createdAt: Date;
+  theme: ThemeType;
+  /** 本地头像 data URL（上传的图片 base64） */
+  avatarDataUrl?: string;
+}
+
+export interface Attribute {
+  id: AttributeId;
+  displayName: string;
+  points: number;
+  level: number;
+  levelThresholds: number[];
+  unlocked: boolean;
+}
+
+export interface Activity {
+  id: string;
+  userId: string;
+  date: Date;
+  description: string;
+  pointsAwarded: {
+    knowledge: number;
+    guts: number;
+    dexterity: number;
+    kindness: number;
+    charm: number;
+  };
+  method: 'local' | 'todo' | 'battle';
+  important?: boolean;
+  /** 记录时的天气（第 6 轮）：保存那一刻 10 分钟内的缓存天气；**只存本机**，上云时剥掉 */
+  weather?: { icon: string; temp?: number; text?: string };
+  category?: 'skill_unlock' | 'achievement_unlock' | 'level_up' | 'weekly_goal' | 'countercurrent' | 'shadow_defeat' | 'confidant' | 'calling_card_clear' | 'ledger' | 'terminal_clear' | 'bigdeal_step' | 'bigdeal_clear' | 'wish_fulfilled' | 'return';
+  /**
+   * 回归补记（PRD_V2.6 §12）：这条是**事后补上的**，不是当天记的。
+   *
+   * 为什么要留这个标记：这个 App 的价值就在于记录是真的。补记仍然是真的，
+   * 但它属于另一个认知类别——半个月后凭印象写下的"我那天跑了步"，
+   * 与当天写下的那条，可信度不一样。用户日后回看应当分得清，
+   * 整段补记也因此可以被整体撤销。
+   */
+  backfilled?: boolean;
+  /** BIG DEAL 从属标注（bigdeal_step / bigdeal_clear 都挂）：收束分组键 + Agent 读取时识别非独立任务 */
+  bigDealId?: string;
+  /**
+   * 挂载到哪个愿望（V2.6 §1.3）。记录活动 / 完成待办 / 黑猫记录卡都可以选。
+   * 愿望的「已完成相关任务 N 次」就是数这个字段——它是"离愿望更近了"的唯一计数来源。
+   * 注意：activities 表本身上云，所以这个字段随行上云；愿望条目本体另受 syncWishesToCloud 管辖，
+   * 于是可能出现"活动带着 wishId 上云、但对面没有那条愿望"——UI 取不到就当未挂载，不报错。
+   */
+  wishId?: string;
+  /** 同伴互动记录的关联同伴 id（category === 'confidant' 时填充） */
+  confidantId?: string;
+  levelUps?: Array<{
+    attribute: AttributeId;
+    fromLevel: number;
+    toLevel: number;
+  }>;
+}
+
+// ── F3 治疗终端 · 启动素材库 ──
+export type WishStatus = 'active' | 'done' | 'archived';
+export type TerminalProblemKind = 'long_term' | 'pressure';
+
+export interface TerminalStepHistoryEntry {
+  id: string;
+  title: string;
+  completedAt: string;
+  sourceStepId?: string;
+  via: 'manual' | 'terminal';
+}
+
+/**
+ * 愿望进度评估的一次落点（PRD_V2.6 §8）。
+ *
+ * 为什么留轨迹而不只存一个当前值：用户要看的是**「涨了多少」**，
+ * 不是"现在是多少"——没有上一次就算不出这一次的意义。
+ */
+export interface WishProgressPoint {
+  /** ISO 时间戳 */
+  at: string;
+  /** 落点百分比 0–100 */
+  pct: number;
+  /** 相对上一次的变化量（首次评估 = pct 本身） */
+  delta: number;
+  /** 一句话依据（AI 给的理由 / 手动填的备注） */
+  reason?: string;
+  source: WishProgressSource;
+}
+
+/**
+ * 进度是谁定的：
+ *   ai     = 面板里主动点「重新评估」，AI 出数
+ *   local  = 无 API Key 时的离线估算（子步占比 + 挂载次数）
+ *   agent  = 黑猫在谈话里提议、**用户点了确认**后写入（绝不静默写）
+ *   manual = 用户自己拖的
+ */
+export type WishProgressSource = 'ai' | 'local' | 'agent' | 'manual';
+
+/**
+ * 启动素材库条目。parentId 为空 → 一件卡住的事 / 想做到的方向；
+ * 否则为该素材下的小步骤（可手动输入，或由 AI 拆分而来）。
+ */
+export interface Wish {
+  id: string;
+  /** 所属父级素材 id；为空表示自身即父级素材 */
+  parentId?: string;
+  title: string;
+  note?: string;
+  /** 父级素材类型：长期愿望 / 短期压力。旧数据缺省按长期愿望处理。 */
+  kind?: TerminalProblemKind;
+  /** 用户描述的当前进度、水平、压力位置；AI 续拆时会带入上下文。 */
+  currentState?: string;
+  /** 父级素材下的小步骤完成历史。完成小步时自动追加，供下一次 AI 拆解避重与续接。 */
+  stepHistory?: TerminalStepHistoryEntry[];
+  /** 轻绑定属性：完成该素材派生的 24h 小步卡时，加点落到此属性（未绑定则归「勇气」） */
+  attribute?: AttributeId;
+  /** 可选关联的 arcana（同伴）id */
+  arcanaId?: string;
+  status: WishStatus;
+  /**
+   * 「愿望已实现」的时刻（V2.6 §1.4）。区别于 archivedAt：
+   * archivedAt 是"离场"（可能是放弃、可能是实现），fulfilledAt 只在**实现**时写。
+   * 归档区据此打「已实现」标签而不是笼统的"已归档"。
+   */
+  fulfilledAt?: Date;
+  /** 小步骤来源：手动输入 / AI 拆分 */
+  source: 'manual' | 'ai';
+  createdAt: Date;
+  archivedAt?: Date;
+
+  // ── 愿望进度（PRD_V2.6 §8）──────────────────────
+  /**
+   * 愿望自己的子任务。结构直接复用 TodoStep，但语义不同：
+   * **勾掉不加点、不进今日任务列表**——愿望是"远处的灯"，不是今天要打的卡。
+   * 想要加点就去今日任务建一条挂到这个愿望上（Todo.wishId）。
+   */
+  steps?: TodoStep[];
+  /**
+   * 「离这个愿望还有多远」的百分比 0–100。
+   * undefined = 从未评估过（环显示未评估态，不是 0%——两者意思差很远）。
+   */
+  progressPct?: number;
+  /** 上次落点的一句话依据 */
+  progressBasis?: string;
+  progressUpdatedAt?: Date;
+  progressSource?: WishProgressSource;
+  /** 评估轨迹（只留最近 12 条，够画小史也不撑爆同步体积） */
+  progressHistory?: WishProgressPoint[];
+}
+
+export type TodoFrequency = 'single' | 'count';
+
+/** BIG DEAL 轻量子步（TASKS_MERGE_PRD §2）：只有标题与可选属性覆写，点数挂在父条目上 */
+export interface TodoStep {
+  id: string;
+  title: string;
+  /** 覆写属性；缺省随父条目 attribute */
+  attribute?: AttributeId;
+  done?: boolean;
+  /** 完成时间 ISO */
+  doneAt?: string;
+  source: 'manual' | 'ai';
+}
+
+export interface Todo {
+  id: string;
+  title: string;
+  attribute: AttributeId;
+  points: number;
+  /** 额外加成属性（最多再添加 2 个，与 attribute+points 共 3 个） */
+  extraBoosts?: Array<{ attribute: AttributeId; points: number }>;
+  frequency: TodoFrequency;
+  repeatDaily?: boolean;
+  isLongTerm?: boolean;
+  targetCount?: number;
+  weekdays?: number[];
+  isActive: boolean;
+  important?: boolean;
+  /** 指定未来某日启用，格式 YYYY-MM-DD；日期未到时不会出现在今日任务 */
+  startDate?: string;
+  createdAt: Date;
+  archivedAt?: Date;
+  /** 任务被完成（达标）时的时间戳，用于区分"已完成"和"手动归档" */
+  completedAt?: Date;
+  /** 抽签（TASKS_MERGE_PRD §4.2）：当日被命运选中的日期 YYYY-MM-DD——当日完成触发命运加成 +1 */
+  fateDrawnDate?: string;
+  /** 从委托板「今日委托」加进来的（预设 id，第 14 批）：本周委托「完成 3 张今日委托」按它数 */
+  lifeQuest?: string;
+  /** 挂载到哪个愿望（V2.6 §1.3）：完成它时产生的活动会带上同一个 wishId，从而计入愿望进度 */
+  wishId?: string;
+  // ── BIG DEAL（任务×终端二合一，TASKS_MERGE_PRD §4.1）──
+  /** 大事模式：进度由 steps 派生，不走 todoCompletion 计数 */
+  isBigDeal?: boolean;
+  steps?: TodoStep[];
+  /** 现状一句话（喂 AI 拆解上下文；自 Wish.currentState 迁移） */
+  currentState?: string;
+  /**
+   * 可选截止日 YYYY-MM-DD：BIG DEAL 的软时限；单次 / 计数任务的 DDL（「更多设置」里设，与 repeatDaily 互斥），
+   * 首页与今日任务显示「剩 N 天」（components/todo/DeadlineTag）
+   */
+  deadline?: string;
+  /** 收官记录的 activity id；存在 = 已收官 */
+  clearedActivityId?: string;
+  /**
+   * 一起进步（v2.7.0.6）：这条待办属于和某位好友的约定，完成即打卡。
+   * 伙伴名存在这里，离线也能画出「与 X」的标记；约定的实时状态在 cloudSocial.pacts 里。
+   */
+  pact?: { id: string; partnerId: string; partnerName: string; kind: PactKind };
+  /**
+   * 组织作战（v2.7.0.6 第 8 轮）：这条待办是某场作战里我的那一份，完成即打卡。
+   * 组织名存在这里，离线也能画出「作战 · 组织名」的小签；作战的实时进度在 cloudSocial.orgs 里。
+   */
+  orgOp?: { orgId: string; opId: string; orgName: string; kind: OrgOpKind };
+}
+
+export interface TodoCompletion {
+  id: string;
+  todoId: string;
+  date: string;
+  count: number;
+}
+
+export interface Achievement {
+  id: string;
+  title: string;
+  description: string;
+  icon: string;
+  unlocked: boolean;
+  unlockedDate?: Date;
+  condition: {
+    type: 'consecutive_days' | 'total_points' | 'attribute_level' | 'keyword_match' | 'all_attributes_max' | 'todo_completions' | 'weekly_goal_completions' | 'shadow_defeats' | 'confidants_at_level' | 'battle_feat' | 'days_since_first_record' | 'quests_claimed';
+    value: number;
+    attribute?: AttributeId;
+    keywords?: string[];
+    currentProgress?: number;
+    /** 用于 'confidants_at_level'：至少需要达到的亲密度等级 */
+    minLevel?: number;
+    /** 用于 'battle_feat'（批4 战场成就组）：对应 BattleState.battleFeats 中的壮举 id */
+    feat?: string;
+  };
+}
+
+export interface Skill {
+  id: string;
+  name: string;
+  description: string;
+  requiredAttribute: AttributeId;
+  requiredLevel: number;
+  unlocked: boolean;
+  bonusMultiplier?: number; // 解锁后的额外属性提升倍数
+  flatBonus?: number;       // 每次加点额外固定追加点数
+}
+
+/** @deprecated 被 DailyDivination 取代，保留类型仅为向前兼容旧 DB 记录 */
+export interface DailyEvent {
+  id: string;
+  date: string;
+  title: string;
+  description: string;
+  effect: {
+    attribute: AttributeId;
+    multiplier: number;
+  };
+}
+
+// ── 星象 / 塔罗 ─────────────────────────────────────────────
+
+export type TarotOrientation = 'upright' | 'reversed';
+export type LongReadingPeriod = 'recent' | 'midterm' | 'longterm';
+/** 总体运势：大吉 / 中吉 / 小吉 / 凶 */
+export type Fortune = 'great' | 'good' | 'small' | 'bad';
+
+export interface DrawnCard {
+  cardId: string;
+  orientation: TarotOrientation;
+}
+
+/** 每日塔罗抽卡（替代旧的 DailyEvent） */
+export interface DailyDivination {
+  id: string;
+  date: string;                 // YYYY-MM-DD (本地时区)
+  drawnFrom: string[];          // 3 张候选 card id
+  pickedIndex: number;          // 0 | 1 | 2
+  cardId: string;               // 抽中的 card id (= drawnFrom[pickedIndex])
+  orientation: TarotOrientation;
+  effect: {
+    attribute: AttributeId;
+    multiplier: number;
+  };
+  narration: string;            // 运势主文案（AI 或离线）
+  advice: string;               // 短建议
+  /** 总体运势吉凶等级（AI 返回或程序兜底；旧记录可能为 undefined） */
+  fortune?: Fortune;
+  source: 'ai' | 'offline';
+  /**
+   * 解读者手记（v2.7.0.6）：这次解读落在客人哪件处境上的一句备忘（≤30 字），
+   * 由同一次 AI 调用顺手写下；后续解读把最近几条手记当"上次聊到哪"喂回去，
+   * 形成跨天叙事。给客人可见、可清除。老记录无此字段。
+   */
+  memo?: string;
+  /**
+   * 案头触点（v2.7.0.6）：这一天简报里允许模型触及的那一件案头事项的键
+   * （todo:<id> / deadline:<id> / wish:<id>）。之后三天不再给同一件——
+   * 用户口径：一个未完成的待办天天被提醒，内容就雷同了。'none' = 那天没给案头。
+   */
+  focusKey?: string;
+  /**
+   * 属性提醒键（v2.7.0.6）：这一天简报里允许模型顺带一句的"没动静的属性"（idle:<attrId>），
+   * 之后四天不再给同一项。用户口径：天天提醒某个属性偏低，频率高到背离初衷。'none' = 没给。
+   */
+  nudgeKey?: string;
+  createdAt: Date;
+}
+
+// ── 窥探命运（v2.7）：连续 7 天集齐每日塔罗后的总占卜 ─────────────
+//
+// 触发条件：最近 7 天（含今天）每天都有每日塔罗，且距上一次窥探 ≥7 天
+// （窗口恰为 7 天，两个条件合起来 = 每张牌只被消耗一次）。
+// 奖励 buff 自创建日起连续 3 天（buffStart ≤ 今天 ≤ buffEnd）：
+//   · 逆影战场伤害加算 +10%（battle/numbers.ts FATE_GLIMPSE_ADD）
+//   · 每日首次带加点的记录，加点最高的那项属性额外 +1（store.addActivity）
+
+export interface FateGlimpseDay {
+  date: string;                 // YYYY-MM-DD
+  cardId: string;
+  orientation: TarotOrientation;
+  fortune?: Fortune;
+  /** 当日塔罗选中的加成属性 */
+  attribute: AttributeId;
+}
+
+export interface FateGlimpse {
+  id: string;
+  /** 七日牌阵（date 升序，恰 7 项） */
+  days: FateGlimpseDay[];
+  /** 一句命运结语（翻面亮相用，8~16 字） */
+  verdict: string;
+  summary: string;              // 总结：七日轨迹回望
+  outlook: string;              // 展望：接下来三天走向
+  advice: string;               // 建议：2~3 条（换行分隔）
+  source: 'ai' | 'offline';
+  buffStart: string;            // YYYY-MM-DD（含）
+  buffEnd: string;              // YYYY-MM-DD（含）= buffStart + 2 天
+  createdAt: Date;
+}
+
+export interface LongReadingFollowUp {
+  id: string;
+  question: string;
+  drawnFrom: string[];          // 3 候选
+  cardId: string;               // 被抽中
+  orientation: TarotOrientation;
+  content: string;              // AI 解读（流式完成后保存）
+  createdAt: Date;
+}
+
+/** 中长期占卜（持续 14 天，支持 1 次追问） */
+export interface LongReading {
+  id: string;
+  question: string;
+  period: LongReadingPeriod;
+  drawnFrom: string[];          // 6 候选
+  picked: DrawnCard[];          // 3 张抽中（顺序 = 牌阵位置）
+  content: string;              // AI 主解读
+  followUps: LongReadingFollowUp[];
+  archived: boolean;            // 手动归档或过期自动归档
+  /** 解读者手记（v2.7.0.6）：解读完成后另用一次小调用抽出的 ≤40 字备忘；给客人可见、可清除 */
+  memo?: string;
+  createdAt: Date;
+  /** YYYY-MM-DD — createdAt + 14 天 */
+  expiresAt: string;
+}
+
+export interface KeywordRule {
+  keywords: string[];
+  attribute: AttributeId;
+  points: number;
+}
+
+/**
+ * F2a 本地通知——单条提醒的「内容类型」。排程时各自读端上数据判断是否「可操作」：
+ *  - tarot：今日塔罗未抽
+ *  - todos：今日仍有未完成的每日待办
+ *  - countercurrent：有属性明日将逆流扣减（连日无增长）
+ *  - summary：有未读的成长总结
+ *  - record：今天还没有任何记录（提醒回来记录）
+ */
+export type NotifContentType = 'tarot' | 'todos' | 'countercurrent' | 'summary' | 'record' | 'together' | 'quests' | 'meeting';
+
+/**
+ * F2a 本地通知——一个「每日时段」。每个时段在自己的时间点检查 contents 里
+ * 列出的内容类型，挑出最值得提醒的一条以 Velvet 口吻推送。
+ * 注：本地通知由系统提前排程，触发时 App 多半未运行；内容在「排程时」由端上
+ * 快照烤好，靠「切前台必重排 + 条件已满足即撤销」保持新鲜（见 utils/notifications.ts）。
+ */
+export interface NotifSlot {
+  id: string;
+  /** 'HH:MM' 24h 本地时间 */
+  time: string;
+  enabled: boolean;
+  /** 用户可见名，如「晨间序曲」「夜间结算」 */
+  label: string;
+  contents: NotifContentType[];
+}
+
+export interface Settings {
+  id?: string;
+  attributeNames: AttributeNames;
+  levelThresholds: number[];
+  /** 名片状态（v2.7.0.6 第 6 项）：预设 id + 设定时刻；过了 24 小时按没有算 */
+  profileStatus?: ProfileStatus;
+  /** 名片目标（v2.7.0.6 第 6 项）：挂着的宣告卡（可带对外显示的说法） */
+  profileGoal?: ProfileGoalPick;
+  /**
+   * 人格指数难度档（R19）。缺省时由 resolveLevelDifficulty 按阈值反推
+   * （只有与某一档 LV1-5 完全一致才算数，手改过的按简单处理）。
+   */
+  levelDifficulty?: LevelDifficulty;
+  /** 五维各等级的四字称号；下标 0 对应 Lv.1。缺失时使用默认兜底。 */
+  attributeLevelTitles?: AttributeLevelTitles;
+  /** 是否正在使用 AI 按当前属性名匹配过的系统成就/技能名称。 */
+  aiMatchedPresetNames?: boolean;
+  /** AI 覆写系统成就/技能名称前的本地快照；用于只撤回 AI 覆写，不覆盖用户自己的改名。 */
+  aiPresetNameBackup?: {
+    achievements: Record<string, string>;
+    skills: Record<string, string>;
+  };
+  openaiEnabled: boolean;
+  openaiApiKey: string;
+  keywordRules: KeywordRule[];
+  darkMode: boolean;
+  backgroundImage?: string;
+  backgroundOrientation?: 'landscape' | 'portrait';
+
+  // ── 天气角标（v2.6）───────────────────────────────────────────────
+  /**
+   * 首页天空位显示什么：'moon' 月相（缺省）/ 'weather' 天气。
+   * 点一下月相即切换，切换被记住——所以它是 settings 字段而不是组件内 state。
+   */
+  homeSkyMode?: 'moon' | 'weather';
+  /**
+   * 首页那张卡显示什么：'todos' 今日任务（缺省）/ 'wishes' 愿望（PRD_V2.6 §1.1）。
+   * 点标题切换，与 homeSkyMode 同口径——切换要被记住，所以进 settings 而不是组件 state。
+   */
+  homeTaskPane?: 'todos' | 'wishes';
+
+  // ── 回归面板（PRD_V2.6 §12）─────────────────────────────
+  /**
+   * 上一次**真的打开过** App 的时刻（ISO）。
+   *
+   * 刻意不用"最后一条记录的时间"当代理：天天打开却什么都不记的人**没有离开**，
+   * 他是另一个问题（停滞提示那条线在管）。对他弹「欢迎回来」是荒谬的。
+   */
+  lastOpenedAt?: string;
+  /** 累计回归次数。streak 记的是"从没断过"，这个记的是"断了还愿意回来" */
+  returnCount?: number;
+  /** 上次弹出回归面板的时刻（ISO），防同一次回归重复弹 */
+  lastReturnPanelAt?: string;
+  /**
+   * 黑猫在谈话里主动提议更新愿望进度（PRD_V2.6 §8）。默认开。
+   * 关掉之后 Agent 只读不提——读取愿望进度作为聊天上下文一直是允许的，
+   * 这个开关管的只是"要不要主动弹确认卡"。
+   */
+  wishAgentProposals?: boolean;
+  /**
+   * 任务完成后自动重估愿望进度并弹窗（PRD_V2.6 §8）。默认开。
+   * 关掉后进度只在面板里手动点「重新评估」时才动。
+   */
+  wishAutoEvaluate?: boolean;
+  /** 'qweather'（默认，和风）| 'openmeteo'（免 Key 兜底） */
+  weatherProvider?: 'qweather' | 'openmeteo';
+  /** 和风 Key。**不上云**（与城市同组豁免），只进本地备份 */
+  weatherApiKey?: string;
+  /** 和风账号专属 API Host（控制台 → 设置里的那个域名，必填；公共域名 2026 年已停服）。存规整后的纯域名 */
+  weatherApiHost?: string;
+  /** 选定城市。位置语义强，**不上云**，只进本地备份 */
+  weatherCity?: { id?: string; name: string; lat: number; lon: number };
+  backgroundOpacity?: number;
+  soundMuted?: boolean;
+  soundVolume?: number;     // 音量大小 0–100，默认 80
+  // ── 导入音乐（第 13 轮 B 组 2.8）：曲目本体在本机 bgmTracks 表（不上云不备份）；这几项按设备生效，上云剥掉 ──
+  bgmEnabled?: boolean;                                  // 默认开（有曲目才有意义）
+  bgmVolume?: number;                                    // 0–100，默认 60
+  bgmBattleTrackId?: string;                             // 战斗曲目（小影 / 强敌）；'' = 跟随主页曲目
+  bgmBossTrackId?: string;                               // Boss 战（每区层关底的心魔）；'' = 跟随战斗曲目
+  bgmTowerTrackId?: string;                              // 爬塔曲目；'' = 跟随主页曲目
+  bgmHomeTrackIds?: Partial<Record<ThemeType, string>>;  // 各主题主页默认曲目
+  bgmNoticeSeen?: boolean;                               // 版权提示已读
+  customAchievements?: Achievement[];
+  customSkills?: Skill[];
+  customLevelThresholds?: number[];
+  backgroundAnimation?: string[]; // 背景动画风格（可多选：'aurora'|'particles'|'wave'|'pulse'）
+  /**
+   * 红频道（P5）是否**亲手开过**背景动画。默认 undefined = 没开过 = 不渲染。
+   * 见 ui/bgAnim.ts：P5 舞台自带满屏拼贴装饰，再叠动画既糊构图又最先掉帧，
+   * 而新档案默认值是 ['aurora']，所有人切到红主题都会撞上。
+   */
+  p5BgAnimOptIn?: boolean;
+  customThemeColor?: string;       // 自定义主题色 hex（theme='custom' 时生效）
+  customSoundScheme?: ThemeType;   // 自定义音效方案（custom 主题时使用，默认跟随 blue）
+  /**
+   * 自定义主题下的塔罗卡面配色（'p3' 蓝 / 'p4' 黄 / 'p5' 红），默认 'p3'。
+   * **只在 custom 主题生效**——蓝/黄/红三个频道各自的卡面是频道视觉的一部分，
+   * 不接受覆写；只有自定义主题本来就没有自己的一套牌，才轮到用户挑。
+   * 三套图的差别不止色调：p5 走 Thoth 序，归位按牌名 slug（见 constants/tarotArt.ts）。
+   */
+  customTarotSet?: 'p3' | 'p4' | 'p5';
+  /**
+   * 每日塔罗改走「深思熟虑」档（v2.7.0.6，默认关）。每日一次，成本可忽略；
+   * 深思熟虑档未配置时自动退回快速响应，不会因此抽不了牌。
+   */
+  tarotDailyDeliberate?: boolean;
+  /**
+   * 成长总结改走「深思熟虑」档（v2.7.0.6，默认关）。周报月报一期一次，
+   * 多等一两分钟换更贴的信；深思熟虑档未配置时自动退回快速响应。
+   */
+  summaryDeliberate?: boolean;
+  /**
+   * 自动撰写上一期总结（v2.7.0.6，默认开：undefined 视为开）。新的一周 / 一个月第一次打开 App 时，
+   * 上一周 / 上个月的总结还没写过，就在后台写好存档，再按「可以查看了」提醒一次。
+   */
+  summaryAutoWrite?: boolean;
+  countercurrentEnabled?: boolean; // 逆流：连续3日无增长属性自动 -1/天
+  countercurrentEnabledAt?: string; // 逆流开启日期 YYYY-MM-DD，防止开启当天就触发
+  // ── F2a 本地通知 ─────────────────────────────────────────
+  /** 本地通知总开关。默认 false = 关；开启需用户授予系统通知权限（仅原生平台生效）。 */
+  notificationsEnabled?: boolean;
+  /** 让助手写提醒文案（v2.7 notifVoice）：每天用当前人格口吻生成一套推送文案，
+   *  失败/离线静默退回内置文案库 */
+  notifAIVoice?: boolean;
+  /**
+   * 助手主动找你（AI 助手第二批 C）：回访约定 / 纪念日 / 久别想念，一天最多一条，夜里不发；
+   * 锁屏只写「〈助手名〉有话想跟你说」。缺省 = 开（跟着提醒总开关）。
+   */
+  navigatorPushEnabled?: boolean;
+  /** 每日提醒时段列表；缺省时回退到 DEFAULT_SETTINGS 的两槽（晨/晚）。 */
+  notificationSlots?: NotifSlot[];
+  /** v2.7.0.6：老用户含「今日待办」的时段已补上「一起进步」（只补一次，之后随用户设置） */
+  notifTogetherAdded?: boolean;
+  /** 第 6 轮：老用户的提醒时段补过「委托板」（只补一次） */
+  notifQuestsAdded?: boolean;
+  /** F2a 一次性回填标记：历史成长总结的 viewedAt 已补齐（视为已读），避免开启通知时旧总结被判未读。 */
+  summaryViewedBackfillDone?: boolean;
+  // ── F5 心相记账 ──
+  /** 记账总开关。默认 undefined=开（功能可见、入口可见）；置 false 隐藏入口与数据。 */
+  ledgerEnabled?: boolean;
+  /** 货币代码，默认 'CNY'（¥）。 */
+  currency?: string;
+  /** F5 消费评估开关（默认关）：开后每笔支出可评「值 / 不值」，值得 +1 SP。 */
+  spendEvalEnabled?: boolean;
+  /** F5 记账奖励日封顶计数的锚日（YYYY-MM-DD）。 */
+  ledgerRewardDate?: string;
+  /** F5 今日已发记账 SP（日封顶 20）。 */
+  ledgerSpToday?: number;
+  /** F5 今日已发投资加点（日封顶 2）。 */
+  ledgerAttrToday?: number;
+  /** F5 今日已发 bonus SP（劳动/值得；日封顶 20，与普通记账 SP 分开计）。 */
+  ledgerBonusSpToday?: number;
+  /** F5 月度「不超预算」+10SP 已发放的月份（YYYY-MM），防重复发放。 */
+  ledgerBudgetBonusMonths?: string[];
+  /** F5 渠道选项（支付宝/微信…）；undefined 时回退 DEFAULT_CHANNELS，可手动增删。 */
+  ledgerChannels?: string[];
+  /** F5 收入来源选项（工资/兼职…）；undefined 时回退 DEFAULT_INCOME_SOURCES，可手动增删。 */
+  ledgerIncomeSources?: string[];
+  /** F5 自定义细分类目（用户自建二级标签），默认空。 */
+  ledgerCategories?: string[];
+  /** F5 记忆：上次使用的渠道（新支出草稿预选）。 */
+  ledgerLastChannel?: string;
+  /** F5 记忆：渠道选择器是否展开（超过折叠数时）。 */
+  ledgerChannelsExpanded?: boolean;
+  /** F5 每月预算重置 / 规划日（发薪日，1–28）；默认 1=自然月初。决定「新周期规划窗」何时弹。 */
+  ledgerResetDay?: number;
+  /** F5 启用「发薪日周期」（默认关）：开后预算/今日可花/规划窗/标签按 ledgerResetDay 切分的日期周期，而非日历月。 */
+  ledgerPayCycleEnabled?: boolean;
+  /** F5 已确认 / 略过的「新周期规划窗」周期 id（cycle 起始月 YYYY-MM）。 */
+  ledgerCycleConfirmed?: string;
+  /** F5 已达成「省钱挑战」并发放 +10SP 的月份（防重复发放）。 */
+  ledgerChallengeWonMonths?: string[];
+  /** F5 资产页「存款」条目是否隐藏（默认显示）。 */
+  ledgerSavingsHidden?: boolean;
+  // ── 弹幕投稿（原 F3 终端遗产，二合一后由大事收官发放；字段名保留兼容存量数据）──
+  /** 已累积但未发送的「鼓励弹幕」投稿机会数。 */
+  terminalDanmakuTokens?: number;
+  /**
+   * 上次成功投稿弹幕的时间（ISO）。**三天一发**的唯一真源（PRD_V2.6 §3 反馈）——
+   * 攒了多少次机会是一回事，多久能发一次是另一回事：
+   * 前者管"有没有资格"，后者管"会不会刷屏"，两个闸门缺一不可。
+   */
+  lastDanmakuSentAt?: string;
+  /** 任务×终端二合一迁移完成时间 ISO（TASKS_MERGE_PRD §2）：防重入标记 */
+  tasksMergeMigratedAt?: string;
+  /** 抽签当日状态：已抽中的候选 key 当日沉底（跨天自动重置） */
+  fateDrawState?: { date: string; drawnKeys: string[] };
+  /** 抽签「以后别抽这件」的旧事（同一件事的键，见 utils/fateDraw.fateHistoryKey；第 17 批） */
+  fateHistoryMuted?: string[];
+  /**
+   * 今日委托题库 ↔ 自定义属性的 AI 对应结果（第 17 批，utils/lifeQuestAI 后台自动要）：sig = 属性名 + 题库版本，
+   * 不一致就作废重算；map = 预设 id → 属性（null = 五项都不搭，不出）
+   */
+  lifeQuestAttrMap?: { sig: string; map: Record<string, AttributeId | null>; at: number };
+  /** 体验个性化：今日委托多一张 AI 按最近记录写的（默认关；会把最近 7 天的记录标题发给 AI 服务） */
+  lifeQuestAiCard?: boolean;
+  // ── F6 万能记录 AI「黑猫」（Navigator） ──
+  /** 最近一次「每日首开问候」的本地日期（YYYY-MM-DD）：跨天首开播完整问候，当日重开只简短招呼。 */
+  navigatorLastGreetDate?: string;
+  /** 当前激活的人格 preset id（缺省 = 内置黑猫）。切人格 = 开新会话。 */
+  navigatorPresetId?: string;
+  /** 拟真增强：回复走流式 + 按标点切碎气泡（句号删并断、——删并断、问叹/分号/括号保留断；逗号不断；括号里的标点不断，颜文字整组成泡），泡间 1.2s。 */
+  navigatorImmersive?: boolean;
+  /** 羁绊页视图：专辑墙（默认）/ 列表；右上角切换、持久记忆（PRD_V2.5_FINAL §5.3） */
+  confidantViewMode?: 'wall' | 'list';
+  /** 组织名册的样式：格子（默认）/ 专辑墙；点「名册」标题切换、持久记忆 */
+  orgRosterView?: 'grid' | 'wall';
+  // AI 总结功能配置
+  summaryApiProvider?: 'openai' | 'deepseek' | 'kimi' | 'qwen' | 'gemini' | 'minimax' | 'custom';
+  /** 第 14 批 · 自定义服务商（第 7 个胶囊）：显示名（「硅基流动」「我的中转站」…）；空 = 预设名或「自定义」 */
+  customProviderName?: string;
+  /** 自定义服务商的请求协议：OpenAI 兼容（默认）/ Anthropic Messages */
+  customProviderProtocol?: 'openai' | 'anthropic';
+  /** 自定义服务商选的预设（取 Key 入口跟着它）：siliconflow / ark / zhipu / openrouter / anthropic / relay */
+  customProviderPreset?: string;
+  /**
+   * 各服务商独立存档（配好多家、点胶囊即切）。
+   * 上面 summaryApiKey / summaryApiBaseUrl / summaryModel / navigatorModel 是**当前生效**的
+   * 那一份（所有消费方只读它们，无需感知本表）；切换服务商时先把生效值存回旧家的档，
+   * 再把新家的档载入生效位。verifiedAt = 该家最近一次「测试连接」成功的时间戳（亮绿灯用）。
+   */
+  aiProfiles?: Partial<Record<
+    'openai' | 'deepseek' | 'kimi' | 'qwen' | 'gemini' | 'minimax' | 'custom',
+    {
+      key?: string; baseUrl?: string; model?: string; navModel?: string; verifiedAt?: number; models?: string[];
+      /** 这家当生效服务商时，深思熟虑档指向哪家（第 17 批：和 navModel 成对存取，切胶囊不再「模型换了、指向没换」） */
+      navProvider?: 'openai' | 'deepseek' | 'kimi' | 'qwen' | 'gemini' | 'minimax' | 'custom';
+      /** /models 顺带给出的能力（v2.7.0.6）：能否看图、最大输出。只有部分服务商给（如 DeepSeek） */
+      modelCaps?: Record<string, { image?: boolean; maxOutput?: number }>;
+    }
+  >>;
+  /**
+   * 第 13 轮：不放行浏览器跨域预检、只能走 App 原生通道（CapacitorHttp）的 AI 主机（host[:port]）。
+   * 测试连接时自动登记 / 注销；原生通道没有流式，回复整段出现。网页版没有原生层，登记了也走普通 fetch。
+   */
+  aiNativeHosts?: string[];
+  summaryApiKey?: string;
+  summaryApiBaseUrl?: string;
+  summaryModel?: string;
+  /** 黑猫（Navigator）对话专用模型覆盖：空/未设 = 跟随全局 summaryModel。
+   *  连接（provider/key/baseUrl）恒复用全局，只换 model —— 聊天值得用更好的模型，
+   *  其余批量任务（塔罗/记账解析等）继续用全局便宜档。 */
+  navigatorModel?: string;
+  /** 深思熟虑档跨平台指向：设了且那家在 aiProfiles 有 Key 时，中长期占卜/助手
+   *  改用那家的连接跑 navigatorModel；未设 = navigatorModel 属于当前生效服务商。 */
+  navigatorProvider?: 'openai' | 'deepseek' | 'kimi' | 'qwen' | 'gemini' | 'minimax' | 'custom';
+  /** 助手（Navigator）专属模型：只管对话/问候/人格生成这条线，空 = 跟随深思熟虑档。
+   *  与 navigatorModel 分开存，才能做到「换助手的模型不动中长期占卜」（用户口径）。 */
+  assistantModel?: string;
+  /** 助手专属模型的平台指向（同 navigatorProvider 语义，作用域只有助手） */
+  assistantProvider?: 'openai' | 'deepseek' | 'kimi' | 'qwen' | 'gemini' | 'minimax' | 'custom';
+  /** 👁 视觉档（FS3）：看图的模型（拍照记账 / 图片理解）。空 = 没配，走 OCR 或手输。
+   *  与深思熟虑同构：可跨平台指向别家（那家 aiProfiles 有 Key 才生效）。 */
+  visionModel?: string;
+  visionProvider?: 'openai' | 'deepseek' | 'kimi' | 'qwen' | 'gemini' | 'minimax' | 'custom';
+  /** 🎤 听觉档（FS3）：语音转写模型（走 OpenAI 兼容 /audio/transcriptions）。
+   *  空 = 不显示黑猫输入栏的话筒（除非原生识别可用）。 */
+  audioModel?: string;
+  audioProvider?: 'openai' | 'deepseek' | 'kimi' | 'qwen' | 'gemini' | 'minimax' | 'custom';
+  summaryPromptPresets?: SummaryPromptPreset[];
+  summaryActivePresetId?: string;
+  /**
+   * 是否在"成长总结"里统计"特殊条目"——逆影战场击破、本周目标、逆流 等。
+   * 默认 false（历史行为）；
+   * 开启后这些条目会进入总结的数据统计与活动清单
+   * 同伴（category=confidant）始终会被统计，不受本开关控制
+   */
+  summaryIncludeSpecial?: boolean;
+  // 开屏动画
+  splashStyle?: 'velvet' | 'p5' | 'p3' | 'p4';
+  splashSpeed?: 'fast' | 'normal' | 'slow';
+  // 逆影战场
+  battleEnabled?: boolean;
+  battleShadowTimeStart?: number;
+  battleShadowTimeEnd?: number;
+  battleShadowTimeDays?: number[];
+  battlePlayerMaxHp?: number;
+  /** （引擎v2）Shadow 全局攻击倍率%（金手指），默认 100；攻击基础值走 BOSS_ATTACK_BY_LEVEL 等级表 */
+  battleAttackScale?: number;
+  /** （批3）登塔回顾的影之评语（AI 约100字点评）。默认 undefined=开；置 false 关闭。 */
+  battleCommentEnabled?: boolean;
+  // 可自定义 Prompt
+  battleVictoryPromptTemplate?: string;     // 胜利叙事提示模板
+  // 星象 / 塔罗
+  astrologyEnabled?: boolean;               // 默认 true
+  // 云同步：是否将同伴（confidants / confidantEvents）一并上传到云端
+  // 默认 true；置为 false 时 push/pull 会跳过这两张表（本地依然完整保留）
+  syncConfidantsToCloud?: boolean;
+  /**
+   * 云同步：是否将治疗终端「启动素材库」(wishes) 上传到云端。
+   * F3 opt-in：默认 undefined / false = 不上云（仅存本地）；仅当用户显式勾选才 push/pull。
+   */
+  syncWishesToCloud?: boolean;
+  /**
+   * 云同步：是否将黑猫的自定义人格 + 原子记忆（navigatorPresets / navigatorMemos）上云。
+   * FS1 opt-in：默认 undefined / false = 只存本地。聊天原文（sessions/messages）永不上云。
+   */
+  syncNavigatorToCloud?: boolean;
+  /**
+   * 云同步免责声明的同意时间（ISO）。undefined = 尚未同意，
+   * 登录弹窗会先出声明页；已登录的存量用户在账号页补弹一次。
+   */
+  cloudConsentAt?: string;
+  /**
+   * 云同步黑名单：列出不需要同步的表名。
+   * 默认 undefined = 全部同步（except 由 syncConfidantsToCloud 控制的"同伴"两张表）。
+   * 这里列出的表在 push/pull 时都会被跳过；本地依然完整保留。
+   * 注意：以下核心表受保护，不允许加入黑名单：users / attributes / settings
+   */
+  syncExcludedTables?: string[];
+  /**
+   * AI 模型 API Key 是否随 settings 同步到云端。
+   *  - true / undefined（默认）：push 会带上 summaryApiKey，pull 会接受云端的 key
+   *  - false：push 时从 settings 行中剔除 summaryApiKey / openaiApiKey；
+   *           pull 时若云端没有 key 则保留本地 key（不会被清空）
+   * **默认（undefined）= 不上传**（v2.6 起翻转，此前是默认上传）。
+   * 设成 true 才随同步上云，方便多设备共用同一把钥匙。
+   */
+  syncCloudApiKey?: boolean;
+  /**
+   * 谏言冷却锚点：上一次"开启残响对话"的时间戳（ISO）。
+   * 作为 3 天冷却的唯一真源 —— 不依赖 counselSessions / counselArchives 的存在与否，
+   * 避免用户通过清空归档绕过冷却。
+   */
+  lastCounselStartedAt?: string;
+  /**
+   * 上次上传到 PB users.avatar 的本地头像指纹（短哈希）。
+   * 用来在 pushAll 里跳过未变动的头像，避免每次同步都重新上传几百 KB。
+   * 空串 = 当前云端无头像；undefined = 从未尝试过。
+   */
+  lastUploadedAvatarSig?: string;
+  /**
+   * COOP 物化时是否调 AI 生成"解读 / 未来"。
+   * - true（默认）：调 AI；失败兜底用模板
+   * - false：直接用 "Ta 写给你..." / 牌意模板
+   * 用户在 ArcanaPickerForm 里勾选"不使用 AI 内容"会写为 false。
+   */
+  coopUseAIInterpretation?: boolean;
+  /**
+   * 「校直模式」——true 时全站 D0：斜轴归零、装饰动效静默。
+   * 与 prefers-reduced-motion / 低帧率永久降级相互独立，三者任一命中即 D0
+   * （UI_DESIGN_BOLD_V2.5.md §3）。设置 UI 随后续设置页迁移 PR 提供。
+   */
+  straightenMode?: boolean;
+}
+
+/** year：年度总结（v2.7.0.6 起单列；之前按 'month' 存、标签「YYYY年度总结」，读取处用 summaryKindOf 认回来） */
+export type SummaryPeriod = 'week' | 'month' | 'year';
+
+export interface SummaryPromptPreset {
+  id: string;
+  name: string;
+  systemPrompt: string;
+  isBuiltin?: boolean;
+}
+
+/**
+ * 归档总结里的"追问 Q&A"对：
+ * - 用户在生成完总结后追问一次；问答内容随总结一起持久化到 db.summaries
+ * - 旧记录里没有这两个字段是合法的（undefined），打开时按"未追问"渲染并保留追问入口
+ */
+export interface PeriodSummaryFollowUp {
+  question: string;
+  answer: string;
+  createdAt: Date;
+}
+
+/** 年度开场一行素材：日期（YYYY-MM-DD）+ 原文 */
+export interface YearRecapLine {
+  date: string;
+  text: string;
+}
+
+/**
+ * 年度开场（v2.7.0.6）的数字，全在本机算（utils/yearRecap），生成年度总结时定格进 PeriodSummary.recap。
+ * 没有数据的项留空，对应的那张卡就跳过。
+ */
+/** 岁时印章（第 6 轮）：节气 / 节日当天记过一条就收一枚；月度心魔与委托的印记也放这张表 */
+export interface SeasonStamp {
+  /** = 岁时键 `${YYYY-MM-DD}-${kind}-${slug}` */
+  id: string;
+  kind: 'term' | 'festival' | 'moon' | 'quest' | 'raid';
+  name: string;
+  date: string;
+  year: number;
+  collectedAt: string;
+}
+
+export interface YearRecap {
+  v: 1;
+  year: number;
+  /** 统计截止日：年内生成是当天，过了年是 12/31 */
+  asOf: string;
+  /** 1/1 到截止日一共几天 */
+  spanDays: number;
+  daysRecorded: number;
+  records: number;
+  /** 每月记录数（12 项） */
+  monthly: number[];
+  /** 多半在什么时段写（占四成以上才给） */
+  habit?: { label: string; pct: number };
+  /** 最晚的一夜：23:00～次日 5:00 里最晚写下的一条（at 为 ISO 时间） */
+  lateNight?: { at: string; text: string };
+  points: number;
+  attrs: Array<{ id: AttributeId; name: string; points: number }>;
+  /** 去年的总加点（去年有记录才给） */
+  prevPoints?: number;
+  streak?: { days: number; start: string; end: string };
+  todos?: { checkins: number; top?: { title: string; count: number } };
+  highlights: YearRecapLine[];
+  /** 带配图的记录 id：配图只存本机，重温时本机有图才显示 */
+  photoIds: string[];
+  countdown?: {
+    reached: Array<{ title: string; date: string; how: 'date' | 'todos' }>;
+    created: number;
+    next?: { title: string; days: number };
+  };
+  tarot?: { draws: number; cardId: string; count: number };
+  /** 记录上带的天气（第 6 轮，只在本机有）：≥ 5 条才给这张卡 */
+  weather?: { total: number; rainy: number; snowy: number; sunny: number };
+  wishes?: {
+    fulfilled: YearRecapLine[];
+    closer: Array<{ title: string; gained: number; now: number }>;
+  };
+  memory?: { first: YearRecapLine; last: YearRecapLine; days: number; records: number; firstEver: boolean };
+}
+
+export interface PeriodSummary {
+  id: string;
+  period: SummaryPeriod;
+  startDate: string; // ISO date string YYYY-MM-DD
+  endDate: string;   // ISO date string YYYY-MM-DD
+  label: string;     // e.g. "2026年第9周" / "2026年3月"
+  content: string;   // AI generated markdown text
+  promptPresetId: string;
+  promptPresetName: string;
+  totalPoints: number;
+  attributePoints: Record<string, number>;
+  activityCount: number;
+  createdAt: Date;
+  /** v2.1+：归档时把追问问答一并存下；老记录此字段为 undefined */
+  followUp?: PeriodSummaryFollowUp;
+  /**
+   * v2.7.0.6：追问放开到多轮（上限见 utils/summaryAI 的 SUMMARY_FOLLOWUP_LIMIT）。
+   * 老记录只有单个 followUp；读取时两者合并（followUp 视为第一轮）。
+   */
+  followUps?: PeriodSummaryFollowUp[];
+  /**
+   * 角色手记（v2.7.0.6）：这一期角色对客人说过的话 / 留下的期待，一两句（≤60 字），
+   * 由同一次调用顺手写在 <<<META>>> 之后。下一期喂回去，角色才"记得上次说过什么"。
+   */
+  memo?: string;
+  /** 角色在结尾向客人提的那个问题（v2.7.0.6）：追问框拿它当默认输入 */
+  question?: string;
+  /** 这一份是否走了深思熟虑档（只作展示，老记录无） */
+  deliberate?: boolean;
+  /** 后台自动撰写的（v2.7.0.6）：归档里打「自动」标 */
+  autoWritten?: boolean;
+  /** 年度开场用的数字（v2.7.0.6）：生成时定格，重温原样放；只有年度总结有 */
+  recap?: YearRecap;
+  /** v2.5+：用户首次打开该总结的时间；undefined = 未读（F2a「未读成长总结」提醒源）。 */
+  viewedAt?: Date;
+  /**
+   * 重建追问所需的"原始 prompt 上下文"：
+   * 不存就没法在归档里再次追问（要重新组 prompt 太麻烦），所以一同存下。
+   * 老记录无此字段时，归档详情里"追问"按钮置灰并显示提示。
+   */
+  reqContext?: {
+    baseUrl: string;
+    model: string;
+    /** 走的是哪家（v2.7.0.6）：深思熟虑档可能指向别家，追问时要用那家的 Key 重连 */
+    provider?: 'openai' | 'deepseek' | 'kimi' | 'qwen' | 'gemini' | 'minimax' | 'custom';
+    /** system + user 原始消息（不含 assistant），重新追问时再 push 上次 streamedText 与新 question */
+    messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
+  };
+}
+
+/**
+ * 记录配图（v2.7.0.6）。图片**不进 activities 行**：那张表整表常驻内存、整表上云，
+ * 塞 base64 会拖慢首页与同步。这里按记录 id 关联，元数据 + 缩略图一张表（列表只读它），
+ * 原图另一张表（灯箱打开时才取）。两张表都**不上云、不进主备份**（与同伴自定义头像同口径），
+ * 单独走「图片包」导出 / 导入（services/backup）。
+ */
+export interface ActivityImage {
+  id: string;
+  activityId: string;
+  /** 缩略图（长边 ≤ 240，JPEG）——列表 / 管理面板用 */
+  thumbDataUrl: string;
+  width: number;
+  height: number;
+  /** 原图字节数（压缩后） */
+  bytes: number;
+  createdAt: Date;
+}
+
+/** 记录配图的原图（长边 ≤ 1280、≤ 150KB JPEG），主键与 ActivityImage.id 相同 */
+/** 导入音乐（第 13 轮 B 组 2.8）：本机专属，Blob 直接存表；不进 SYNC_TABLES、不进主备份 */
+export interface BgmTrack {
+  id: string;
+  name: string;
+  size: number;
+  mime: string;
+  blob: Blob;
+  createdAt: Date;
+}
+
+export interface ActivityImageData {
+  id: string;
+  dataUrl: string;
+}
+
+// ── CallingCard / 宣告卡（倒计时） ───────────────────────────
+//
+// 设计契机：参考 P5 的"预告函"——玩家"宣告"要拿下某件事，把它从抽象目标
+// 拍打成一张带日期 / 任务清单的实体卡片。本系统支持三种模式：
+//   - deadline：纯日期倒计时（高考 / 婚礼 / 截稿日）
+//   - todos：完成一组手选的待办（最多 7 条）
+//   - both：两者皆有，先达成的一头先关掉这张卡
+//
+// 上限语义（todos / both）：
+//   - 关联的 repeatDaily todo → 当日是否完成 算一格
+//   - 关联的单次 todo → 是否最终 completed (!isActive && completedAt) 算一格
+//   - 进度 = 满足格子 / linkedTodoIds.length
+//   - both 模式下：日期到了 OR 任务全清，先到的一方触发归档
+//
+// pinned 互斥：保存时 pinned=true 会把其它 unpin（store 层处理）
+
+export type CallingCardMode = 'deadline' | 'todos' | 'both';
+/**
+ * 纹理类型（v2.1 起 tone 字段语义改为"纹理"，颜色全部跟随当前主题 primary）：
+ *   - lines / grid / dots / plain：新值，纹理形态
+ *   - red / blue / gold：legacy 兼容值（旧用户的卡片仍能正常展示，渲染时映射为 lines/grid/dots）
+ */
+export type CallingCardTone = 'lines' | 'grid' | 'dots' | 'plain' | 'red' | 'blue' | 'gold';
+
+export interface CallingCard {
+  id: string;
+  /** 主标题：宣告"要做什么" */
+  title: string;
+  /** 副标题 / 宣告台词，可空。占位 placeholder 鼓励但不强制 */
+  subtitle?: string;
+
+  mode: CallingCardMode;
+
+  /** deadline / both 模式：目标日期 (YYYY-MM-DD)，避 UTC 偏移用本地 key */
+  targetDate?: string;
+  /** 起算日期：默认创建日，用于算"已征途 X / 共 N 天"百分比 */
+  startDate: string;
+
+  /** todos / both 模式：关联的 todoId 顺序数组，最多 7 条 */
+  linkedTodoIds?: string[];
+
+  /** 视觉调性 —— 背景情绪色（红 / 蓝 / 金）；强调色随当前主题 primary */
+  tone: CallingCardTone;
+  /** 卡片图标 emoji，默认 ✦ */
+  icon?: string;
+
+  /** 钉到首页 HERO 卡（互斥，仅 1 张） */
+  pinned: boolean;
+
+  /** 归档 / 完成态 */
+  archived: boolean;
+  archivedAt?: Date;
+  /**
+   * 归档原因：
+   *   - auto_date：targetDate 已过 → 自动归档（cut-in 文案"宣告 · 时之至"）
+   *   - auto_todos：linked todos 全部满足 → 自动归档（cut-in 文案"宣告 · 达成"）
+   *   - manual：用户在 ⋯ 菜单里手动归档
+   */
+  archiveReason?: 'auto_date' | 'auto_todos' | 'manual';
+
+  /**
+   * 完成结算屏是否已展示过。避免每次进 Dashboard 都重弹，
+   * sweep 自动归档时第一次设 false → CutIn 渲染后置 true。
+   */
+  cutInShown?: boolean;
+
+  /**
+   * 是否已"留下记录"——cut-in 上点了"留下记录"会写一条 Activity，
+   * 同一张卡片只允许写一次，避免重复刷成长记录。
+   */
+  ledgerWritten?: boolean;
+
+  /**
+   * F3 治疗终端小步卡标记。存在即表示这是「短路决策」生成的 24h 当前小步，
+   * 与普通宣告卡区分：不占 pinned、被 sweepCallingCards 跳过（完成由用户手动
+   * 「我做到了」触发 completeTerminalTask，不靠日期到期自动归档）。
+   */
+  terminal?: {
+    sourceKind: 'wish' | 'todo';
+    sourceId: string;
+    /** 完成奖励落点属性；缺省 → 归「勇气」(guts) */
+    attribute?: AttributeId;
+    /** 叙事用的父级素材标题（wish 来源为父级素材；todo 来源可空） */
+    goalTitle?: string;
+    /** 起算 / 24h 到期时间（ISO） */
+    startedAt: string;
+    expiresAt: string;
+  };
+
+  createdAt: Date;
+}
+
+// ── 抽签（决策短路转世，TASKS_MERGE_PRD §4.2） ──
+
+/** 抽签候选：三源奖池条目（今日待办 / 愿望纸片 / 近 30 天手动记录） */
+export interface FateCandidate {
+  /** 当日沉底键：todo:{id} / wish:{id} / hist:{同一件事的键} / quest:{今日委托预设 id} */
+  key: string;
+  /** quest = 今日委托（第 17 批加的第四个来源） */
+  kind: 'todo' | 'wish' | 'history' | 'quest';
+  title: string;
+  todoId?: string;
+  wishId?: string;
+  /** wish/history/quest 接受成任务时的属性与点数建议（history 取最近那条记录最大加点维度） */
+  attribute?: AttributeId;
+  points?: number;
+  /** 旧事：近 60 天里做过几天、上次是几天前（揭示时写来由，第 17 批） */
+  historyDays?: number;
+  lastDaysAgo?: number;
+  /** 今日委托：预设 id（接受时带 lifeQuest 标记） */
+  presetId?: string;
+  /** 抽取权重（来源权重 × 条目权重；缺省 1） */
+  weight?: number;
+}
+
+// ── F6 黑猫 Navigator · 持久化（Batch3） ──
+
+/** 人格 preset：人格是皮肤，能力是骨架——personaPrompt 只影响口吻，功能协议不可触。 */
+export interface NavigatorPreset {
+  id: string;
+  name: string;
+  /** 内置剪影 id（'cat'|'toaster'|'bear'…）或本地头像 dataUrl（local-only，永不上云） */
+  avatar?: string;
+  personaPrompt: string;
+  /** 切换/新会话开场的一句接管语（内置手写；自定义可空走通用） */
+  handoffLine?: string;
+  /** 口吻示例（第 13 轮）：两三句这个人格会说的话，只教语气和长短，不是台词库。内置人格自带；自定义可空 */
+  examples?: string[];
+  isBuiltin: boolean;
+  createdAt: Date;
+  /** 固定喜好（第二批「自己的一天」）：内置人格写在代码里；自定义人格第一次用到时 AI 按设定写一份，编辑人格里能改 */
+  traits?: PersonaTraits;
+}
+
+/** 人格的固定喜好：喜欢 / 讨厌 / 跟天气季节节日有关的小习惯 */
+export interface PersonaTraits {
+  likes: string[];
+  dislikes: string[];
+  habits: string[];
+}
+
+/** 会话行：每日每人格最多一条活跃会话（跨天清流、切人格开新会话） */
+export interface NavigatorSessionRow {
+  id: string;
+  dateKey: string;
+  presetId: string;
+  /** compact 双产物：中性摘要（检索/续接用）+ 人格口吻版（注入用；人格绑定随会话归档） */
+  compactedSummary?: string;
+  personaSummary?: string;
+  /** 被打断没说出口的段落（吞话回捞，跨重启存活） */
+  swallowed?: string[];
+  /** 这天用户开过口（第二批「相处时长」数聊过几天用；老会话缺这个字段时按消息 / 摘要补算一次） */
+  userSpoke?: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/** 消息行：与内存态 NavigatorMessage 对齐；draft 序列化存 JSON */
+export interface NavigatorMessageRow {
+  id: string;
+  sessionId: string;
+  role: 'cat' | 'user' | 'card' | 'summary';
+  text?: string;
+  /** 用户随消息附的图片（降采样 data URL；FS3.4 聊天发图）。可选字段，Dexie 无需升版 */
+  imageDataUrl?: string;
+  /** 视觉档对这张图的转述（第 4 轮）：存下来就不会一轮被打断后再转述一遍，历史里也不再只剩占位符 */
+  imageDesc?: string;
+  draftJson?: string;
+  cardStatus?: 'pending' | 'done' | 'cancelled';
+  /** 用户手改过这张卡（进卡片实录，让模型知道内容已不是它提议的那版） */
+  userEdited?: boolean;
+  receipt?: string;
+  createdAt: number;
+}
+
+/** 原子记忆（三源：对话沉淀/观察日记/手动；F8 图片记忆卡共用此表 source='image'；
+ *  source='profile' 为特殊单行 = AI 维护的用户画像总览（常驻注入，用户可编辑） */
+export interface NavigatorMemo {
+  id: string;
+  source: 'chat' | 'observation' | 'manual' | 'image' | 'profile';
+  /** 中性事实文本（不带人格口吻——口吻在 prompt 组装时现场渲染） */
+  text: string;
+  /** 情绪元数据（"用户提起时很沮丧"），可选 */
+  colorHint?: string;
+  /** 1..5；置顶=拉满且免疫遗忘 */
+  importance: number;
+  /** 未完话头（一次性：被黑猫提起后清空） */
+  followUp?: string;
+  status: 'active' | 'archived';
+  pinned?: boolean;
+  createdAt: Date;
+  lastRecalledAt?: Date;
+  recallCount?: number;
+  /**
+   * 回访约定（第二批）：一件带日子的事（面试、考试、体检……）。那件事过后第一次见面问一次结果，
+   * 只问一次。text 是中性事实（「10月3日（周六）有面试」），下面几个字段管什么时候问、问没问过。
+   */
+  dueDate?: string;
+  /** 那件事在一天里的什么时候：上午的事当天中午后问、白天的事当天 18 点后问、晚上的事第二天早上问 */
+  dueWhen?: 'morning' | 'day' | 'evening';
+  /** 事情的短名（≤12 字，问的时候用、判断提没提也用） */
+  promiseTopic?: string;
+  /** 等着 → 问过了 / 他自己说了结果 / 作废（三天内没机会问或顺延了两次）；后三种永不再进上下文 */
+  promiseState?: 'waiting' | 'asked' | 'resolved' | 'expired';
+  /** 交给模型之后它没问的次数（≥2 作废，不追着问） */
+  promiseDeferred?: number;
+  /** 当天的加油给过了（只一次） */
+  promiseCheered?: boolean;
+  promiseClosedAt?: Date;
+}
+
+/** BIG DEAL 收官结算屏载荷（TASKS_MERGE_PRD 批4） */
+export interface BigDealClearPayload {
+  todoId: string;
+  title: string;
+  stepsCount: number;
+  /** 实际入账 SP（战场关闭 / 未初始化 = 0） */
+  sp: number;
+  /** 触及属性（收官记录里各 +1） */
+  attrs: AttributeId[];
+}
+
+// ── 回归面板（PRD_V2.6 §12）────────────────────────────────────────────────
+
+/** 回归档位：7–14 天可选日历补记；14 天以上只给一句话——那么久之前的事，逐日回忆是编故事 */
+export type ReturnTier = 'recent' | 'distant';
+
+/** 回归面板要展示的一切。全部是**真实数据**——「欢迎回来」这句话要有分量，就不能是空话 */
+export interface ReturnPayload {
+  /** 离开天数 */
+  daysAway: number;
+  tier: ReturnTier;
+  /** 这是第几次回来（本次已计入） */
+  returnCount: number;
+  /** 上次打开的日期 YYYY-MM-DD */
+  lastSeenKey: string;
+  /** 可补记的日期（旧 → 新，最多 14 天；distant 档为空数组） */
+  backfillDays: string[];
+  /** 记录总条数——「一条都没有少」这句话的依据 */
+  totalRecords: number;
+  /** 最高的那一维：{ id, 名称, 等级 }，用于那句「并没有削减你的◯◯」 */
+  topAttribute: { id: AttributeId; name: string; level: number } | null;
+}
+
+/** 补记的一条：挂在哪天、写了什么。points 从来源条目继承，但落库时一律清零（见 §12 红线） */
+export interface BackfillEntry {
+  /** YYYY-MM-DD */
+  dateKey: string;
+  text: string;
+}
+
+/** 任务完成后的愿望进度弹窗载荷（PRD_V2.6 §8） */
+export interface WishProgressCutPayload {
+  wishId: string;
+  wishTitle: string;
+  /** 新落点 */
+  pct: number;
+  /** 相对上次涨了多少（可能为 0——AI 认为这次没推近，照实说） */
+  delta: number;
+  reason?: string;
+  source: WishProgressSource;
+  /** 挂载记录总次数，弹窗里作副信息 */
+  times: number;
+}
+
+/**
+ * 黑猫谈话中的进度提议（PRD_V2.6 §8）。
+ * **只是提议**——必须用户点确认才写库，任何情况下不静默落数。
+ */
+export interface WishProposalPayload {
+  wishId: string;
+  wishTitle: string;
+  /** 现值（undefined = 从未评估过） */
+  fromPct?: number;
+  /** 建议落点 */
+  toPct: number;
+  reason?: string;
+}
+
+// 本周目标
+export type WeeklyGoalType = 'activity_count' | 'todo_count' | 'attr_points' | 'total_points';
+
+export interface WeeklyGoalItem {
+  type: WeeklyGoalType;
+  attribute?: AttributeId;    // activity_count / attr_points 时指定属性
+  target: number;
+  current: number;
+}
+
+export interface WeeklyGoal {
+  id: string;
+  weekStart: string;          // YYYY-MM-DD（周一）
+  weekEnd: string;            // YYYY-MM-DD（周日）
+  goals: WeeklyGoalItem[];
+  reward: string;             // 用户自定义奖励文案
+  completed: boolean;
+  completedAt?: Date;
+  rewardAttribute?: AttributeId;  // 完成后用户选择的奖励属性
+  rewardPoints?: number;          // 实际发放的奖励点数
+  createdAt: Date;
+}
+
+// ── 委托板（2.7.0.6 第 6 轮）────────────────────────────────
+//
+// 每周一刷新三张委托，全部按已有数据现算进度、手动领取。只发 SP（没开战场的账号只记计数），不发属性点。
+// 进度不落库：每次打开按本周数据重算，所以 quests 行只存「这周是哪三张、目标多少、领没领」。
+
+export type QuestTemplateId =
+  | 'attr_least' | 'attr_most' | 'bigdeal_steps' | 'all_todos_3days' | 'record_7days' | 'streak_3days'
+  | 'tarot_3days' | 'pact_once' | 'images_2' | 'summary_1' | 'ledger_3' | 'battle_once' | 'important_2'
+  | 'life_3';
+
+export interface Quest {
+  /** `${weekKey}-${slot}`：同一周两台设备生成同一组，同步时天然合并 */
+  id: string;
+  /** 周一 YYYY-MM-DD */
+  weekKey: string;
+  slot: number;
+  templateId: QuestTemplateId;
+  /** 属性委托：本周要记的那一维 */
+  params?: { attribute?: AttributeId };
+  target: number;
+  rewardSp: 5 | 10 | 15;
+  createdAt: string;
+  /** 领取时间（领取即完成） */
+  claimedAt?: string;
+  /** 上周做完没领、这周刷新时替你领的 */
+  autoClaimed?: boolean;
+  /** 用了本周的「换一张」换来的（每周一次，第 14 批） */
+  swapped?: boolean;
+}
+
+// ── F5 心相记账 ──────────────────────────────────────────
+
+/** 一笔记账的方向：支出 / 收入 / 总余额对账调整 */
+export type LedgerDirection = 'expense' | 'income' | 'adjust';
+/** 支出类目（生活场景；study=成长项，触发属性加点奖励） */
+export type LedgerExpenseType = 'food' | 'transport' | 'shopping' | 'fun' | 'home' | 'study' | 'other';
+/** 收入类 */
+export type LedgerIncomeType = 'labor' | 'other';
+/** 消费评估（可选，默认关）：这笔值不值 */
+export type SpendWorth = 'worth' | 'notWorth';
+
+export interface LedgerEntry {
+  id: string;
+  direction: LedgerDirection;
+  /** 金额，正数；direction='adjust' 时可正可负（对账增减） */
+  amount: number;
+  /** 货币代码，如 'CNY'；默认随 settings.currency */
+  currency: string;
+  note?: string;
+  /** 'YYYY-MM-DD' 本地日期 */
+  date: string;
+  source: 'manual' | 'ai';
+  createdAt: Date;
+  // ── 支出专属 ──
+  type?: LedgerExpenseType;
+  /** 二级类目（餐饮/交通/娱乐…），可选 */
+  category?: string;
+  /** 渠道（支付宝/微信/卡/现金…），可选 */
+  channel?: string;
+  /** 投资类自选加点属性（phase ③ 奖励用） */
+  attribute?: AttributeId;
+  /** 消费评估（phase ③） */
+  evalWorth?: SpendWorth;
+  /** 已登记为资产则回链（phase ②） */
+  assetId?: string;
+  /** 图片导入回链记忆卡（F8a） */
+  sourceMemoId?: string;
+  /** （第 13 轮 2.6）对账轮次：同一轮里按账户写的几条调整共享一个 id，每月 3 次按「轮」算 */
+  adjustRound?: string;
+  // ── 收入专属 ──
+  incomeType?: LedgerIncomeType;
+  // ── 奖励回收（删除时精确逆转）──
+  /** 落账时实际发放的奖励快照（SP + 投资属性加点的活动 id），删除该条目时据此精确回收。 */
+  reward?: {
+    sp: number;
+    attr?: { activityId: string; attribute: AttributeId; points: number };
+  };
+}
+
+/** 月度预算（纪律层，独立于总余额）。一个 period 一条。 */
+export interface Budget {
+  id: string;        // = period
+  period: string;    // 'YYYY-MM'
+  monthlyLimit?: number;
+  /** 每日额定预算；缺省时取 monthlyLimit / 当月天数 */
+  dailyLimit?: number;
+  /** 「省钱挑战」目标：本月想省下多少（预算−支出 ≥ 此值即达成，次月结算 +10SP） */
+  savingsGoal?: number;
+  /** 「省钱挑战」目标已修改次数（每月限 2 次） */
+  savingsGoalEdits?: number;
+  /** （第 13 轮）这期的花费上限是从哪一期沿用来的（'YYYY-MM'）；用户改过后清掉 */
+  carriedFrom?: string;
+  createdAt: Date;
+}
+
+/** 固定资产登记（phase ② 资产板块用；类型先定、表 v10 已建） */
+export interface LedgerAsset {
+  id: string;
+  name: string;
+  /** 类目 → 绑定开源图标（不存照片） */
+  category: string;
+  price: number;
+  purchaseDate: string;  // 'YYYY-MM-DD'
+  status: 'inuse' | 'idle' | 'soldout';
+  /** 附加费用（如手机壳） */
+  addOns?: Array<{ name: string; amount: number }>;
+  /** 由某笔消费登记则回链 */
+  linkedEntryId?: string;
+  createdAt: Date;
+}
+
+// ── 逆影战场 ─────────────────────────────────────────────
+
+export interface PersonaSkill {
+  level: number;
+  name: string;
+  description: string;
+  /** damage=直接伤害 | crit=暴击型伤害(10-30%双倍+失衡) | buff=提升下次伤害 | debuff=施加易伤 | charge=蓄力(下回合双倍) | heal=回复HP | attack_boost=攻击增益(伤害+3回合增伤) */
+  type: 'damage' | 'buff' | 'debuff' | 'crit' | 'charge' | 'heal' | 'attack_boost';
+  power: number;
+  spCost: number;
+  // ── 批3 · 养成扩展（全部可选，AI schema 不变） ──
+  /** 熟练度：累计使用次数。星级由 numbers.masteryStars 派生（每星 +5% 加算） */
+  mastery?: number;
+  /** 解锁标记：只会 false→true（存量迁移按当时属性等级置位=不回锁；此后走双条件） */
+  unlocked?: boolean;
+  /** 迷思镶嵌（denormalized 快照；stoneId 指向 arsenal.myths；誓约技不可镶）。
+   *  permanent=觉醒烧录：石已消耗、词条永久，不可卸除 */
+  socket?: { stoneId: string; kind: MythKind; value: number; permanent?: boolean };
+  /** （R18 觉醒）轮次：满星消耗一颗迷思烧录词条+改名，星级清零进下一轮（每星价值 ×(轮+1)） */
+  awakenRound?: number;
+  /** 誓约置换：本体已是誓约技；original 为被替换技能的完整快照（卸下时恢复） */
+  oath?: { stoneId: string; kind: OathKind; original: PersonaSkill };
+  /** 誓约技行为扩展（本地定义，不进 AI schema） */
+  oathEffect?: OathEffectKind;
+}
+
+export interface Persona {
+  id: string;
+  name: string;
+  description?: string;
+  attributePersonas?: Record<AttributeId, { name: string; description: string }>;
+  equippedMaskAttribute?: AttributeId | null;
+  createdViaAI: boolean;
+  skills: Record<AttributeId, PersonaSkill[]>;
+  /** （批3）召唤台词：每属性一句，AI 批量生成后缓存；无 Key 用模板 */
+  summonLines?: Partial<Record<AttributeId, string>>;
+  /** （第 13 轮）觉醒问答的附加题「力量之源」：最多两类；没答 = 按原规则不限范围。洗牌时沿用 */
+  sources?: PersonaSourceId[];
+  createdAt: Date;
+}
+
+/** 力量之源：太初的光芒（神明）/ 文明的墨痕（古代伟人）/ 蒸腾的汽焰（近代名人）/ 二进制之海（近现代）/ 幻想与纹样（文艺作品角色） */
+export type PersonaSourceId = 'primordial' | 'ancient' | 'steam' | 'binary' | 'fantasy';
+
+// ── 批3 · 战利品与养成（遗物/迷思/誓约/共鸣链/词缀） ────────────
+
+/** 品质三档：残月 / 弦月 / 满月 */
+export type LootQuality = 'waning' | 'half' | 'full';
+
+export type RelicKind =
+  | 'monocle'      // 猎手的单片镜：弱点伤害+
+  | 'pocketwatch'  // 月光怀表：回合开始+SP
+  | 'bulwark'      // 铁壁徽记：格挡时回复HP
+  | 'venomfang'    // 蚀骨之牙：中毒伤害+
+  | 'starchart'    // 观星者的星图：暴击率+
+  | 'hourglass'    // 逆流沙漏：蓄力伤害额外+
+  | 'bandage'      // 执念绷带：HP<30% 时受伤−
+  | 'tuningfork'   // 共鸣音叉：加算段总和+
+  | 'lightningrod' // 引雷针：1More 后下次伤害+
+  | 'compass'      // 登塔者罗盘：塔内节点 SP 收益+
+  | 'maskstrap'    // 面具挂绳：切换面具后首次攻击+
+  | 'handwarmer'   // 影之怀炉：回响节点回复+
+  | 'heroproof';   // 英雄的证明：SP消耗−5 · 攻击+20%（Lv6 伪神唯一掉落，不进随机池）
+
+export interface RelicInstance {
+  id: string;
+  kind: RelicKind;
+  quality: LootQuality;
+  /** 词条值（百分比类存小数 0.08=8%；SP/HP 类存整数） */
+  value: number;
+  equipped?: boolean;
+  obtainedAt: string; // YYYY-MM-DD
+}
+
+export type MythKind =
+  | 'charge_echo'   // 蓄力余韵：命中后概率获得蓄力
+  | 'life_siphon'   // 生命虹吸：命中回复HP
+  | 'venom_bite'    // 淬毒之牙：附带1层中毒（仅 damage/crit 可镶）
+  | 'keen_eye'      // 慧眼：该技能暴击率+
+  | 'amp_circuit'   // 增幅回路：命中后下次伤害+
+  | 'calm_ripple'   // 镇静涟漪：命中后概率施加镇静
+  | 'flaw_insight'  // 破绽洞察：该技能弱点伤害+
+  | 'moon_echo'     // 月光余响：该技能 SP 消耗−（下限1）
+  | 'stagger_boost';// 失衡助推：该技能失衡充能+
+
+export interface MythStone {
+  id: string;
+  kind: MythKind;
+  quality: LootQuality;
+  value: number;
+  obtainedAt: string;
+}
+
+export type OathKind =
+  | 'abyss'      // 深渊之誓：heal 25% 最大HP
+  | 'storedbolt' // 蓄雷之誓：charge ×2.3
+  | 'soulfire'   // 燃魂之誓：高威伤害，自损10%当前HP
+  | 'shadowrot'  // 蚀影之誓：3层中毒+镇静
+  | 'aegis'      // 铁壁之誓：护盾60%+视为完全格挡
+  | 'moonlight'; // 月光之誓：+18 SP，每场1次
+
+export type OathEffectKind =
+  | 'heal_pct_max' | 'charge_23' | 'self_hp_cost' | 'poison_calm' | 'shield_block' | 'sp_once';
+
+export interface OathStone {
+  id: string;
+  kind: OathKind;
+  /** 已装备到哪个属性 Persona（每 Persona 限1；未装备 = undefined） */
+  equippedAttr?: AttributeId;
+  /** LLM 按人设命名缓存：attr → 名称/描述（重复装备不再调 AI） */
+  namedCache?: Partial<Record<AttributeId, { name: string; description: string }>>;
+  obtainedAt: string;
+}
+
+/** 共鸣链组合键：两属性按克制环顺序拼接 */
+export type ChainKey =
+  | 'knowledge+guts' | 'knowledge+dexterity' | 'knowledge+kindness' | 'knowledge+charm'
+  | 'guts+dexterity' | 'guts+kindness' | 'guts+charm'
+  | 'dexterity+kindness' | 'dexterity+charm' | 'kindness+charm';
+
+export interface ResonanceChain {
+  key: ChainKey;
+  obtainedAt: string;
+}
+
+/** 战斗背包（挂在 BattleState 上，跟随备份/恢复，无需新 Dexie 表） */
+export interface BattleArsenal {
+  relics: RelicInstance[];
+  myths: MythStone[];
+  oaths: OathStone[];
+  chains: ResonanceChain[];
+  /** 生效中的共鸣链（可保有多条，同时生效1条） */
+  activeChainKey?: ChainKey;
+}
+
+/** Shadow 词缀（本地零 AI）：强敌1条、心魔0-1条（异变加深每次+1） */
+export type AffixKind =
+  | 'stubborn'  // 顽固：HP+30%（生成时应用）
+  | 'keen'      // 敏锐：暴击+10%
+  | 'vengeful'  // 记仇：你曾下塔撤离→攻击+15%
+  | 'thorns'    // 荆棘：反弹10%所受直接伤害
+  | 'slippery'  // 湿滑：失衡条+50%长
+  | 'swift'     // 迅捷：开场先制
+  | 'eclipse'   // 月蚀：弱点隐藏（洞察或误打命中可揭示）
+  | 'greedy';   // 贪婪：击败多掉 SP+50%
+
+export interface Shadow {
+  id: string;
+  level: number;
+  name: string;
+  description: string;
+  invertedAttributes: Record<AttributeId, string>;
+  weakAttribute: AttributeId; // 弱点属性，对应技能伤害×1.5
+  /** （引擎v2）属性向：承伤/输出的克制环判定用；存量数据缺省时由 id 稳定派生 */
+  attribute?: AttributeId;
+  /** （引擎v2）二形态更换后的弱点/耐性（跨 session 恢复战斗时需要） */
+  phase2WeakAttribute?: AttributeId;
+  phase2ResistAttribute?: AttributeId;
+  maxHp: number;
+  currentHp: number;
+  maxHp2?: number;
+  currentHp2?: number;
+  /** （Lv6 伪神）第三条血——仅最终 BOSS 拥有；缺省 = 只有两形态 */
+  maxHp3?: number;
+  currentHp3?: number;
+  responseLines: string[];
+  attackPower: number;
+  /** （批3）词缀：显形时 0-1 条，月相日异变加深每次 +1 */
+  affixes?: AffixKind[];
+  /** （Lv6）最终 BOSS「伪神」标记：三条血 + 击破后走终局演出而非常规结算 */
+  isFinalBoss?: boolean;
+  /** （Lv6）伪神对你的指认（显形时 AI 生成一次，演出与档案复用，不重复生成） */
+  flaw?: FinalBossFlaw;
+  /** （第 6 轮 满月心魔）它是哪个满月的月度心魔（moonPhaseSlot 的奇数槽）；YYYY-MM 给档案与岁时册 */
+  moonSlot?: number;
+  moonMonth?: string;
+  createdAt: Date;
+}
+
+/** （Lv6）伪神的「缺点判词」：它读你的记录后指认的那一件事 */
+export interface FinalBossFlaw {
+  /** 档位 slug，如 'inconsistency' / 'perfectionism'（档案分组用） */
+  key: string;
+  /** 「三分钟热度」 */
+  title: string;
+  /** 一句指认，≤40 字，第二人称 */
+  verdict: string;
+}
+
+export interface DefeatedShadowRecord {
+  shadowName: string;
+  level: number;
+  breachDate: string;   // 识破日期 (ISO date string)
+  defeatDate: string;   // 击败日期 (ISO date string)
+  daysElapsed: number;  // 历时天数
+  // ── 批3 · 阴影档案馆扩展（存量记录缺省 = 首批藏品，字段留空） ──
+  description?: string;
+  affixes?: AffixKind[];
+  /** 代表台词（响应池抽一句） */
+  quote?: string;
+  /** 击败时的你：五维总等级快照 */
+  playerTotalLevel?: number;
+  stratumLevel?: number;
+  /** （第 6 轮）满月心魔：哪个月的（YYYY-MM） */
+  moonMonth?: string;
+}
+
+export interface BattleState {
+  id: 'current';
+  /** 旧单影模型遗留（shadowId / personaId / lastBattleDate / battleLog）：不再写入，只为老存档保留 */
+  shadowId?: string;
+  personaId?: string;
+  playerHp: number;
+  playerMaxHp: number;
+  lastBattleDate?: string;
+  lastChallengeDate?: string;   // 本次挑战日期（每天只能挑战一次）
+  sp: number;
+  totalSpEarned: number;
+  battleLog?: BattleLogEntry[];
+  status: 'idle' | 'in_battle' | 'shadow_phase2' | 'victory' | 'session_end';
+  shadowsDefeated: number;
+  lastDefeatedWeakAttribute?: AttributeId;
+  defeatedShadowLog?: DefeatedShadowRecord[]; // 已击败阴影历史
+  hpBonusFromDefeats?: number; // 击败Shadow累计获得的HP上限加成
+  /** （R18 面具羁绊）各面具累计出战场次（战斗胜利时按本场召唤过的面具 +1）→ 档位 Ⅰ/Ⅱ/Ⅲ 伤害加算 */
+  maskBattles?: Partial<Record<AttributeId, number>>;
+  /** （批2）当日登塔 session 统计与临时增益 */
+  towerSession?: TowerSessionStats;
+  /** （批3）战斗背包：遗物/迷思/誓约/共鸣链 */
+  arsenal?: BattleArsenal;
+  /** （批3）曾下塔撤离/败退过（「记仇」词缀与记忆台词的事实源） */
+  everRetreatedDown?: boolean;
+  /** （批4）勤勉的光辉：持有数（上限2；连续记录3天+1，塔内使用=完全恢复HP） */
+  diligenceCharges?: number;
+  /** （批4）勤勉的光辉：上次发放日期（YYYY-MM-DD，间隔≥3天才再发） */
+  diligenceLastGrantKey?: string;
+  /** （批4）战场成就事实：已达成的战斗壮举 id 列表 */
+  battleFeats?: string[];
+  /** （批5）深渊回廊：历史最深环数（本地纪录，验收"层数纪录持久"） */
+  abyssHighestRing?: number;
+  /** （第 6 轮 深渊周常）本周的规则与本周最好成绩；只和自己比，不做排行榜 */
+  abyssWeekly?: { weekKey: string; ruleId: AbyssRuleId; bestRing: number };
+  /** （第 6 轮）每条规则下到过的最深环 */
+  abyssRuleBest?: Partial<Record<AbyssRuleId, number>>;
+  /** （第 6 轮 满月心魔）本月的月度心魔（满月当天第一次打开 App 生成；只做当月） */
+  moonShadow?: MoonShadowState;
+  /** 击败过几只月度心魔（血量按它每只 +10%） */
+  moonDefeats?: number;
+  /** （批4）黑猫败因信：待投递（下次打开黑猫时推送并清除） */
+  pendingCatLetter?: { text: string; dateKey: string };
+  /**
+   * （Lv6 伪神）终局进度。字段缺省 = 尚未满足条件（不存 'locked'，少一个要迁移的取值）：
+   *  revealed = 已显形未击败 / finale = 三条血已破、终局演出进行中（杀进程后重入回到演出）/ defeated = 已终结
+   */
+  finalBossStage?: 'revealed' | 'finale' | 'defeated';
+  /** （Lv6）伪神对你的指认——显形时生成一次，演出与档案复用 */
+  finalBossFlaw?: FinalBossFlaw;
+  /** （Lv6）终结日期（YYYY-MM-DD，档案馆「终局」一栏） */
+  finalBossDefeatedAt?: string;
+  /** （Lv6 演出）当前阶段：杀进程后重入回到这里，而不是从头再演一遍 */
+  finalePhase?: FinalePhase;
+  /** （Lv6 演出）记录卡已命中数（0..18） */
+  finaleHits?: number;
+  /** （Lv6 演出）援军已发放的 SP 总量（封顶 1000，只发一次） */
+  finaleAllySp?: number;
+  /** （Lv6 演出）致命一击落地时的 SP：演出里会被碾到 1，终结后按「这个数 + 援军」还回去 */
+  finaleSpBefore?: number;
+  /**
+   * （R19「回头看看」）已通关的最高主塔区层。
+   *
+   * 为什么不直接看 stratum.level：塔与主影都是**单例表**，重游会把它们顶掉。
+   * 进度必须存在 battleState 里，否则「回头打一层 Lv2」会把 Lv5 的进度也一起降级。
+   */
+  maxStratumLevel?: number;
+  /** （R19）重游期间被寄存的主线区层与主影，回塔顶时原样放回 */
+  parkedStratum?: TowerStratum;
+  parkedShadow?: Shadow;
+  /** （第 8 轮 组织作战）领过达成奖励（+SP）的作战 id：跟着战场状态同步，换设备也不重复领（只留最近 200 个） */
+  orgOpRewards?: string[];
+  /** （组织 P2 满月团战）领过击破奖励的团战 id：同上，取并集、只留最近 100 个 */
+  orgRaidRewards?: string[];
+  /** （第 8 轮 借面具）本周借着的面具与本周已经带进了几场（周键对不上 = 新的一周：清零、借的还回去） */
+  borrow?: { weekKey: string; battles: number; mask?: BorrowedMask };
+}
+
+/** 借来的面具（第 8 轮 · PRD §13.5）：别人成员牌上展示的那份快照，借的时候校验、夹过值 */
+export interface BorrowedMask {
+  orgId: string;
+  orgName: string;
+  ownerId: string;
+  ownerCodename: string;
+  persona: OrgPersonaSnapshot;
+  /** 借的时候的据点系数（组织不在本机了就用它） */
+  mult: number;
+  /** 借的时刻（ISO；两台设备合并时取新的） */
+  at: string;
+}
+
+/** Lv6 终局演出的八段（PRD_FINAL_BOSS §5）；reward = 掉落屏 */
+export type FinalePhase =
+  | 'shock' | 'taunt' | 'forbidden' | 'crush'
+  | 'resolve' | 'allies' | 'awaken' | 'cards' | 'finish' | 'reward';
+
+export interface BattleLogEntry {
+  id: string;
+  date: string;
+  playerActions: BattleAction[];
+  shadowResponse: string;
+  playerHpBefore: number;
+  playerHpAfter: number;
+  shadowHpBefore: number;
+  shadowHpAfter: number;
+}
+
+export interface BattleAction {
+  skillName: string;
+  skillAttribute?: AttributeId; // 技能所属属性，用于判断弱点
+  type: 'damage' | 'buff' | 'debuff' | 'crit' | 'charge' | 'heal' | 'attack_boost';
+  value: number;
+  spCost: number;
+  isCrit?: boolean;      // 是否触发暴击
+  isOffBalance?: boolean; // 是否造成失衡
+}
+
+// ── 影时间高塔 · 区层（引擎v2 批2）────────────────────────────
+// 塔是唯一的、常在的；可解锁单位是"区层"（Lv1-5，层号全塔累计）。
+// 单只 shadows 表记录 = 当前区层主影（沿用既有单例约定，避免大迁移）。
+
+export type StratumNodeType = 'mob' | 'elite' | 'event' | 'echo' | 'chest' | 'boss' | 'golden';
+export type StratumStatus = 'climbing' | 'cleared';
+
+export interface MobSpec {
+  name: string;                 // 本地命名池（零 AI）
+  tier: 'mob' | 'elite';
+  attribute: AttributeId;       // 属性向（克制环 / 剪影色）
+  weakAttribute: AttributeId;
+  maxHp: number;
+  /** （批3）词缀：强敌必带 1 条，Shadow 无 */
+  affixes?: AffixKind[];
+  /** （批5 §5.5）金色回响稀有影：必掉满月品质战利品 */
+  golden?: boolean;
+}
+
+export interface StratumNode {
+  id: string;
+  floor: number;                // 区层内层号 1..floors（boss 层 = floors）
+  lane: number;                 // 0-2 横向位
+  type: StratumNodeType;
+  edges: string[];              // 可通往的上一层节点 id
+  cleared: boolean;
+  mob?: MobSpec;
+  eventPoolId?: string;         // 事件池 id（src/battle/events.ts）
+  lootSp?: number;              // 月匣：批2 掉 SP（物品池批3 接入）
+}
+
+export interface TowerStratum {
+  id: string;
+  level: number;                // 区层 1-5
+  name: string;                 // AI 生成 "xx之域"（迁移/无 Key 用模板名）
+  description: string;
+  themeAttribute?: AttributeId; // 主影主题属性（65% 短板逻辑批4 接入）
+  createdWeekKey: string;       // 显形周（周一为界）
+  lastDeepenWeekKey?: string;   // 最近一次月相日加深的周键
+  baseFloor: number;            // 全塔累计起始层号（区层2 ≈ 从 13F 起）
+  floors: number;               // 本区层层数（10-12）
+  nodes: StratumNode[];
+  currentNodeId: string | null; // null = 区层入口（尚未踏入第 1 层）
+  deepenCount: number;
+  status: StratumStatus;
+  /** （批5）深渊回廊环数（1 起；undefined = 主塔区层）。深渊环零 AI 即时生成、无月相加深、通关不锁日 */
+  abyssRing?: number;
+  /** （第 6 轮 深渊周常）这一环生成时那一周的规则，整环有效 */
+  abyssRuleId?: AbyssRuleId;
+  /** 「只剩 X」那一环的 X（跨周还在爬这一环时，横幅要写的是它生成那周的 X） */
+  abyssRuleAttr?: AttributeId;
+  /** （第 6 轮 满月心魔）顶层守卫要换成月度心魔、但它还在显形：生成好再换进来，之前顶层不能进 */
+  moonBossPending?: boolean;
+  /** （R19「回头看看」）重游的旧区层：零 AI 即时生成、不推进度、心魔不入档案、不加 HP 上限 */
+  revisit?: boolean;
+  createdAt: Date;
+}
+
+/** 当日登塔 session 统计（登塔回顾用；挂在 BattleState 上跨杀进程持久） */
+/** 满月心魔（第 6 轮）：从生成到打完 */
+export type MoonShadowStatus = 'generating' | 'ready' | 'installed' | 'defeated' | 'skipped';
+export interface MoonShadowState {
+  /** 满月编号（moonPhaseSlot 的奇数槽） */
+  slot: number;
+  /** YYYY-MM */
+  month: string;
+  /** 满月那天 YYYY-MM-DD */
+  date: string;
+  status: MoonShadowStatus;
+  /** 生成好、还没装进环的本体（装进环后清掉，本体在 shadows 单例里） */
+  shadow?: Shadow;
+  /** 名字（横幅用；装进环后本体不在这里了） */
+  name?: string;
+  /**
+   * 满月当天第一次进战场时判定：进的是一环还没走过的回廊 → true（装进这一环的顶层）；
+   * 当天之前就在爬的环 / 不在回廊 → false（这个月忽略，不回补）。未判定 = undefined。
+   */
+  eligible?: boolean;
+  /** 生成失败或没配 AI，改用了离线模板 */
+  offline?: boolean;
+}
+
+/** 深渊周常（第 6 轮）：八条规则按周确定性取一条 */
+export type AbyssRuleId = 'single_weak' | 'thick_armor' | 'gale' | 'oath_night' | 'eclipse' | 'greed' | 'silence' | 'echo';
+
+export interface TowerSessionStats {
+  dateKey: string;
+  startFloor: number;
+  floorsClimbed: number;
+  nodesCleared: number;
+  mobsDefeated: number;
+  damageDealt: number;
+  maxSingleHit: number;
+  weaknessHits: number;
+  spEarned: number;
+  /** 本次登塔的临时增益（事件/回响来源；伤害类进引擎加算段） */
+  buffs: Array<{ id: string; label: string; addPct?: number }>;
+  /** 事件「被夺先手」：下一场战斗 Shadow 先攻（战斗开场消费并清除） */
+  pendingFirstStrike?: boolean;
+  /** （批3 记忆台词）本次登塔距上一次登塔的间隔天数（entry 时快照，覆写 lastChallengeDate 前计算） */
+  daysAway?: number;
+  /** （批4 记账联动）结余护壁已消耗（每 session 一次：吸收一次 Shadow 攻击的 50%） */
+  wardUsed?: boolean;
+  /** （批4 同伴庇护）本 session 的致命保护已触发（每 session 一次） */
+  companionGuardUsed?: boolean;
+  /** （批4 备战抽取）本次登塔已抽取的备战 buff id（防重复抽取） */
+  prepDrawnId?: string;
+}
+
+// ── 战斗状态效果（本地，不持久化） ─────────────────────────────
+
+export type StatusKind =
+  | 'poison'        // 中毒：每回合扣血，可叠层
+  | 'mark'          // 猎手标记：受伤×mult
+  | 'fear'          // 恐惧：概率跳过
+  | 'calm'          // 镇静：攻击×mult
+  | 'beguile'       // 魅惑：概率打自己
+  | 'shield'        // 护盾：吸收下次伤害×mult
+  | 'crit_buff'     // 玩家暴击率+
+  | 'crit_debuff'   // Shadow 暴击率-
+  | 'resonance'     // 共鸣：下次伤害×mult
+  | 'atk_up'        // （引擎v2）攻击强化：攻击×mult
+  | 'guard_stance'; // （引擎v2）警戒姿态：受伤×mult
+
+export interface StatusEffect {
+  kind: StatusKind;
+  /** 剩余回合数，0 表示本回合结束后清除 */
+  remainingTurns: number;
+  /** 数值参数：DoT伤害 / 乘数 / 概率 / 护盾比例等 */
+  value: number;
+  /** 叠加层数，默认 1 */
+  stacks: number;
+  /** 触发来源的技能名（显示用） */
+  sourceName?: string;
+}
+
+/** Shadow AI 决策类型 */
+export type ShadowActionKind =
+  | 'interrupt'   // 打断玩家蓄力
+  | 'guard'       // 警戒：弱点伤害减半
+  | 'enterBerserk' // 进入狂化
+  | 'execute'     // 追击：必暴击
+  | 'mock'        // 嘲讽（带DoT情境）
+  | 'normal';     // 常规攻击
+
+// ── 同伴 / Confidant ─────────────────────────────────────────
+//
+// 映射到 22 张大阿卡纳，每张牌每个用户唯一。
+// 支持离线 / 在线两种模式；在线模式下可双向绑定（两位用户互为同伴）。
+//
+// 亲密度等级（0–10）解锁不同能力：
+//   Lv 2 → 日常特殊技能（乘区外 +1 该属性加点）
+//   Lv 4 → 战斗回复道具（用一次，恢复 HP 或 SP）
+//   Lv 7 → 永久战斗技能（该属性技能 +1 固定伤害）
+//   Lv 10 → 圆满，所有能力增强
+
+export type ConfidantBuffKind =
+  | 'daily_plus'    // 日常加点额外 +N（乘区外）
+  | 'battle_heal'   // 战斗道具：回复 HP（每 2 天一次）
+  | 'battle_sp'     // 战斗道具：回复 SP（每 2 天一次）
+  | 'damage_plus';  // 永久战斗技能伤害 +N
+
+export interface ConfidantBuff {
+  id: string;
+  kind: ConfidantBuffKind;
+  attribute?: AttributeId;   // 绑定的属性（由 arcana.relatedAttribute 决定）
+  value: number;             // 加成数值
+  unlockAtLevel: number;     // 解锁所需亲密度等级
+  title: string;             // 显示名称
+  description: string;       // 描述
+}
+
+/** 同伴来源标识（离线自建 vs 绑定在线用户） */
+export type ConfidantSource = 'offline' | 'online';
+
+export interface ConfidantEvent {
+  id: string;
+  confidantId: string;
+  date: string;                // YYYY-MM-DD
+  type:
+    | 'created'
+    | 'intimacy_up'
+    | 'intimacy_down'
+    | 'level_up'
+    | 'buff_unlocked'
+    | 'conversation'
+    | 'item_used'
+    | 'archived'
+    | 'decay'
+    | 'bound'
+    | 'unbound'
+    | 'star_shift';
+  delta?: number;              // 亲密点变化
+  /** level_up 事件到达的等级；旧数据可从 narrative 的 Lv.X 兼容解析 */
+  toLevel?: number;
+  narrative?: string;          // AI / 系统生成的叙事描述（conversation 时为馆长解读）
+  /** 用户在"今日互动"里原本输入的事件（仅 conversation 事件写入） */
+  userInput?: string;
+  /** AI 给出的相处建议（仅 conversation 事件写入；展开时与 narrative 分别展示） */
+  advice?: string;
+  createdAt: Date;
+}
+
+export interface Confidant {
+  id: string;
+  userId: string;              // 所属本地用户（user.id）
+  /** 离线自建 / 在线绑定 */
+  source: ConfidantSource;
+  /** 在线模式下对方的云端用户 id（双向绑定时填充） */
+  linkedCloudUserId?: string;
+  /** 对方邮箱（在线模式下展示） */
+  linkedEmail?: string;
+  /** 在线同伴 —— 对方的公开档案快照（断网 / 对方长期离线仍可展示"上次同步的样子"） */
+  linkedProfile?: CloudProfile;
+  /** 用户给的称呼（朋友的名字 / 昵称） */
+  name: string;
+  /** 大阿卡纳 id，如 'fool' 'magician' 'empress'；一个用户同一张牌只能绑定一人 */
+  arcanaId: string;
+  /** 正位 / 逆位（AI 决定；影响叙事基调） */
+  orientation: TarotOrientation;
+  /** 用户输入的关系描述（与此人的关系、相处方式等） */
+  description: string;
+  /** AI 对牌面匹配理由的解读 */
+  aiInterpretation: string;
+  /** AI 给出的相处建议 / 下一步行动 */
+  aiAdvice: string;
+  /** 亲密等级（0–10） */
+  intimacy: number;
+  /** 当前等级内的亲密点进度（0 ~ pointsToNextLevel-1） */
+  intimacyPoints: number;
+  /**
+   * 能力 buff 加成所指向的属性。
+   * - 未设置 → 退化用 arcanaId 对应的 relatedAttribute（老档案 / 旧创建流程）
+   * - 设置后 → 用户主动选择，可与塔罗花色不一致
+   */
+  skillAttribute?: AttributeId;
+  /** 已解锁的能力快照（随 intimacy 提升追加） */
+  buffs: ConfidantBuff[];
+  /** "逆流" 模式是否启用（连续 3 天无互动 → 每日 -1） */
+  decayEnabled: boolean;
+  /**
+   * 星移（Star Shift）可用次数。
+   * 每次升级 +1，用于以当前最新状态重新生成 description / aiInterpretation / aiAdvice。
+   * 每次使用 -1。
+   */
+  starShiftCharges?: number;
+  /**
+   * 在线同伴的点数换算到哪条阈值曲线了（v2.7.0.6 起在线同伴用 ONLINE_INTIMACY_THRESHOLDS）。
+   * 缺省 = 还是老曲线的点数，首次加载时按比例换算并写上 2（见 utils/confidantLevels）。
+   */
+  intimacyCurve?: number;
+  /** 情感安全锁：归档前的二次确认标记（用户主动设置） */
+  pinned?: boolean;
+  /**
+   * 自定义头像（data URL, jpeg）。长按塔罗牌后可上传替换。
+   * ⚠ 本字段不会被同步到云端（sync.ts 会在 push 前 strip）——
+   * 保证照片仅保留在本地。离线同伴始终允许自上传；在线同伴若绑定了云端账号，
+   * 未来版本会自动拉取对方的官方头像覆盖此处。
+   */
+  customAvatarDataUrl?: string;
+  /**
+   * 上传头像后是否把塔罗的**卡面**也一并换成这张图（羁绊墙 / 卡片 / 详情统一生效）。
+   * 上传完会问一次；不同步时头像只出现在详情页的小像位，卡面仍是塔罗牌。
+   */
+  avatarAsCardFace?: boolean;
+  /**
+   * 卡面专用图（1:1.6 塔罗比例）。在线同伴的官方头像是 1:1 的，直接铺到卡面上
+   * 会被上下裁掉一大截，所以切卡面时让用户自己裁一次、结果存这里；
+   * 缺省时回落到 customAvatarDataUrl / linkedProfile.avatarUrl。
+   */
+  cardFaceDataUrl?: string;
+  /**
+   * 仅在线同伴：是否在卡片上优先显示塔罗而非对方头像。
+   * 默认 false（显示头像）；用户可在卡片长按菜单切换。
+   */
+  preferTarotOverAvatar?: boolean;
+  /**
+   * 仅在线同伴：用户已经"知道这条 COOP 被解除了"。
+   *
+   * 设为 true 时，loadSocial 的 reflectSeveredBonds 不再重复把这张卡自动归档 ——
+   * 否则用户每次手动"恢复关系"都会被下一次同步立刻反向归档，陷死循环。
+   *
+   * true 的状态下卡片可以被恢复，但已经不再是"活的 COOP"：
+   * 不再共享每日总结、不再拉对方资料；要重新建立 COOP 需走重新缔约流程。
+   */
+  bondSeverDismissed?: boolean;
+  /**
+   * 这对 COOP 曾共同击败的羁绊之影 —— 纪念图章列表。
+   * 击败时本地追加一条；在 `CoopMemorialPanel` 里展示；对方同一时刻也会追加到他那张卡上。
+   * 单向数据（从 coop_shadows 的 memorial_stamp 字段同步过来）。
+   */
+  coopMemorials?: CoopMemorialStamp[];
+  /** 最近一次使用战斗回复道具的日期（每次使用后需要 2 天冷却） */
+  itemUsedDate?: string;       // YYYY-MM-DD
+  /** 今日是否领过日常加点奖励（避免重复触发） */
+  dailyUsedDate?: string;      // YYYY-MM-DD
+  /** 今日是否手动"互动"过（用于 1/天 的 AI 判断互动限制） */
+  lastInteractionDate?: string; // YYYY-MM-DD
+  /** 最后互动时间（用于 decay 与 "已离开" 判定） */
+  lastInteractionAt?: Date;
+  /**
+   * 连续祈愿天数（在线同伴专属）。第 2 天起接管互动记录的默认文案。
+   * 判定只认「昨天」：断一天就从 1 重新数（与全站 streak 口径一致，见 utils/prayerStreak.ts）。
+   */
+  prayerStreak?: number;
+  /** 最近一次为 Ta 祈愿的本地日期 YYYY-MM-DD（streak 的推进依据） */
+  lastPrayerDate?: string;
+  createdAt: Date;
+  archivedAt?: Date;
+}
+
+// ── 谏言 / Counsel ───────────────────────────────────────────
+//
+// 客人可以向"知心"倾诉 Ta 在某段人际关系里的烦恼。
+// - 每周（7 天）可用一次
+// - 开启后 1 小时内可自由聊天；1 小时后消息自动清空（但冷却仍在）
+// - 用户可随时归档：AI 生成 ≤100 字摘要，移入归档库
+// - AI 会参考被 @ 的同伴的最近 15 条互动记录
+
+export interface CounselMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  timestamp: Date;
+  /** 用户消息中 @ 提到的同伴 id 列表 */
+  mentions?: string[];
+  /** AI 输出被用户打断 */
+  interrupted?: boolean;
+}
+
+export interface CounselSession {
+  id: string;
+  /** YYYY-MM-DD（本地时区），用于周冷却判断 */
+  startedDate: string;
+  startedAt: Date;
+  /** 1 小时后过期，过期后 messages 会被清空，但 session 本身保留用于显示状态 */
+  expiresAt: Date;
+  /** 进入该会话时 @ 提到过的所有同伴（union，用于归档元数据展示；不代表当前是否仍在上下文里） */
+  mentionedConfidantIds: string[];
+  /**
+   * 每位同伴"最近一次被 @ 时所在的用户回合号"（用户消息序号，从 1 起算）。
+   * AI 上下文注入只看"最近 10 回合内被 @ 过"的那些——超时会自动从 prompt 里掉出来，
+   * 用户再次 @ 即刷新。预设 @（入场时选中的）会置为 1，让开场问候也能感知到 Ta。
+   */
+  mentionLastTurn?: Record<string, number>;
+  messages: CounselMessage[];
+  /** 消息过期后仍保留 session，用 expired = true 标记。UI 不再展示对话 */
+  expired?: boolean;
+  /** 若已归档到 counselArchives，记录归档时间（此后 session 被删除，字段其实写不到 DB 上） */
+  archivedAt?: Date;
+}
+
+export interface CounselArchive {
+  id: string;
+  /** ≤100 字的摘要 */
+  summary: string;
+  /** 会话中 @ 提到的同伴 id（用于展示） */
+  mentionedConfidantIds: string[];
+  messageCount: number;
+  /** 会话开始与结束时间，用于展示时间跨度 */
+  sessionStartedAt: Date;
+  sessionEndedAt: Date;
+  createdAt: Date;
+}
+
+// ── 在线社交 / 好友 / 通知 ─────────────────────────────────
+//
+// 这些类型完全承载在云端（PocketBase 集合），本地不存 Dexie 表，
+// 只在内存里保留 zustand state（useCloudSocialStore）。
+// 断网 / 对方长期离线时，对方的 profile 快照会留在 Confidant.linkedProfile 里。
+
+/** 对方的公开档案快照（会被缓存到 Confidant.linkedProfile） */
+/** 人格指数难度档（R19）：简单 = 新档默认；困难 = 旧口径，且等级标签换高调配色 */
+export type LevelDifficulty = 'easy' | 'hard';
+
+export interface CloudProfile {
+  /** PB user.id */
+  id: string;
+  /** PB username（UserID，小写 3-18 位） */
+  userId?: string;
+  /** 展示名（本地 user.name 同步过来的） */
+  nickname?: string;
+  /** 云端头像（PB file URL） */
+  avatarUrl?: string;
+  /** 总等级（五维 level 之和） */
+  totalLv?: number;
+  /**
+   * 对方走的是哪一档难度（R19）。困难档的人，等级在别人眼里也是红的。
+   * 需要 PB users 集合有 level_difficulty 字段；没有就是 undefined，
+   * 表现为"不特殊标记"，不影响其它档案字段。
+   */
+  levelDifficulty?: LevelDifficulty;
+  /** 对方自己的属性自定义名 */
+  attributeNames?: Partial<Record<AttributeId, string>>;
+  /** 对方五维各自的 level */
+  attributeLevels?: Partial<Record<AttributeId, number>>;
+  /** 对方五维各等级的四字称号；下标 0 对应 Lv.1。 */
+  attributeLevelTitles?: Partial<Record<AttributeId, string[]>>;
+  /** 对方五维各自的 points */
+  attributePoints?: Partial<Record<AttributeId, number>>;
+  /** 五维 points 之和（冗余字段，避免每次都重新求和；对方推上来时已算好） */
+  totalPoints?: number;
+  /** 已解锁成就 + 已解锁技能的总数（不含 blessing_*） */
+  unlockedCount?: number;
+  /** 名片状态（v2.7.0.6 第 6 项）：预设之一，设定后 24 小时内有效；PB users.status，没建字段就是 undefined */
+  status?: ProfileStatus;
+  /** 名片目标（v2.7.0.6 第 6 项）：对方推上来的快照；PB users.goal */
+  goal?: ProfileGoalSnapshot;
+  /** 最近一次拉取到这份档案的时间（用于"上次同步 X 天前"的戳） */
+  lastSyncedAt?: Date;
+}
+
+// ── 名片状态 / 目标（v2.7.0.6 第 6 项）──────────────────────────
+
+/** 名片「状态」：从预设里挑一个（constants/profileStatus），设定后 24 小时自动消失 */
+export interface ProfileStatus {
+  /** 预设 id */
+  id: string;
+  /** 设定时刻（ISO） */
+  at: string;
+}
+
+/**
+ * 名片「目标」——本机记的选择：挂一张宣告卡。
+ * alias = 对外显示的说法（别人眼里你的目标叫什么）；只能挂着卡时写，免得又变回个性签名。
+ */
+export interface ProfileGoalPick {
+  kind: 'card';
+  cardId: string;
+  alias?: string;
+}
+
+/** 给好友看的目标快照（随档案推到云端；宣告卡的进度每次推送时重算） */
+export interface ProfileGoalSnapshot {
+  kind: 'text' | 'card';
+  title: string;
+  subtitle?: string;
+  /** 宣告卡的目标日 YYYY-MM-DD */
+  targetDate?: string;
+  /** 0–100 */
+  progress?: number;
+  daysLeft?: number;
+  /** 宣告卡已完成 / 已至期 */
+  done?: boolean;
+  /** 快照时刻（ISO） */
+  at: string;
+}
+
+export type FriendshipStatus =
+  | 'pending'   // 正在等待对方响应
+  | 'linked'    // 已建立双向关系
+  | 'rejected'  // 被拒绝（3 天冷却）
+  | 'severed'   // 已解除（7 天冷却）
+  | 'expired';  // 申请 21 天未响应自动作废
+
+/**
+ * 未缔结在线好友的自裁卡面（专辑墙 friend 卡用，db v14）。
+ * 未缔结的好友本地没有 Confidant 行，卡面只能按对方云端 user id 存；
+ * 缔结时会搬进新建同伴的 cardFaceDataUrl，随后本行清除。
+ * **不上云**（base64 大图 + 他人肖像，与 customAvatarDataUrl 同口径）。
+ */
+export interface OnlineCardFace {
+  /** 对方 PB user.id */
+  userId: string;
+  dataUrl: string;
+  updatedAt: Date;
+}
+
+export interface Friendship {
+  id: string;                 // PB record id
+  userAId: string;            // 归一化后的较小 id 在前
+  userBId: string;
+  initiatorId: string;        // 发起方
+  status: FriendshipStatus;
+  message?: string;           // 申请留言（≤200 字）
+  expiresAt?: Date;           // pending 状态的过期时间（申请后 21 天）
+  respondedAt?: Date;         // linked / rejected / severed 的时间
+  reRequestAfter?: Date;      // rejected → 3 天后可再申请
+  reLinkAfter?: Date;         // severed → 7 天后可再建
+  createdAt: Date;
+  updatedAt: Date;
+  /** 另一方的 profile 快照（按当前登录者反推出谁是"另一方"） */
+  otherProfile?: CloudProfile;
+}
+
+export type NotificationType =
+  | 'friend_request'          // 收到好友申请
+  | 'friend_accepted'         // 对方接受了我的好友申请
+  | 'friend_rejected'         // 对方拒绝了我的好友申请
+  | 'prayer_received'         // 对方给我祈愿 (+3 SP)
+  | 'prayer_reciprocal'       // 你和对方今天互相祈愿
+  | 'coop_proposal'           // 收到 COOP 关系提议
+  | 'coop_accepted'           // 对方接受了我的 COOP 提议
+  | 'coop_rejected'           // 对方拒绝了我的 COOP 提议
+  | 'coop_severed'            // 对方解除了 COOP 关系
+  | 'event_logged'            // 对方在共享事件里记下了一笔
+  | 'coop_event_logged'       // 对方在线 COOP 上记录了一次互动（共享事件 / 共享亲密度同步）
+  | 'coop_shadow_spawned'     // 羁绊之影降临
+  | 'coop_shadow_attacked'    // 对方对羁绊之影出手了
+  | 'coop_shadow_defeated'    // 羁绊之影被封印
+  | 'coop_shadow_retreated'   // 羁绊之影撤退（10 天未击败）
+  | 'system';                 // 系统公告
+
+export interface NotificationEntry {
+  id: string;                         // PB record id
+  userId: string;                     // 收件人 id（= 当前登录用户）
+  type: NotificationType;
+  fromId?: string;                    // 发件人 id（系统通知可为空）
+  fromProfile?: CloudProfile;         // 展开后的发件人档案
+  payload?: Record<string, unknown>;  // 附加数据：friendship_id / prayer_id / coop_link_id 等
+  read: boolean;
+  createdAt: Date;
+}
+
+// ── 一起进步（v2.7.0.6） ─────────────────────────────────
+//
+// 两位好友之间的打卡约定：每日打卡（一段时间内每天各完成一件事）或一次性目标（截止日前各完成一件）。
+// 共同目标 = 同一件事；不同目标 = 各写各的。接受后双方各在本地建一条带 pact 的待办，完成即打卡。
+// 在线同伴（有 COOP 契约）同一天都完成会涨亲密度；普通好友只一起打卡，不涨亲密度。
+// 数据在 PB 集合 coop_pacts（services/coopPacts.ts 顶部有字段与规则）。
+
+export type PactKind = 'daily' | 'once';
+export type PactMode = 'same' | 'different';
+export type PactStatus = 'pending' | 'active' | 'finished' | 'cancelled' | 'declined' | 'expired';
+
+export interface CoopPact {
+  id: string;
+  /** 发起人 / 受邀人（PB users id） */
+  fromId: string;
+  toId: string;
+  kind: PactKind;
+  mode: PactMode;
+  /** 发起人的任务（共同目标时两人都做这件） */
+  titleFrom: string;
+  /** 受邀人的任务（不同目标时接受才填） */
+  titleTo?: string;
+  /** 每日打卡的天数：7 / 14 / 21 / 30；0 = 不设期限。一次性目标为 0 */
+  days: number;
+  /** 一次性目标的截止日 YYYY-MM-DD */
+  deadline?: string;
+  /** 约定开始的日子（受邀人接受当天） */
+  startDay?: string;
+  status: PactStatus;
+  /** 双方各自打卡的日子（YYYY-MM-DD，各自只写自己那一栏） */
+  doneFrom: string[];
+  doneTo: string[];
+  /** 最近一次催对方的日子（发起人催 / 受邀人催） */
+  nudgeFromDay?: string;
+  nudgeToDay?: string;
+  message?: string;
+  endedBy?: string;
+  createdAt: Date;
+  updatedAt: Date;
+  /** 对方的档案快照（expand 出来的） */
+  otherProfile?: CloudProfile;
+}
+
+// ── 组织（v2.7.0.6 第 7 轮 · PRD §12）──────────────────────────────────────
+// 组织是单位、据点是它的主页。一人最多自建一个 + 加入一个；每个组织最多 7 人（座位 1–7）。
+// 数据全在 PB 的 orgs / org_members（7b 起加 org_posts / org_reactions / org_reports），不落 Dexie。
+
+/** 这一行成员身份占的是哪个名额：自己建的 / 加入别人的 */
+export type OrgSlot = 'own' | 'joined';
+/** 代号怎么来的：自己写 / 用昵称 / 用代表牌的牌名 */
+export type OrgCodenameKind = 'custom' | 'nickname' | 'tarot';
+
+export interface Org {
+  id: string;
+  name: string;
+  motto: string;
+  /** 徽记 id（components/org/OrgEmblem 里的一套） */
+  emblem: string;
+  leaderId: string;
+  inviteCode: string;
+  /** 建立时记下的创建者时区（IANA）；「本周」、会议日都按它算 */
+  tz: string;
+  /** 队长自定义（组织 P2：等级名字 / 称号改名 / 自定义称号）；没有 = 全用默认 */
+  custom?: OrgCustom;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/** 名册背面展示的面具（本人推上来的快照；第 8 轮借面具直接用这份） */
+export interface OrgPersonaSnapshot {
+  /** 面具名（该属性的人格面具名；没有就是人格名） */
+  name: string;
+  attribute: AttributeId;
+  /** 该属性的等级 */
+  level: number;
+  skills: Array<{ name: string; type: PersonaSkill['type']; power: number; level: number }>;
+}
+
+/** 成员牌上的一维（五维之一）：本人起的名字、等级；没解锁的维度 locked。星形雷达（和首页同一个）要的几样也带上 */
+export interface OrgMemberAttr {
+  id: AttributeId;
+  name: string;
+  level: number;
+  locked?: boolean;
+  /** 这一维累计点数（总点数 = 五维相加） */
+  points?: number;
+  /** 本人的满级（阈值档数；首页星图的满格） */
+  max?: number;
+  /** 满级后的精通星数 */
+  stars?: number;
+  /** 本人这一维现在的称号（等级称号 / 精通称号；过屏蔽词） */
+  title?: string;
+}
+
+/** 成员牌上的数字（本人客户端推送；只有这些，不含任何记录内容） */
+export interface OrgMemberCard {
+  /** 连续天数（排除补记） */
+  streak: number;
+  /** 本周出勤：周键（组织时区的周一）+ 七个格子的位图（bit0 = 周一） */
+  week?: { key: string; days: number };
+  /** 上一周的出勤（跨周推送时把 week 挪过来）：周一生成纪要时，有人已经刷成新一周，上周的格子也不丢（7b） */
+  prev?: { key: string; days: number };
+  /** 名片状态（24 小时内有效，过期了就不带） */
+  status?: ProfileStatus;
+  /** 展示中的面具；null = 不展示（第 8 轮起是 personas 的第一张，留给只认一张的老版本） */
+  persona?: OrgPersonaSnapshot | null;
+  /** 展示中的面具，最多 3 张（第 8 轮；按本人选的顺序）；没有这个字段的老牌子看 persona */
+  personas?: OrgPersonaSnapshot[];
+  /** 总等级（五维等级之和，和同伴页的 LV 同口径）；老版本推的牌子没有 */
+  lv?: number;
+  /** 五维：本人起的属性名 + 等级（名册上展示；名字过屏蔽词，不过就用默认名）；老版本推的牌子没有 */
+  attrs?: OrgMemberAttr[];
+  /** 选定现在这张代表牌的时刻（ISO）：两人撞牌时先选的留下 */
+  tarotAt?: string;
+  /** 推送时刻（ISO） */
+  at?: string;
+}
+
+export interface OrgMember {
+  id: string;
+  orgId: string;
+  userId: string;
+  slot: OrgSlot;
+  /** 1–7；队长建立时坐 1 号 */
+  seat: number;
+  codename: string;
+  codenameKind: OrgCodenameKind;
+  /** 代表牌（大阿卡纳 id）；刚加入、还没选时为空 */
+  tarotId?: string;
+  /** 头像地址（拉成员时展开 user 带出来的，不存在成员行上；没有头像就是空） */
+  avatarUrl?: string;
+  card: OrgMemberCard;
+  /** 周日会议写的一句话目标，以及它是哪一周的（7b） */
+  goal?: string;
+  goalWeek?: string;
+  /** 对 resultWeek 那周目标的自评（7b） */
+  result?: 'done' | 'partial' | 'missed';
+  resultWeek?: string;
+  /** 加入时间 */
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/** 公告板动态附带的记录快照（7b）：只有这些，不含记录原文 */
+export interface OrgPostSnapshot {
+  v: 1;
+  /** 记录日期 YYYY-MM-DD（分享者本地） */
+  date: string;
+  /** 加点：只带有加点的属性 */
+  pts: Partial<Record<AttributeId, number>>;
+  /** 分享者自己的属性名（只带 pts 里有的） */
+  names: Partial<Record<AttributeId, string>>;
+  /** 类型：重要 / BIG DEAL 收官 / 愿望实现 / 宣告卡达成 / 周目标完成 */
+  kind?: 'important' | 'bigdeal' | 'wish' | 'card' | 'weekly';
+  backfilled?: boolean;
+  /** 分享时的代号与代表牌：人退出以后也能显示是谁分享的 */
+  by: { codename: string; tarotId?: string };
+}
+
+/** 会议纪要（kind = minutes 的动态存这一份，7b）。代号都冻结在里面 */
+export interface OrgMinutesSnapshot {
+  v: 1;
+  /** 记的是哪一周（周一的日键） */
+  week: string;
+  /** 这周的目标：立过目标的人数 / 做到了的人数 */
+  rate: { done: number; total: number };
+  done: Array<{ userId: string; codename: string }>;
+  /** 下周目标（会上写的） */
+  goals: Array<{ userId: string; codename: string; goal: string }>;
+  /** 称号：title 是发纪要时的名字（冻结）；tid 是称号的 id（组织 P2 起才有，称号册按它归类，老纪要按名字认） */
+  titles: Array<{ userId: string; codename: string; title: string; tid?: string }>;
+  /** 会议时间里没写下周目标的人 */
+  absent: Array<{ userId: string; codename: string }>;
+}
+
+export interface OrgPost {
+  id: string;
+  orgId: string;
+  userId: string;
+  /** moment = 分享的动态；minutes = 会议纪要；operation = 作战达成卡（第 8 轮） */
+  kind: 'moment' | 'minutes' | 'operation';
+  /** 动态附的一句话（≤20 字）；纪要 / 达成卡为空 */
+  text: string;
+  snapshot: OrgPostSnapshot | null;
+  minutes: OrgMinutesSnapshot | null;
+  opCard?: OrgOpCardSnapshot | null;
+  weekKey?: string;
+  createdAt: Date;
+}
+
+// ── 作战（第 8 轮 · PRD §13）────────────────────────────────────────────────────
+// 两种（界面上叫「目标」和「作战」；id 是 small / big）：
+//   目标（small）：一句话，人人做同一件事，任何成员都能发；作战（big）：作战目标 + 每人一行子任务（队长写 / AI 拆 / 本人自己填），只有队长能发。
+// 每人做完一次就算；达成 / 未达成都是现算的（org_operations 上只有 active / cancelled）。
+
+export type OrgOpKind = 'small' | 'big';
+
+export interface OrgOperation {
+  id: string;
+  orgId: string;
+  initiatorId: string;
+  kind: OrgOpKind;
+  /** 这次练哪个属性（参与者的待办默认加这个属性） */
+  attr: AttributeId;
+  /** 一句话 / 共同目标（≤20 字） */
+  title: string;
+  /** 截止日 YYYY-MM-DD（组织时区） */
+  deadline: string;
+  /** 参与者的用户 id（发起时定下，之后不变；本人可以「这次不参加」） */
+  participants: string[];
+  /** 作战（big）的分工：用户 id → 子任务（≤20 字）；没有的人自己填，或者就做作战目标 */
+  assignments: Record<string, string>;
+  status: 'active' | 'cancelled';
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/** 参与者在一场作战上的动作：done = 做完了（撤销就删掉）；out = 这次不参加；plan = 自己写下的那一份 */
+export interface OrgCheckin {
+  id: string;
+  operationId: string;
+  orgId: string;
+  userId: string;
+  kind: 'done' | 'out' | 'plan';
+  /** done 的日子（本人本地日期 YYYY-MM-DD） */
+  day: string;
+  /** plan 的内容（≤20 字） */
+  text: string;
+  createdAt: Date;
+}
+
+/** 作战达成卡（org_posts.kind = operation 的 snapshot）：代号、子任务都冻结在里面 */
+export interface OrgOpCardSnapshot {
+  v: 1;
+  opId: string;
+  kind: OrgOpKind;
+  title: string;
+  /** 达成那天（最后一个人做完的日子）和它所在的周（组织时区的周一） */
+  day: string;
+  week: string;
+  participants: Array<{ userId: string; codename: string; tarotId?: string; task?: string }>;
+}
+
+/** 六个预设标签：太强了 / 🤣👉 / 稳 / 羡慕 / 带我一个 / 别似（id 不变，显示字按验收改过：same → 🤣👉、metoo → 带我一个、hug → 别似） */
+export type OrgReactionTag = 'strong' | 'same' | 'steady' | 'envy' | 'metoo' | 'hug';
+
+export interface OrgReaction {
+  id: string;
+  postId: string;
+  orgId: string;
+  userId: string;
+  tag: OrgReactionTag;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/** 本机看到的一个组织：组织本身 + 全体成员 + 我那一行；7b 起带上最近 30 天的动态与标签（还没拉到时为 undefined） */
+export interface OrgView {
+  org: Org;
+  members: OrgMember[];
+  me: OrgMember;
+  posts?: OrgPost[];
+  reactions?: OrgReaction[];
+  /** 第 8 轮：最近 62 天建的作战（含进行中的）与它们的打卡；还没拉到时为 undefined */
+  ops?: OrgOperation[];
+  checkins?: OrgCheckin[];
+  /** 这一轮作战没拉到（离线 / 服务器还没建表）：作战区显示「暂时拉不到」而不是一直转圈 */
+  opsFailed?: boolean;
+  /** 第 8 轮：据点经验的来源——全部纪要与作战达成卡（不限 30 天）；还没拉到时为 undefined */
+  ledger?: OrgPost[];
+  /** 组织 P2：全部满月团战与出手（经验、称号、公告板战报都从这里现算）；还没拉到时为 undefined */
+  raids?: OrgRaid[];
+  raidHits?: OrgRaidHit[];
+  /** 团战没拉到（离线 / 服务器还没建表）：地图上不升月亮，团战面板说「暂时拉不到」 */
+  raidsFailed?: boolean;
+}
+
+// ── 组织 P2（PRD §17）：队长自定义 + 满月团战 ─────────────────────────────────────────
+
+/** 内置称号 id（名字队长可以改；纪要里记 tid，称号册按它归类） */
+export type OrgTitleId = 'attend' | 'full' | 'weekend' | 'streak7' | 'streak14' | 'streak30' | 'promise' | 'ops' | 'moon';
+/** 自定义称号的条件（像自定义成就：选一种，填一个数；weekend 不用数） */
+export type OrgTitleCondType = 'week_days' | 'weekend' | 'streak' | 'goal_weeks' | 'ops' | 'raid' | 'lv';
+export interface OrgCustomTitle {
+  /** c + 随机串（改名不换 id，称号册照样归在一起） */
+  id: string;
+  name: string;
+  cond: { type: OrgTitleCondType; value: number };
+}
+/** 队长自定义（orgs.custom，json ≤ 4KB）：没写的项用默认；名字都过屏蔽词，不过的当没写 */
+export interface OrgCustom {
+  /** 六级的名字（下标 0 = Lv.1；空 = 用默认） */
+  levelNames?: string[];
+  /** 内置称号改名（没写 = 默认名） */
+  titleNames?: Partial<Record<OrgTitleId, string>>;
+  /** 自定义称号（最多 8 个） */
+  titles?: OrgCustomTitle[];
+}
+
+/** 团战首领：开团时按组织 + 满月编号确定生成（名字、弱点），存进 org_raids.boss，之后不变 */
+export interface OrgRaidBoss {
+  v: 1;
+  name: string;
+  /** 弱点：开团时全队五维等级加起来最低的那一维 */
+  weak: AttributeId;
+  /** 开团时的据点等级（1–6）：血量每级 +5%，击退奖励 25 + 5 × (等级 − 1) SP；老数据没有当 1 */
+  lv?: number;
+}
+
+/** 一次满月一场团战（org_raids；第一个打开据点的成员用确定 id 开团，血量开团时定下） */
+export interface OrgRaid {
+  id: string;
+  orgId: string;
+  /** 满月编号（utils/moonPhase 的槽位，奇数） */
+  slot: number;
+  boss: OrgRaidBoss;
+  hpMax: number;
+  createdAt: Date;
+}
+
+/** 一次出手（org_raid_hits）：每人每晚一条（服务器唯一索引），总攻击每人一条（night = allout） */
+export interface OrgRaidHit {
+  id: string;
+  raidId: string;
+  orgId: string;
+  userId: string;
+  kind: 'strike' | 'allout';
+  /** 那一晚（组织时区的晚上日期 YYYY-MM-DD）；总攻击是 allout */
+  night: string;
+  attr?: AttributeId;
+  skill: string;
+  damage: number;
+  weak: boolean;
+  /** 服务器时间：判断是不是在那一晚打的、谁打出了最后一击 */
+  createdAt: Date;
+}
+
+// ── COOP 契约（在线同伴羁绊） ───────────────────────────
+//
+// 两位好友都同意把关系升级为"在线同伴"后，本地各自会多一张 Confidant(source='online')。
+// 每一方都独立选择自己看到的那张塔罗 —— A 眼里 Ta 是什么，B 眼里 A 又是什么，
+// 所以 bond 里同时保存 arcana_a / arcana_b。
+//
+// 生命周期：
+//   pending  → 已发出提议，等对方响应（14 天未响应过期）
+//   linked   → 双方各自确认，本地同伴卡已建立
+//   rejected → 对方拒绝（3 天冷却）
+//   severed  → 任一方主动解除（7 天冷却，旧同伴卡归档）
+//   expired  → 自动过期
+
+export type CoopBondStatus = 'pending' | 'linked' | 'rejected' | 'severed' | 'expired';
+
+export interface CoopBond {
+  id: string;                 // PB record id
+  userAId: string;            // 归一化后字典序较小者
+  userBId: string;
+  initiatorId: string;        // 提议发起方
+  status: CoopBondStatus;
+  /** A 眼里的对方是哪张塔罗 */
+  arcanaAId?: string;
+  arcanaAOrientation?: TarotOrientation;
+  /** B 眼里的对方是哪张塔罗（linked 之前可能为空） */
+  arcanaBId?: string;
+  arcanaBOrientation?: TarotOrientation;
+  /** 两侧各自希望的初始亲密度（1-10）；物化时取 Math.floor((a+b)/2) */
+  intimacyALevel?: number;
+  intimacyBLevel?: number;
+  /** 两侧各自选定的"能力加成属性"（物化时取任一侧的非空值，都有则取自己的） */
+  skillAttributeA?: AttributeId;
+  skillAttributeB?: AttributeId;
+  /** 两侧各自的"逆流"开关；只有两边都为 true 时才真正衰减亲密度 */
+  decayA?: boolean;
+  decayB?: boolean;
+  /** 提议 / 接受时附带的短消息 */
+  messageA?: string;
+  messageB?: string;
+  expiresAt?: Date;
+  respondedAt?: Date;
+  reRequestAfter?: Date;
+  reLinkAfter?: Date;
+  createdAt: Date;
+  updatedAt: Date;
+  /** 另一方的 profile 快照 */
+  otherProfile?: CloudProfile;
+}
+
+// ── 祈愿 / Prayer ────────────────────────────────────────────
+//
+// 在线好友之间互送的轻量小动作。
+// - 每个"祈愿日"（本地 04:00 到次日 04:00）对同一人只能发送一次
+// - 收件方本地战斗状态 +3 SP（无战斗状态时静默丢弃，不阻塞）
+// - 双向互祈 → 系统通知 prayer_reciprocal 给双方
+
+export interface Prayer {
+  id: string;                 // PB record id
+  fromId: string;             // 发起者 user.id
+  toId: string;               // 接收者 user.id
+  /** "祈愿日" key：YYYY-MM-DD，以本地 04:00 为日界 */
+  day: string;
+  createdAt: Date;
+  /** 发起 / 接收方的档案快照（可选） */
+  fromProfile?: CloudProfile;
+  toProfile?: CloudProfile;
+}
+
+// ── 羁绊之影 · 联机暗影狩猎 ──────────────────────────────
+//
+// 挂在某对 COOP bond 上的专属 Boss。每逢新月/满月（~15 天一次）18:00 降临，
+// 每天 18:00–次日 07:00 可攻击；10 天内未击败则撤退。
+// 共享 HP，独立 Persona，共鸣印记提供 ×1.5 接力加成。
+
+export type CoopShadowStatus = 'active' | 'defeated' | 'retreated';
+
+export interface CoopShadow {
+  id: string;                     // PB record id
+  bondId: string;                 // → coop_bonds.id
+  userAId: string;                // 两位讨伐者（冗余字段）
+  userBId: string;
+  shadowId: string;               // 取自 COOP_SHADOW_POOL 或 'coop:<archetype>'
+  nameOverride?: string;          // 阶段 2：LLM 花名
+  spawnedAt: Date;
+  expiresAt: Date;                // spawnedAt + 10d
+  hpMax: number;
+  hpCurrent: number;
+  status: CoopShadowStatus;
+  weaknessAttribute: AttributeId; // 弱点属性（胜利奖励也是该属性）
+  resonanceUntil?: Date;          // 共鸣印记过期时间（未过期 → 下个接力者吃 ×1.5）
+  resonanceBy?: string;           // 印记由谁留下的（user id）
+  /** 共享 COMBO 计数器 —— 弱点命中 +1，不因换手 / 未命中 而衰减 */
+  comboCount: number;
+  /** 每位讨伐者一次性的总攻击（All-Out）使用标记 */
+  allOutByA: boolean;
+  allOutByB: boolean;
+  /** 识破标记：两人都点击"识破 SHADOW"后，战斗正式开启（入场动画 → 战斗主界面） */
+  identifiedByA: boolean;
+  identifiedByB: boolean;
+  /**
+   * 共享 buff 状态 —— buff 类技能命中即登记；伤害类攻击消耗 1 回合。
+   * 同 kind 不叠加数值，只延长持续时间（加到 remainingTurns 上，封顶 6）。
+   */
+  sharedBuffs: SharedBuffs;
+  defeatedAt?: Date;
+  /** 胜利时写入：纪念图章 JSON（展示用） */
+  memorialStamp?: CoopMemorialStamp;
+}
+
+/** 羁绊之影共享 buff —— 双方都吃 */
+export interface SharedBuffs {
+  /** 攻击强化：所有伤害 ×1.2 */
+  attack_up?: { remainingTurns: number };
+  /** 易伤：Boss 受到的所有伤害 ×1.15 */
+  vulnerability?: { remainingTurns: number };
+}
+
+/** 一次 COOP 攻击的事件日志；落在 coop_attacks 集合 */
+export interface CoopAttack {
+  id: string;
+  shadowId: string;               // → coop_shadows.id
+  attackerId: string;             // user id
+  /** 本地日 YYYY-MM-DD，用于 PB 唯一索引 (shadow_id, attacker, day) 硬性限速 */
+  day: string;
+  personaId: string;              // 本地 Persona id 快照
+  personaName: string;
+  skillKind: 'damage' | 'buff' | 'debuff' | 'crit' | 'charge' | 'heal' | 'attack_boost';
+  skillName: string;
+  damageRaw: number;              // 未加成前
+  damageFinal: number;            // 加成后（共鸣 ×1.5 / 弱点 ×1.3 等）
+  resonanceBonus: boolean;        // 本次是否吃到共鸣加成
+  weaknessBonus: boolean;         // 本次是否吃到弱点加成
+  createdAt: Date;
+}
+
+/**
+ * 羁绊纪念图章 —— 胜利时生成并写到 coop_shadows.memorial_stamp（PB）+
+ * 本地 Confidant.coopMemorials 里。在 CoopMemorialPanel 里展示。
+ */
+export interface CoopMemorialStamp {
+  shadowId: string;
+  /** 这一只影的 PB 记录 id：结算去重按它认（同一原型会反复降临，光看 shadowId + 时间会认错） */
+  recordId?: string;
+  shadowName: string;             // 展示用名
+  weaknessAttribute: AttributeId;
+  defeatedAt: string;             // ISO string
+  /** 两位讨伐者的快照（名字即可） */
+  winners: { userId: string; nickname: string }[];
+  /** 自己这一方累计造成的伤害（用来算贡献百分比） */
+  myDamage?: number;
+  /** 双方合计伤害（= hpMax） */
+  totalDamage?: number;
+  /** （第 6 轮）击杀那一刻冻进来的：这对 COOP 连着封印了几只（撤退归零，含这一只） */
+  streak?: number;
+  /** （第 6 轮）最后一击是谁（总攻击收尾也认得出，不再靠共鸣印记猜） */
+  finisherId?: string;
+  /** （第 6 轮）本机实际发了多少（只在本地副本里；结算屏照它显示） */
+  reward?: { attr: number; intimacy: number; sp: number; streak: number; finisher: boolean };
+}

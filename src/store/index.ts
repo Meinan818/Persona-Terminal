@@ -1,0 +1,6952 @@
+import { create } from 'zustand';
+import { User, Attribute, Activity, Achievement, Skill, Settings, ThemeType, AttributeId, AttributeNamesKey, DailyEvent, Todo, TodoCompletion, TodoStep, FateCandidate, BigDealClearPayload, PeriodSummary, SummaryPeriod, SummaryPromptPreset, WeeklyGoal, WeeklyGoalItem, Persona, Shadow, BattleState, TowerStratum, StratumNode, DailyDivination, LongReading, LongReadingFollowUp, FateGlimpse, Confidant, ConfidantEvent, ConfidantBuff, CounselSession, CounselMessage, CounselArchive, CallingCard, NotifSlot, LedgerEntry, Budget, SpendWorth, LedgerAsset, Wish, WishProgressPoint, WishProgressSource, WishProgressCutPayload, WishProposalPayload, ReturnPayload, ReturnTier, BackfillEntry, BattleArsenal, ChainKey, AffixKind, NavigatorPreset, NavigatorMemo, RelicInstance, FinalBossFlaw, FinalePhase , MoonShadowState , SeasonStamp, Quest } from '@/types';
+import { TAROT_BY_ID } from '@/constants/tarot';
+import { summarizeCounsel, type CounselContext, type CounselConfidantBrief, type CounselRecentEvent } from '@/utils/counselAI';
+import { db } from '@/db';
+import { deleteImagesOfActivity, loadActivityImageIndex, findOrphanActivityImages, pruneOrphanActivityImages } from '@/utils/activityImages';
+import { freshUnreadSummary, reportPushDelivered, markReportPushScheduled } from '@/utils/reportNotice';
+import { useCloudSocialStore } from '@/store/cloudSocial';
+import { pickTogetherReminder } from '@/utils/pactLogic';
+import { v4 as uuidv4 } from 'uuid';
+import { FATE_SOURCE_WEIGHT, fateHistoryCandidates, pickWeighted } from '@/utils/fateDraw';
+import { ensureLifeQuestDay, lifeDayKeyOf, normTitle, recordLifeQuestEvent } from '@/utils/lifeQuests';
+import { ensureLifeQuestAttrMap, lifeAttrMapStatus, readLifeQuestAiCard } from '@/utils/lifeQuestAI';
+import { calcMaxStreak, daysSinceFirstRecord, streakDates } from '@/utils/streak';
+import { applyUiChannel, syncDarkClass } from '@/ui/channel';
+import { computeAndSchedule, type NotifSnapshot } from '@/utils/notifications';
+import { getCachedNotifVoice, refreshNotifVoiceIfNeeded } from '@/utils/notifVoice';
+import { pushWidgetSnapshot } from '@/utils/widgetSnapshot';
+import { isGrowthCategory, cycleRangeForKey, ledgerCycle, roundMoney, shiftMonth, DEFAULT_CHANNELS, UNASSIGNED_ACCOUNT, isDebtAccount, type AccountBalance } from '@/utils/ledgerFormat';
+import { chatComplete, getAIConfig, type AIConfig, type AIMessage } from '@/utils/aiClient';
+import { keepLocalAISecrets } from '@/utils/aiSecrets';
+import { syncCustomProvider } from '@/utils/aiProviders';
+import { buildSummaryRequest as buildSummaryRequestAI, getActiveSummaryPreset as getActiveSummaryPresetAI, type SummaryRequestData } from '@/utils/summaryAI';
+import {
+  pointsToLevel,
+  levelBasePoints,
+  MAX_INTIMACY,
+  buffsForLevel,
+  isItemOnCooldown,
+  thresholdsFor,
+  remapIntimacyPoints,
+  INTIMACY_THRESHOLDS,
+  ONLINE_INTIMACY_THRESHOLDS,
+  ONLINE_INTIMACY_CURVE,
+} from '@/utils/confidantLevels';
+import type { ConfidantMatchResult } from '@/utils/confidantAI';
+
+/**
+ * 返回本地时区的 YYYY-MM-DD 日期字符串。
+ *
+ * 不使用 toISOString()：那个方法先转成 UTC 再格式化，在 UTC+8 这类时区下
+ * 凌晨 0:00–8:00 会被算成"前一天"，全站的跨天判断（今日塔罗 / 每日任务 /
+ * 同伴祈愿重置）都会跟着错一天。
+ */
+export function toLocalDateKey(date: Date = new Date()): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+/**
+ * 本机全部业务表的**唯一真源**：resetAllData 清哪些、importData 快照/回滚哪些，都读这一份。
+ *
+ * 为什么要收成一份（FS7 审查）：这三处原本各写一遍表名，结果各漏各的——
+ * resetAllData 漏了黑猫四表（"清空所有数据"后猫还记得你），
+ * importData 的快照漏了记账三表（导入失败自动回滚时把整本账吃掉）。
+ * 新加表只要 db 里加了、这里跟一行，三个语义就同时正确。
+ *
+ * 与 services/sync.ts 的 SYNC_TABLES 是两码事：那份管"上不上云"，这份管"算不算本机数据"。
+ */
+export const ALL_LOCAL_TABLES = [
+  'users', 'attributes', 'activities', 'achievements', 'skills',
+  'dailyEvents', 'dailyDivinations', 'longReadings', 'fateGlimpses', 'callingCards',
+  'settings', 'todos', 'todoCompletions', 'summaries', 'weeklyGoals',
+  'personas', 'shadows', 'battleStates', 'strata',
+  'confidants', 'confidantEvents', 'counselSessions', 'counselArchives',
+  'ledgerEntries', 'budgets', 'assets', 'wishes',
+  // F6 黑猫：人格 / 原子记忆 / 会话与消息（聊天原文 7 天即焚，但"清空数据"必须清）
+  'navigatorPresets', 'navigatorMemos', 'navigatorSessions', 'navigatorMessages',
+  // v2.7.0.6 记录配图（本地专属；不上云、不进主备份，"清空数据"必须清）
+  'activityImages', 'activityImageData',
+  // 第 13 轮 B 组 导入音乐（本地专属；不上云、不进主备份，"清空数据"必须清；导入备份时不动）
+  'bgmTracks',
+  // 第 6 轮 岁时印章
+  'stamps',
+  // 第 6 轮 委托板
+  'quests',
+] as const;
+
+/** importData 的返回：导入后记录已不存在的配图有几张、占多少字节（0 张 = 不用问） */
+export interface ImportDataResult {
+  orphanImages: { count: number; bytes: number };
+}
+
+/**
+ * addConfidant 串行锁：防止两次并发调用绕过"22 arcana 唯一 / 在线同伴唯一"检查。
+ * 实现方式：每次调用等待上一次 resolve 后再跑，失败也照常 unlock。
+ */
+let _addConfidantLock: Promise<unknown> = Promise.resolve();
+
+/** BIG DEAL 收官 SP（TASKS_MERGE_PRD §5）：min(20, 子步数×3)，经 earnSP 入战场钱包 */
+const BIGDEAL_CLEAR_SP_PER_STEP = 3;
+const BIGDEAL_CLEAR_SP_CAP = 20;
+/** completeTodoStep 在途锁：同一子步双击在 addActivity 异步窗口内重入会双发点数 */
+const _completingStepIds = new Set<string>();
+/**
+ * 迁移单飞锁：StrictMode 下 App 启动 effect 双跑，两次调用会在 settings 标记落库前
+ * 双双通过防重入检查 → 大事被迁两份。同一 JS 会话内只允许第一次真正执行。
+ */
+let _tasksMergeMigrationPromise: Promise<void> | null = null;
+
+type TerminalStepHistory = NonNullable<Wish['stepHistory']>[number];
+
+const appendWishStepHistory = async (
+  parentId: string,
+  entry: Omit<TerminalStepHistory, 'id' | 'completedAt'> & { completedAt?: string },
+) => {
+  const parent = await db.wishes.get(parentId);
+  if (!parent) return;
+  const history = parent.stepHistory ?? [];
+  const exists = history.some((h) =>
+    entry.sourceStepId ? h.sourceStepId === entry.sourceStepId : h.title.trim() === entry.title.trim(),
+  );
+  if (exists) return;
+  await db.wishes.put({
+    ...parent,
+    stepHistory: [
+      ...history,
+      {
+        id: uuidv4(),
+        title: entry.title.trim(),
+        sourceStepId: entry.sourceStepId,
+        via: entry.via,
+        completedAt: entry.completedAt ?? new Date().toISOString(),
+      },
+    ],
+  });
+};
+
+const removeWishStepHistory = async (parentId: string, sourceStepId: string) => {
+  const parent = await db.wishes.get(parentId);
+  if (!parent?.stepHistory?.length) return;
+  await db.wishes.put({
+    ...parent,
+    stepHistory: parent.stepHistory.filter((h) => h.sourceStepId !== sourceStepId),
+  });
+};
+
+// ── 愿望进度评估（PRD_V2.6 §8）─────────────────────────────
+
+/** bumpWishProgress 的节流表：wishId → 上次泵的时间戳 */
+const wishBumpAt = new Map<string, number>();
+
+// ── 回归面板阈值（PRD_V2.6 §12）────────────────────────────
+/** 离开多少天算"走了"。低于这个数不弹——七天以内的间断是正常生活，不是缺席 */
+const RETURN_MIN_DAYS = 7;
+/** 7–14 天给日历补记；再久就只给一句话概括（逐日回忆超过两周就是在编故事） */
+const RETURN_RECENT_MAX_DAYS = 14;
+
+/**
+ * 无 API Key 时的离线估算。
+ *
+ * 形状选饱和曲线而不是线性：「离梦想的距离」本来就该越靠后越难推——
+ * 线性会让第 30 条记录和第 3 条一样值钱，那是记账不是靠近。
+ * 也永远够不到 100%：只有用户自己按下「愿望已实现」才算到岸。
+ */
+export function localWishEstimate(done: number, total: number, times: number): number {
+  const act = (cap: number) => cap * (1 - Math.exp(-times / 10));
+  if (total > 0) return Math.min(99, Math.round((done / total) * 60 + act(38)));
+  return Math.min(92, Math.round(act(92)));
+}
+
+const WISH_EVAL_SYS =
+  '你在评估用户距离一个长期愿望还有多远。只输出 JSON：{"pct":<0到100的整数>,"reason":"<不超过24个中文字的依据>"}。' +
+  '判断依据是**实际推进的证据**（子任务完成情况、挂到这个愿望的记录条数与内容、用户自述现状），不是愿望本身听起来难不难。' +
+  '有上次评估值时以它为锚点微调，没有新证据就别大改；证据充分才敢大步走。' +
+  '100 留给"已经实现"，没实现就不要给 100。reason 用第二人称、说人话、不要复述数字。';
+
+/** 空响应自愈：DeepSeek 的 json_object 有概率回空白 content，退一档重来 */
+async function callWishJson(cfg: AIConfig, messages: AIMessage[]): Promise<string> {
+  const opts = { temperature: 0.3, maxTokens: 160 };
+  try {
+    return await chatComplete(cfg, messages, { ...opts, jsonMode: true });
+  } catch (e) {
+    if (e instanceof Error && e.message.includes('空响应')) {
+      return await chatComplete(cfg, messages, { ...opts, jsonMode: false });
+    }
+    throw e;
+  }
+}
+
+/** JSON 优先，失败退化为"抓第一个百分数"——模型加了话头也不至于整次白跑 */
+function parseWishEval(content: string): { pct: number; reason?: string } | null {
+  const raw = content.trim();
+  const jsonText = raw.startsWith('{') ? raw : raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1);
+  try {
+    const o = JSON.parse(jsonText) as Record<string, unknown>;
+    const pct = Number(o.pct);
+    if (Number.isFinite(pct)) {
+      const reason = String(o.reason ?? '').trim().slice(0, 40);
+      return { pct: Math.max(0, Math.min(100, Math.round(pct))), reason: reason || undefined };
+    }
+  } catch { /* 落到下面的正则兜底 */ }
+  const m = raw.match(/(\d{1,3})\s*%/) ?? raw.match(/\b(\d{1,3})\b/);
+  if (!m) return null;
+  const pct = Number(m[1]);
+  if (!Number.isFinite(pct) || pct < 0 || pct > 100) return null;
+  return { pct: Math.round(pct) };
+}
+
+// 成长总结的类别口径（特殊条目 / 标签）已随简报迁到 utils/summaryAI（v2.7.0.6）。
+import {
+  INITIAL_ATTRIBUTES,
+  ACHIEVEMENTS,
+  SKILLS,
+  DEFAULT_KEYWORD_RULES,
+  DEFAULT_LEVEL_THRESHOLDS,
+  HP_BONUS_PER_DEFEAT,
+  SHADOW_LEVEL_CONFIG,
+  SKILL_BONUS_MULT_CAP,
+} from '@/constants';
+import { PLAYER_BASE_HP, nodeSpReward, bossSpReward, RELIC_SALVAGE_SP, RELIC_SLOTS_BY_STRATUM, AFFIX_HP_MULT, masteryStars,
+  MEMORY_ECHO_MIN_CANDIDATES, MOON_BOSS_SP, ABYSS_RULE_THICK_SP, ABYSS_RULE_GREED_DROP,
+} from '@/battle/numbers';
+import { buildStratum, buildAbyssRing, buildFinalStratum, buildRevisitStratum, migrationStratumName, orphanBossOf, reachableNodeIds, rollMobSpec, weekKeyOf } from '@/battle/tower';
+import { TOWER_EVENT_IDS } from '@/battle/events';
+import { abyssWeeklyRule, abyssWeeklyWeakAttribute } from '@/battle/abyssRules';
+import { buildMoonShadow, monthKeyOf } from '@/battle/moonBoss';
+import type { MoonRevealData } from '@/battle/moonBoss';
+import { fullMoonSlotOnDay } from '@/utils/moonPhase';
+import { memoryEchoCandidates } from '@/utils/towerMemory';
+import { rollNodeLoot, rollAffixes, buildOathSkill, towerRelicBonus, MYTH_POOL, rollRelic, rollMyth, lootLabel, type LootDrop } from '@/battle/loot';
+import { currentRecordStreak, shouldGrantDiligence } from '@/battle/preparation';
+import { DILIGENCE_MAX_CHARGES, GOLDEN_SP_MULT, BOSS_ATTACK_BY_LEVEL, HEROPROOF_SP_CUT } from '@/battle/numbers';
+import { generateDefeatLetter, type FinalBossFacts } from '@/utils/battleAI';
+import { normalizeAttributeLevelTitles } from '@/utils/attributeLevelTitles';
+import { levelForPoints, masteryOf, thresholdsOf } from '@/utils/levels';
+import { peekWeatherNow, weatherConfigOf } from '@/utils/weather';
+import { seasonMarkOf } from '@/utils/calendar';
+import { generateWeekQuests, previousWeekKey, questBoardUnlocked, questDone, questTitle, swapQuestFor, weekRangeOf, weekRangeOfKey, type QuestData } from '@/utils/questBoard';
+import { meetingReminder } from '@/utils/orgLogic';
+import { resolveLevelDifficulty } from '@/utils/levelDifficulty';
+
+// 成长总结的角色预设 / 请求载荷已迁到 utils/summaryAI（v2.7.0.6）；这里只做转出口，
+// 旧的 import { ... } from '@/store' 照常可用。
+export { DEFAULT_SUMMARY_PROMPT_PRESETS, FAMILIAR_FACE_PRESETS } from '@/utils/summaryAI';
+export type { SummaryRequestData } from '@/utils/summaryAI';
+
+interface AppState {
+  user: User | null;
+  attributes: Attribute[];
+  activities: Activity[];
+  achievements: Achievement[];
+  skills: Skill[];
+  /** 今日塔罗抽卡结果（未抽则为 null） */
+  dailyDivination: DailyDivination | null;
+  /** 窥探命运记录（v2.7；createdAt 降序） */
+  fateGlimpses: FateGlimpse[];
+  /** 全部中长期占卜（活跃 + 归档） */
+  longReadings: LongReading[];
+  /** 全部宣告卡 / 倒计时（含归档） */
+  callingCards: CallingCard[];
+  settings: Settings;
+  todos: Todo[];
+  todoCompletions: TodoCompletion[];
+  summaries: PeriodSummary[];
+  weeklyGoals: WeeklyGoal[];
+  currentPage: string;
+  /** 「当年今日」→ 记录页：要定位到的那一天（YYYY-MM-DD），记录页消费后清空（第 6 轮） */
+  activitiesJumpDate: string | null;
+  /** 行动页（任务+记录合并）当前子页；菜单/首页等外部入口可在导航前指定 */
+  actionsSubTab: 'todos' | 'activities';
+  /** masteryStars 有值 = 满级后的精通升星（第 6 轮），弹窗换精通口径 */
+  levelUpNotification: { id: string; displayName: string; level: number; masteryStars?: number } | null;
+  achievementNotification: { id: string; title: string } | null;
+  skillNotification: { id: string; name: string } | null;
+  modalBlocker: boolean;
+  
+  /** 启动初始化。deferTail：只读首屏必需的（用户 / 设置 / 核心表 / 今日塔罗），其余由 finishBoot 在首屏之后接着读 */
+  initializeApp: (opts?: { deferTail?: boolean }) => Promise<void>;
+  /** 启动尾巴：命运 / 长占 / 宣告卡清扫 / 同伴维护 / 谏言 / 记账 / 愿望（initializeApp 不 deferTail 时内部自己调） */
+  finishBoot: () => Promise<void>;
+  createUser: (name: string, attrNames?: Partial<import('@/types').AttributeNames>, blessingAttribute?: AttributeId) => Promise<void>;
+  updateUser: (patch: Partial<Pick<User, 'name' | 'avatarDataUrl'>>) => Promise<void>;
+  setTheme: (theme: ThemeType) => Promise<void>;
+  /** skipLoad：调用方紧接着还要再记一条时，把内存刷新留给后一条（少跑一整轮 loadData） */
+  addActivity: (description: string, points: Record<string, number>, method: 'local' | 'todo' | 'battle', options?: { important?: boolean; date?: Date; category?: Activity['category']; bigDealId?: string; wishId?: string; skipLoad?: boolean }) => Promise<{ unlockHints: { achievements: number; skills: number }; activityId: string }>;
+  updateAttribute: (attributeId: string, points: number) => Promise<void>;
+  unlockAchievement: (achievementId: string) => Promise<void>;
+  unlockSkill: (skillId: string) => Promise<void>;
+  setCurrentPage: (page: string) => void;
+  setActivitiesJumpDate: (key: string | null) => void;
+  setActionsSubTab: (tab: 'todos' | 'activities') => void;
+  updateSettings: (newSettings: Partial<Settings>) => Promise<void>;
+  loadData: () => Promise<void>;
+  // 星象 / 塔罗
+  loadDailyDivination: () => Promise<void>;
+  saveDailyDivination: (d: DailyDivination) => Promise<void>;
+  // ── 窥探命运（v2.7）────────────────────────────────────────
+  loadFateGlimpses: () => Promise<void>;
+  /** 保存一次窥探（含 buff 生效期）并刷新内存态 */
+  createFateGlimpse: (g: FateGlimpse) => Promise<void>;
+  /** 当前生效中的窥探 buff（buffStart ≤ 今天 ≤ buffEnd）；无则 null */
+  getActiveFateBuff: () => FateGlimpse | null;
+  /**
+   * 七日窗口状态：以当前连抽 streak 起点锚定的 7 天（未到/未抽留空位，收集区从左
+   * 往右逐日点亮）；7 张全齐即可窥探（起点恒晚于上次窥探日，冷却随之自动满足）。
+   * dailyDivinations 不在内存态（只有今日一张），故此查询走 db、返回 Promise。
+   */
+  getFateWindow: () => Promise<{
+    days: Array<{ date: string; drawn: DailyDivination | null }>;
+    complete: boolean;
+    eligible: boolean;
+    lastGlimpse: FateGlimpse | null;
+  }>;
+  /** 解读者手记（v2.7.0.6）：清除或改写今日塔罗 / 中长期占卜上的备忘；memo 传空即清除 */
+  updateDailyMemo: (id: string, memo: string | undefined) => Promise<void>;
+  updateLongReadingMemo: (id: string, memo: string | undefined) => Promise<void>;
+  loadLongReadings: () => Promise<void>;
+  saveLongReading: (r: LongReading) => Promise<void>;
+  appendLongReadingFollowUp: (id: string, followUp: LongReadingFollowUp) => Promise<void>;
+  archiveLongReading: (id: string, archived: boolean) => Promise<void>;
+  deleteLongReading: (id: string) => Promise<void>;
+  sweepExpiredReadings: () => Promise<void>;
+  /** 活跃（未归档、未过期）的中长期占卜数量 */
+  countActiveReadings: () => number;
+
+  // ── CallingCard / 宣告卡（倒计时） ───────────────────────
+  loadCallingCards: () => Promise<void>;
+  /** 新建 / 覆盖一张 CallingCard。pinned=true 时自动 unpin 其它卡（互斥保证） */
+  saveCallingCard: (card: CallingCard) => Promise<void>;
+  deleteCallingCard: (id: string) => Promise<void>;
+  dropProfileGoalIfCard: (cardId: string) => Promise<void>;
+  /** 手动归档：archiveReason='manual' */
+  archiveCallingCard: (id: string) => Promise<void>;
+  /** 取消归档（误归档时还原） */
+  unarchiveCallingCard: (id: string) => Promise<void>;
+  /** 把某张卡钉到首页（自动 unpin 其它卡）；id=null 仅做全 unpin */
+  pinCallingCard: (id: string | null) => Promise<void>;
+  /**
+   * 扫一遍所有未归档卡片，把已经满足达成条件的自动归档：
+   *   - mode='deadline'：today > targetDate
+   *   - mode='todos'：linkedTodoIds 全部满足（见 getCallingCardProgress）
+   *   - mode='both'：先到的为准
+   * 返回值：本次新归档的卡片列表（用来给 UI 触发 cut-in 结算屏）
+   */
+  sweepCallingCards: () => Promise<CallingCard[]>;
+  /**
+   * 算一张卡当下进度：
+   *   - daysElapsed / daysTotal / daysLeft：deadline / both 模式有值
+   *   - dateProgress：0–1，到/过期 = 1
+   *   - todosDone / todosTotal：todos / both 模式有值
+   *   - todoProgress：0–1
+   *   - overallProgress：综合（both 取 max；其它取本身）
+   *   - reached：是否已达成（用于判定是否应归档）
+   */
+  getCallingCardProgress: (id: string) => {
+    daysElapsed?: number;
+    daysTotal?: number;
+    daysLeft?: number;
+    dateProgress?: number;
+    todosDone?: number;
+    todosTotal?: number;
+    todoProgress?: number;
+    overallProgress: number;
+    reached: boolean;
+  } | null;
+  /** 标记某张卡的 cut-in 已展示过（避免重弹） */
+  markCallingCardCutInShown: (id: string) => Promise<void>;
+  /**
+   * 在 cut-in 上点击"留下记录"时调用：写一条 category='calling_card_clear' 的 Activity，
+   * description 形如 "跨越了「{title}」"。同一张卡只允许写一次（ledgerWritten flag）。
+   */
+  writeCallingCardLedger: (id: string) => Promise<void>;
+
+  // ── F3 治疗终端 · 启动素材库 ──────────────────────
+  wishes: Wish[];
+  loadWishes: () => Promise<void>;
+  /** 新建 / 覆盖一条素材（父级素材 parentId 空 / 小步骤带 parentId） */
+  saveWish: (wish: Wish) => Promise<void>;
+  /** 创建一条素材（自动补 id/createdAt/status/source 默认值），返回新建对象 */
+  addWish: (input: { title: string; parentId?: string; note?: string; kind?: Wish['kind']; currentState?: string; attribute?: AttributeId; arcanaId?: string; source?: 'manual' | 'ai' }) => Promise<Wish>;
+  /** 删除一条素材；删除父级素材时连带删除其全部小步骤 */
+  deleteWish: (id: string) => Promise<void>;
+  /** 改素材状态（active/done/archived）；done/archived 落 archivedAt */
+  setWishStatus: (id: string, status: Wish['status']) => Promise<void>;
+  /** 某个愿望「已完成相关任务」次数 = 挂了 wishId 的活动条数（V2.6 §1.2） */
+  getWishProgress: (wishId: string) => number;
+  /**
+   * 「愿望已实现」（V2.6 §1.4）：写 fulfilledAt + status='done'，
+   * 并把该愿望名下的子愿望与在途 BIG DEAL/待办一并归档（口径同 BIG DEAL 收官）。
+   * 返回结算屏要用的载荷；没有这条愿望则返回 null。
+   */
+  fulfillWish: (id: string) => Promise<{ title: string; timesLogged: number; archivedTodos: number } | null>;
+  /**
+   * AI 拆分：把一件卡住的事拆成 3–5 个「可执行的小步骤」标题。
+   * 在线走 chatComplete；无 Key 抛错由调用方兜底（手动输入）。返回标题数组，由 UI 确认后再落库。
+   */
+  decomposeWishAI: (parent: Wish, children?: Wish[]) => Promise<string[]>;
+
+  // ── 愿望进度（PRD_V2.6 §8）──────────────────────────────
+  /** 给愿望加一条子任务（勾掉不加点，见 Wish.steps 注释） */
+  addWishStep: (wishId: string, title: string, opts?: { source?: 'manual' | 'ai' }) => Promise<void>;
+  /** 勾 / 撤勾一条子任务；勾上会顺带触发一次进度重估（受 wishAutoEvaluate 管辖） */
+  toggleWishStep: (wishId: string, stepId: string) => Promise<void>;
+  removeWishStep: (wishId: string, stepId: string) => Promise<void>;
+  /** AI 续拆愿望子任务（复用 decomposeWishAI 管线，避重/限量逻辑免费继承） */
+  decomposeWishStepsAI: (wishId: string) => Promise<string[]>;
+  /**
+   * 评估「离这个愿望还有多远」。
+   * 在线走 AI（带子步/挂载记录/上次落点作上下文）；无 Key 退化为本地估算（source='local'）。
+   * `context` 供 Agent 把谈话里的新信息喂进来；
+   * `dryRun` 只算不写——Agent 的提议必须等用户确认才落库，绝不先斩后奏。
+   */
+  evaluateWishProgress: (wishId: string, opts?: { context?: string; allowDecrease?: boolean; dryRun?: boolean }) => Promise<{ pct: number; delta: number; reason?: string; source: WishProgressSource } | null>;
+  /** 直接落一个百分比（手动拖 / Agent 提议被确认后）。写轨迹、发弹窗由调用方决定 */
+  setWishProgress: (wishId: string, pct: number, opts?: { reason?: string; source?: WishProgressSource }) => Promise<void>;
+  /** 环要画的一切：百分比 + 是否评估过 + 子步计数 + 挂载次数 */
+  getWishRing: (wishId: string) => { pct: number; evaluated: boolean; done: number; total: number; times: number };
+  /**
+   * 任务完成后的进度泵：立刻不阻塞地跑一次重估，出结果再弹窗（§8「每次任务完成都会评估涨了多少」）。
+   * 内部自带节流与状态校验，重复调用安全。
+   */
+  bumpWishProgress: (wishId: string) => Promise<void>;
+  /** 进度弹窗载荷（App 顶层 WishProgressCutIn 消费；null = 无待播） */
+  wishProgressCut: WishProgressCutPayload | null;
+  clearWishProgressCut: () => void;
+  /** 黑猫的进度提议（谈话中触发，必须用户确认才落库；null = 无待决） */
+  wishProposal: WishProposalPayload | null;
+  setWishProposal: (p: WishProposalPayload | null) => void;
+
+  // ── 回归面板（PRD_V2.6 §12）──────────────────────────────
+  /**
+   * 记一次「打开过」。每次冷启动 / 切回前台调用。
+   * 返回本次是否构成一次**回归**（离开 ≥ 7 天）及其载荷；不构成则返回 null。
+   * 内部只在真的构成回归时才写 lastReturnPanelAt，普通打开只刷新 lastOpenedAt。
+   */
+  markAppOpened: () => Promise<ReturnPayload | null>;
+  /**
+   * 补记候选：从近 60 天的手动记录里按出现频次挑出常做的事。
+   * 回忆很难、认出来很容易——补记面板给 chip 而不是空输入框，靠的就是这份表。
+   */
+  getBackfillSuggestions: (limit?: number) => Array<{ text: string; points: Record<string, number> }>;
+  /**
+   * 完成回归仪式：写补记条目 + 写那条带 tag 的回归记录 + 回归次数 +1。
+   * `entries` 为空也照样成立——「我回来了」本身就是仪式。
+   */
+  commitReturn: (payload: ReturnPayload, entries: BackfillEntry[], summary?: string) => Promise<void>;
+
+  /** 今日「应做」的活跃待办（active + 未来启用日排除 + weekdays 不含今天排除）；短路决策候选与入口卡计数共用，统一全站口径。 */
+  getDueTodosToday: () => Todo[];
+
+  addTodo: (todo: Omit<Todo, 'id' | 'createdAt'>) => Promise<void>;
+  updateTodo: (id: string, updates: Partial<Todo>) => Promise<void>;
+  deleteTodo: (id: string) => Promise<void>;
+  completeTodo: (todoId: string) => Promise<{ unlockHints: { achievements: number; skills: number } } | null>;
+  /**
+   * 撤销今日的 todo 完成：从 activity 历史里抠出当天因这条 todo 触发的活动，
+   * 走 deleteActivity 完整撤销链路（扣回属性点数、回算 level、删 todoCompletion、还原 todo 为 active）。
+   * 仅作用于 today + method='todo' 的活动；非当天已完成的项不应进入这个入口。
+   */
+  undoTodayTodoCompletion: (todoId: string) => Promise<void>;
+  // ── BIG DEAL（任务×终端二合一，TASKS_MERGE_PRD 批1 数据底座）──
+  addTodoStep: (todoId: string, title: string, opts?: { attribute?: AttributeId; source?: 'manual' | 'ai' }) => Promise<void>;
+  updateTodoStep: (todoId: string, stepId: string, patch: Partial<Pick<TodoStep, 'title' | 'attribute'>>) => Promise<void>;
+  removeTodoStep: (todoId: string, stepId: string) => Promise<void>;
+  /** 勾一子步：发父条目点数 + 写 bigdeal_step 记录；最后一步自动收官。返回 null = 未生效 */
+  completeTodoStep: (todoId: string, stepId: string) => Promise<{ collapsed: boolean } | null>;
+  /** 撤勾（未收官前）：走 deleteActivity 完整回档链路 */
+  undoTodoStep: (todoId: string, stepId: string) => Promise<void>;
+  /** 收官：触及属性各+1（承载在收官记录上）+ SP 入账 + 归档；全子步 done 才生效 */
+  collapseBigDeal: (todoId: string) => Promise<void>;
+  /** 收官结算屏载荷（App 顶层 BigDealClearCutIn 消费；null = 无待播结算） */
+  bigDealClear: BigDealClearPayload | null;
+  clearBigDealClear: () => void;
+  getBigDealProgress: (todoId: string) => { done: number; total: number; nextStep: TodoStep | null };
+  /** AI 拆解大事子步（复用 decomposeWishAI 管线；无 Key 抛错由 UI 走离线模板兜底） */
+  decomposeBigDealAI: (todoId: string) => Promise<string[]>;
+  /** 一次性迁移：Wish 树根→BIG DEAL / 无子步根→愿望纸片 / 在途终端卡归档（防重入） */
+  runTasksMergeMigration: () => Promise<void>;
+  /**
+   * 收官后的 BIG DEAL「重建任务」（PRD_V2.6 §2.4）。
+   * 取代原来的"回退/撤销"：回退会把条目留在"全成但动不了"的僵死态
+   * （clearedActivityId 已写、子步全 done、所有控件 disabled）——那条路已砍。
+   * 这里改为新立一条同名同步骤的全新 BIG DEAL，旧条目原样归档留作历史。
+   */
+  rebuildBigDeal: (todoId: string) => Promise<string | null>;
+  // ── 抽签（TASKS_MERGE_PRD §4.2 批3）──
+  /** 三源奖池：今日未完成待办 + 愿望纸片 + 近 30 天手动记录去重；当日已抽中/已完成剔除 */
+  getFateDrawPool: () => FateCandidate[];
+  /** 纯单抽：从池随机取一张并当日沉底（无重抽；拒绝零惩罚但同条目当日不再出现） */
+  drawFate: (pool?: FateCandidate[]) => Promise<FateCandidate | null>;
+  /** 接受抽中：待办→钉签；愿望→转正为今日一次性任务并归档纸片；历史→同款复刻一条 */
+  acceptFateDraw: (c: FateCandidate) => Promise<void>;
+  /** 抽签「以后别抽这件」：旧事拉黑，之后不再进池（第 17 批） */
+  muteFateHistory: (c: FateCandidate) => Promise<void>;
+  getTodayTodoProgress: (todoId: string) => { count: number; isComplete: boolean; target: number };
+  getTodoDateLabel: (date: Date) => string;
+  setLevelUpNotification: (notification: { id: string; displayName: string; level: number } | null) => void;
+  setAchievementNotification: (notification: { id: string; title: string } | null) => void;
+  setSkillNotification: (notification: { id: string; name: string } | null) => void;
+  setModalBlocker: (value: boolean) => void;
+  deleteActivity: (id: string) => Promise<void>;
+  /**
+   * 仅删除活动条目本身，不回退属性点 / 等级 / todoCompletion / level_up 副记录。
+   * 使用场景：用户想清除记录但保留这次的成长成果（误录的描述、隐私清理等）。
+   * 与 deleteActivity 互斥两条路径：deleteActivity = "删除并回档"，本方法 = "仅删除条目"。
+   */
+  deleteActivityRecordOnly: (id: string) => Promise<void>;
+  /** keepImages：导入主备份时用——配图不在主备份里也不上云，清掉就再也回不来 */
+  resetAllData: (opts?: { keepImages?: boolean }) => Promise<void>;
+  /** 导入成功后顺便数一数「记录已不存在的配图」；> 0 时置 orphanImagesPrompt，App 顶层弹询问窗 */
+  importData: (jsonData: string) => Promise<ImportDataResult>;
+  /**
+   * 导入主备份后发现的「记录已不存在的配图」。只在导入成功且张数 > 0 时被置上，其余时候恒为 null；
+   * 挂在 store 而不是账号页的原因：导入会 resetAllData（currentPage 回首页、user 置空），账号页当场卸载，
+   * 组件里的状态设了也没人看见——「导入成功」那句提示就是这么丢的
+   */
+  orphanImagesPrompt: { count: number; bytes: number } | null;
+  dismissOrphanImagesPrompt: () => void;
+  /** 用户在询问窗里点了「删除」：删之前再核对一遍记录确实不在；返回删掉的张数 */
+  pruneOrphanImages: () => Promise<number>;
+  addCustomAchievement: (achievement: Omit<Achievement, 'unlocked' | 'unlockedDate'>) => Promise<void>;
+  addCustomSkill: (skill: Omit<Skill, 'unlocked'>) => Promise<void>;
+  updateCustomAchievement: (id: string, achievement: Partial<Achievement>) => Promise<void>;
+  updateCustomSkill: (id: string, skill: Partial<Skill>) => Promise<void>;
+  deleteCustomAchievement: (id: string) => Promise<void>;
+  deleteCustomSkill: (id: string) => Promise<void>;
+  toggleSkillUnlock: (id: string) => Promise<void>;
+  checkKeywordAchievements: (description: string, options?: { skipLoad?: boolean }) => Promise<void>;
+  checkTodoCompletionAchievements: (options?: { skipLoad?: boolean }) => Promise<void>;
+  checkWeeklyGoalAchievements: (options?: { skipLoad?: boolean }) => Promise<void>;
+  checkAllAttributesMaxAchievement: () => Promise<void>;
+  applySkillBonus: (attributeId: string, points: number) => number;
+  // 总结功能
+  buildSummaryRequest: (period: SummaryPeriod, startDate: string, endDate: string, opts?: { signal?: AbortSignal }) => Promise<SummaryRequestData>;
+  saveSummary: (summary: PeriodSummary) => Promise<void>;
+  deleteSummary: (id: string) => Promise<void>;
+  loadSummaries: () => Promise<void>;
+  getSummaryLabel: (period: SummaryPeriod, startDate: string) => string;
+  getActiveSummaryPreset: () => SummaryPromptPreset;
+  // 本周目标
+  saveWeeklyGoal: (goal: WeeklyGoal) => Promise<void>;
+  deleteWeeklyGoal: (id: string) => Promise<void>;
+  completeWeeklyGoal: (id: string, rewardAttribute: AttributeId) => Promise<void>;
+  getWeeklyGoalProgress: (goal: WeeklyGoal) => WeeklyGoalItem[];
+  // 逆流
+  applyCountercurrentDecay: () => Promise<AttributeId[]>;
+  getCountercurrentWarnings: () => AttributeId[];
+  // F2a 本地通知
+  /** 合并 250ms 内的连发后再排（见 syncNotificationsNow） */
+  syncNotifications: () => Promise<void>;
+  /** 立刻按当前数据重排本地通知（不合并） */
+  syncNotificationsNow: () => Promise<void>;
+  markSummaryViewed: (id: string) => Promise<void>;
+  // F5 心相记账
+  ledgerEntries: LedgerEntry[];
+  /** 记账三表已从本地库读进内存（第 13 轮：读完前「0 条流水」会被当成新用户、对账按 0 算） */
+  ledgerLoaded: boolean;
+  budgets: Budget[];
+  loadLedger: () => Promise<void>;
+  addLedgerEntry: (input: Omit<LedgerEntry, 'id' | 'createdAt' | 'currency'> & { currency?: string }) => Promise<LedgerEntry>;
+  deleteLedgerEntry: (id: string) => Promise<void>;
+  setBudget: (period: string, patch: { monthlyLimit?: number; dailyLimit?: number; savingsGoal?: number; savingsGoalEdits?: number; carriedFrom?: string }) => Promise<void>;
+  /** （第 13 轮）新周期没设预算 → 沿用最近一期的花费上限（记 carriedFrom，可改） */
+  ensureBudgetCarry: () => Promise<void>;
+  adjustTotalBalance: (targetTotal: number) => Promise<{ ok: boolean; reason?: string }>;
+  /** （第 13 轮 2.6）各账户余额：渠道即账户；收入 − 支出 + 调整；没渠道的归「未分配」 */
+  getAccountBalances: () => AccountBalance[];
+  /** （第 13 轮 2.6）一轮对账：给出若干账户的目标余额，各写一条带同一轮次 id 的调整；每月 3 轮；开局设余额不占 */
+  adjustAccountBalances: (targets: Array<{ account: string | null; target: number }>) => Promise<{ ok: boolean; reason?: string }>;
+  getTotalBalance: () => number;
+  getBudget: (period?: string) => Budget | undefined;
+  getPeriodExpense: (periodKey: string) => number;
+  getPeriodIncome: (periodKey: string) => number;
+  getAdjustCountThisMonth: () => number;
+  earnLedgerSp: (amount: number, tier?: 'regular' | 'bonus' | 'flat') => Promise<number>;
+  rewardForLedgerEntry: (entry: LedgerEntry, opts?: { attribute?: AttributeId; attrPoints?: number; evalWorth?: SpendWorth }) => Promise<void>;
+  // F5 资产板块
+  assets: LedgerAsset[];
+  addAsset: (input: Omit<LedgerAsset, 'id' | 'createdAt'>) => Promise<LedgerAsset>;
+  updateAsset: (id: string, patch: Partial<LedgerAsset>) => Promise<void>;
+  deleteAsset: (id: string) => Promise<void>;
+  getFixedAssetTotal: () => number;
+  /** 累计存款：过去每月「没花完的预算」之和 max(0, 月预算 − 当月支出)（自律攒下）。 */
+  getSavings: () => number;
+  /** 月度不超预算 → 发 +10 SP（仅完成月、每月一次）；返回本次是否发放。 */
+  claimLedgerBudgetBonus: (period: string) => Promise<boolean>;
+  /** 「省钱挑战」结算：过去月 (预算−支出) ≥ savingsGoal 且未发放 → +10SP，返回省下的金额（未达成/已发返 null）。 */
+  claimLedgerChallengeBonus: (period: string) => Promise<number | null>;
+  // 逆影战场
+  persona: Persona | null;
+  shadow: Shadow | null;
+  battleState: BattleState | null;
+  loadBattleData: () => Promise<void>;
+  savePersona: (persona: Persona) => Promise<void>;
+  saveShadow: (shadow: Shadow) => Promise<void>;
+  saveBattleState: (state: BattleState) => Promise<void>;
+  earnSP: (amount: number) => Promise<void>;
+  // ── 满月心魔（第 6 轮 · PRD §11.6）──
+  /** 满月当天：建本月的月度心魔并在后台生成；满月那天没进战场的过后作废；生成到一半被杀的接着跑 */
+  ensureMoonShadow: () => Promise<void>;
+  /** 满月当天第一次进战场（新开一环 / 当天第一次潜入）时判定一次：没走过的一环 → 装进顶层；否则这个月忽略 */
+  moonCheckOnEntry: () => Promise<void>;
+  /** 生成完落库；已判定要装、那一环在等 → 立刻换进去 */
+  completeMoonShadow: (slot: number, data: MoonRevealData, offline: boolean) => Promise<void>;
+  // ── 委托板（第 6 轮）──
+  /** 周一后第一次打开：生成本周三张；上周做完没领的自动领取并留一句话在 questNotice */
+  refreshQuests: () => Promise<void>;
+  /** 手动领取：进度够了才发 SP（没开战场只记计数）；一周三张都领了盖一枚「委托全清」印记 */
+  claimQuest: (id: string) => Promise<{ ok: boolean; sp: number }>;
+  /** 本周委托「换一张」（每周一次；做完 / 领过的不能换） */
+  swapQuest: (id: string) => Promise<{ ok: boolean; reason?: string }>;
+  questNotice: string | null;
+  clearQuestNotice: () => void;
+  startBattleSession: () => void;
+  endBattleSession: () => void;
+  defeatShadow: () => Promise<void>;
+  /** 第 13 轮：status=victory 但本体没了、且已无奖可领（区层已通关 / 没有区层）→ 状态修回 idle，别再弹一个按不动的奖励屏 */
+  repairOrphanVictory: () => Promise<void>;
+  resetBattle: () => Promise<void>;
+  equipMask: (attr: AttributeId | null) => Promise<void>;
+  // 影时间高塔（批2）：区层攀登
+  stratum: TowerStratum | null;
+  saveStratum: (s: TowerStratum) => Promise<void>;
+  /** 显形新区层：写入区层 + 主影（沿用 shadows 单例=当前区层主影约定） */
+  revealStratum: (params: { level: number; name: string; description: string; themeAttribute?: AttributeId; boss: Shadow }) => Promise<void>;
+  /** 每日一次登塔：满 HP + 记 lastChallengeDate + 初始化当日 session 统计 */
+  enterTowerToday: () => Promise<void>;
+  moveToTowerNode: (nodeId: string) => Promise<StratumNode | null>;
+  /** 完成节点：标记 cleared + 按类型即发 SP（返回发放量） */
+  completeTowerNode: (nodeId: string, opts?: { wasMob?: boolean }) => Promise<number>;
+  /** 事件效果原语：HP%增减 / SP 增减 / 登塔增益 / 被夺先手 */
+  towerAdjust: (opts: { hpDeltaPct?: number; spDelta?: number; buff?: { id: string; label: string; addPct?: number }; stealFirstStrike?: boolean }) => Promise<void>;
+  towerSkipNextFloor: () => Promise<void>;
+  towerRerollNextFloor: () => Promise<void>;
+  /** 战斗结束后回写 session 统计（伤害/最大单击/弱点数） */
+  towerRecordBattleStats: (stats: { damage: number; maxHit: number; weaknessHits: number }) => Promise<void>;
+  /** 月相日（周一）异变加深：主影回满 + deepenCount+1；返回是否触发（供演出） */
+  deepenStratumIfNewWeek: () => Promise<boolean>;
+  // ── 批3 · 养成与生态 ──
+  /** 战利品掷取并入包（月匣/强敌/心魔/金色回响）；返回掉落列表（toast/演出用） */
+  rollTowerLoot: (source: 'chest' | 'elite' | 'boss' | 'golden', floorRatio: number) => Promise<LootDrop[]>;
+  /** （批5）踏入深渊回廊 / 深入下一环：零 AI 即时生成环+守卫（Lv5 通关后解锁） */
+  enterAbyss: () => Promise<void>;
+  // ── R19 ·「回头看看」──
+  /** 已通关的最高主塔区层（存量档从档案与当前区层推断） */
+  highestClearedStratum: () => number;
+  /** 重游一个已通关区层：主线区层与主影原样寄存在 battleState，零 AI 即时生成旧层 */
+  startRevisit: (level: number) => Promise<void>;
+  /** 回到塔顶：把寄存的主线放回来 */
+  endRevisit: () => Promise<void>;
+  // ── Lv6 · 最终 BOSS「伪神」（PRD_FINAL_BOSS）──
+  /** 汇总喂给伪神生成器的结构化事实（只出统计量，不出记录原文） */
+  collectFinalBossFacts: () => FinalBossFacts;
+  /** 伪神显形：写入 Lv6 顶阙 + 伪神本体（三条血）+ 标记 finalBossStage='revealed' */
+  revealFinalBoss: (params: {
+    stratumName: string; stratumDescription: string;
+    name: string; description: string;
+    invertedAttributes: Record<AttributeId, string>;
+    responseLines: string[]; weakAttribute: AttributeId;
+    flaw: FinalBossFlaw;
+  }) => Promise<void>;
+  /** 三条血击破 → 进入终局演出（持久化，杀进程后重入回到演出） */
+  beginFinalBossFinale: () => Promise<void>;
+  /** 终局演出进度落库（阶段 / 命中数 / 援军 SP / 被碾压后的 HP·SP） */
+  saveFinaleProgress: (patch: {
+    phase?: FinalePhase; hits?: number; allySp?: number; playerHp?: number; sp?: number;
+  }) => Promise<void>;
+  /** 终局演出走完：发「英雄的证明」+ 记档案 + 区层通关 + finalBossStage='defeated' */
+  defeatFinalBoss: () => Promise<RelicInstance | null>;
+  /** 事件奖励：残月遗物 / 随机迷思 直接入包；返回展示名（结果文案用） */
+  grantEventLoot: (kind: 'relicWaning' | 'randomMyth') => Promise<string>;
+  /** 删除遗物 → 转化 SP（10/25/60）；返回转化量 */
+  salvageRelic: (relicId: string) => Promise<number>;
+  /** 装备/卸下遗物（受区层期栏位限制：Lv1期1/Lv2-4期2/Lv5期3）；返回是否成功 */
+  toggleEquipRelic: (relicId: string) => Promise<boolean>;
+  /** 迷思镶嵌（每技能1枚；誓约技不可镶；淬毒仅 damage/crit）；返回错误文案或 null */
+  socketMyth: (attr: AttributeId, skillLevel: number, stoneId: string) => Promise<string | null>;
+  /** 迷思拆下（石头返还背包，无残留；R18 觉醒烧录 permanent 不可拆） */
+  unsocketMyth: (attr: AttributeId, skillLevel: number) => Promise<void>;
+  /** R18 面具羁绊：战斗胜利后按本场召唤过的面具累加出战场次 */
+  recordMaskBattles: (masks: AttributeId[]) => Promise<void>;
+  /** R18 技能觉醒：满星 + 消耗一颗迷思 → 词条烧录永久 + 改名（空名 = 原名·觉醒）+ 星级清零进下一轮；返回错误文案或 null */
+  awakenSkill: (attr: AttributeId, skillLevel: number, stoneId: string, newName?: string) => Promise<string | null>;
+  /** 誓约装备：快照原技能→置换（每 Persona 限1）；返回错误文案或 null。命名由 UI 层 LLM 后置覆写 */
+  equipOathStone: (attr: AttributeId, skillLevel: number, stoneId: string) => Promise<string | null>;
+  /** 誓约卸下：原技能完整恢复 + 石返还（完全可逆） */
+  unequipOathStone: (attr: AttributeId) => Promise<void>;
+  /** 誓约技 LLM 命名回写（并缓存到石头上，重复装备不再调 AI） */
+  renameOathSkill: (attr: AttributeId, name: string, description: string) => Promise<void>;
+  /** 共鸣链生效切换（同时 1 条；null=全部收起） */
+  setActiveChain: (key: ChainKey | null) => Promise<void>;
+  /** 熟练度记录（战斗中每次技能使用；内部触发双条件解锁刷新） */
+  recordSkillUses: (uses: Array<{ attr: AttributeId; level: number }>) => Promise<void>;
+  /** 技能解锁刷新：存量迁移（unlocked 缺省→按当时属性等级置位，不回锁）+ 双条件（属性等级≥N 且前技满星） */
+  refreshSkillUnlocks: () => Promise<void>;
+  // ── 批4 · 日常闭环 ──
+  /** 备战抽取应用：buff 进 session（伤害类）+ SP 即发；记 prepDrawnId 防重复 */
+  applyPrepBuff: (buff: { id: string; label: string; addPct?: number; sp?: number }) => Promise<void>;
+  /** 勤勉的光辉：塔内使用一枚 → 完全恢复 HP；返回是否成功 */
+  claimDiligence: () => Promise<boolean>;
+  /** 战场成就壮举：记入 battleFeats 并尝试解锁对应成就 */
+  recordBattleFeat: (feat: string) => Promise<void>;
+  /** 战场成就自愈：壮举与成就双向对账（历史竞态丢过记录，见 recordBattleFeat 注释） */
+  repairBattleFeats: () => Promise<void>;
+  /** 黑猫败因信：败退当晚生成（AI/模板兜底）→ 存 pendingCatLetter（黑猫打开时投递）+ 写 observation 记忆 */
+  deliverDefeatLetter: () => Promise<void>;
+  /** 月相祭坛：移除主影随机一条词缀（顽固回落 HP 上限）；返回被移除的词缀或 null */
+  removeRandomShadowAffix: () => Promise<AffixKind | null>;
+
+  // 同伴 / Confidant
+  confidants: Confidant[];
+  confidantEvents: ConfidantEvent[];
+  loadConfidants: () => Promise<void>;
+  addConfidant: (args: {
+    name: string;
+    description: string;
+    match: ConfidantMatchResult;
+    source?: 'offline' | 'online';
+    linkedCloudUserId?: string;
+    linkedEmail?: string;
+    /** 用户主观选定的初始亲密度（1–10，优先于 AI 建议） */
+    initialLevel?: number;
+    /** 用户自选的能力加成属性（未传 → 使用塔罗花色对应的） */
+    skillAttribute?: AttributeId;
+  }) => Promise<Confidant>;
+  updateConfidant: (id: string, patch: Partial<Confidant>) => Promise<void>;
+  bumpConfidantIntimacy: (
+    id: string,
+    delta: number,
+    eventType?: ConfidantEvent['type'],
+    narrative?: string,
+    extra?: { userInput?: string; advice?: string; eventId?: string; eventDate?: string; lastInteractionDate?: string },
+  ) => Promise<{ leveledUp: boolean; newIntimacy: number; starShiftGained: number; eventId: string }>;
+  /** 使用一次星移：写入新的 description / interpretation / advice / orientation，charges -1 */
+  consumeStarShift: (
+    id: string,
+    payload: { description: string; interpretation: string; advice: string; orientation: import('@/types').TarotOrientation; summary?: string },
+  ) => Promise<void>;
+  recordConfidantInteraction: (args: {
+    id: string;
+    description: string;
+    delta: number;
+    narrative: string;
+    advice?: string;
+    createActivity?: boolean;
+    /** 同步到记录时：可额外给某个属性加点（0–3） */
+    activityAttribute?: AttributeId;
+    activityPoints?: number;
+  }) => Promise<{ leveledUp: boolean; newIntimacy: number }>;
+  archiveConfidant: (id: string) => Promise<void>;
+  unarchiveConfidant: (id: string) => Promise<void>;
+  deleteConfidant: (id: string) => Promise<void>;
+  useConfidantBattleItem: (id: string, kind: 'battle_heal' | 'battle_sp') => Promise<ConfidantBuff | null>;
+  runConfidantDailyMaintenance: () => Promise<void>;
+  getAvailableConfidantItems: (kind: 'battle_heal' | 'battle_sp') => Array<{
+    confidantId: string;
+    confidantName: string;
+    arcanaId: string;
+    buff: ConfidantBuff;
+  }>;
+
+  // 谏言 / Counsel
+  counselSession: CounselSession | null;
+  counselArchives: CounselArchive[];
+  loadCounsel: () => Promise<void>;
+  /** 周冷却检查：已使用过就返回 locked + 下一次可用日期 */
+  getCounselCooldown: () => { locked: boolean; nextAvailableAt?: Date; nextAvailableDate?: string; daysLeft?: number };
+  /** 判断当前是否有"进行中（未过期、未归档）"的 session */
+  hasActiveCounsel: () => boolean;
+  /** 新建一次会话；若已锁定或已有活动会话则抛错 */
+  startCounselSession: (mentionedConfidantIds?: string[]) => Promise<CounselSession>;
+  /** 追加一条消息到当前 session */
+  appendCounselMessage: (msg: CounselMessage) => Promise<void>;
+  /** 覆写一条消息（用于流式最终完成时写入全文） */
+  updateCounselMessage: (id: string, patch: Partial<CounselMessage>) => Promise<void>;
+  /** 检测并清理过期会话（保留 session 行以维持冷却，但清空 messages + expired=true） */
+  expireCounselIfNeeded: () => Promise<void>;
+  /** 归档当前会话：AI 生成 100 字摘要 → 写入 counselArchives → 删除 counselSessions 行 */
+  archiveCounselSession: (signal?: AbortSignal) => Promise<CounselArchive | null>;
+  /** 从归档库删除一条 */
+  deleteCounselArchive: (id: string) => Promise<void>;
+  /** 根据当前 session 的 mentioned ids + confidantEvents 构建 AI context（UI 调用） */
+  buildCounselContext: () => CounselContext;
+}
+
+/** hex 颜色变亮 ~25% 作为 secondary */
+function lightenHex(hex: string, amount = 0.25): string {
+  const h = hex.replace('#', '');
+  const r = Math.min(255, Math.round(parseInt(h.substring(0, 2), 16) + 255 * amount));
+  const g = Math.min(255, Math.round(parseInt(h.substring(2, 4), 16) + 255 * amount));
+  const b = Math.min(255, Math.round(parseInt(h.substring(4, 6), 16) + 255 * amount));
+  return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
+}
+
+/** hex → "r g b" 三元组（供 --color-primary-rgb，Tailwind 透明度修饰符依赖它） */
+function hexToRgbTriplet(hex: string): string {
+  const h = hex.replace('#', '');
+  const r = parseInt(h.substring(0, 2), 16);
+  const g = parseInt(h.substring(2, 4), 16);
+  const b = parseInt(h.substring(4, 6), 16);
+  return `${r} ${g} ${b}`;
+}
+
+/** 将自定义颜色写入 CSS 变量（内style 覆盖 data-theme 规则*/
+export function applyCustomThemeColor(hex: string) {
+  document.documentElement.style.setProperty('--color-primary', hex);
+  document.documentElement.style.setProperty('--color-primary-rgb', hexToRgbTriplet(hex));
+  document.documentElement.style.setProperty('--color-secondary', lightenHex(hex));
+}
+
+/**
+ * 清掉自定义颜色的内联覆盖，三个变量一起清。以前切出自定义主题时只清了 --color-primary 和
+ * --color-secondary，漏了 --color-primary-rgb——而 Tailwind 的 text-primary / bg-primary/10 一族
+ * 走的正是 rgb 三元组，于是蓝主题记录页上这些件还披着自定义色（用户上报「一块换颜色」）。
+ */
+export function clearCustomThemeColor() {
+  document.documentElement.style.removeProperty('--color-primary');
+  document.documentElement.style.removeProperty('--color-primary-rgb');
+  document.documentElement.style.removeProperty('--color-secondary');
+}
+
+/** F2a 默认提醒时段：新用户初始值，且现有用户首次开启通知时（notificationSlots 为 undefined）用它兜底。 */
+export const DEFAULT_NOTIF_SLOTS: NotifSlot[] = [
+  { id: 'morning', time: '08:00', enabled: true, label: '晨间序曲', contents: ['tarot', 'summary', 'quests'] },
+  { id: 'evening', time: '21:30', enabled: true, label: '夜间结算', contents: ['record', 'todos', 'countercurrent', 'together'] },
+];
+
+/** F5 记账奖励日封顶状态：锚日不是今天则视作 {0,0}（自然跨日重置）。 */
+function ledgerDailyState(s: Settings, today: string): { sp: number; attr: number; bonus: number } {
+  return s.ledgerRewardDate === today
+    ? { sp: s.ledgerSpToday ?? 0, attr: s.ledgerAttrToday ?? 0, bonus: s.ledgerBonusSpToday ?? 0 }
+    : { sp: 0, attr: 0, bonus: 0 };
+}
+
+const DEFAULT_SETTINGS: Settings = {
+  id: 'default',
+  attributeNames: {
+    knowledge: '知识',
+    guts: '胆量',
+    dexterity: '灵巧',
+    kindness: '温柔',
+    charm: '魅力'
+  },
+  levelThresholds: DEFAULT_LEVEL_THRESHOLDS,
+  levelDifficulty: 'easy',
+  attributeLevelTitles: normalizeAttributeLevelTitles(undefined, DEFAULT_LEVEL_THRESHOLDS.length),
+  aiMatchedPresetNames: false,
+  aiPresetNameBackup: undefined,
+  openaiEnabled: false,
+  openaiApiKey: '',
+  keywordRules: DEFAULT_KEYWORD_RULES,
+  darkMode: false,
+  backgroundImage: undefined,
+  backgroundOrientation: undefined,
+  backgroundOpacity: 0.3,
+  backgroundAnimation: ['aurora'],
+  soundMuted: false,
+  customLevelThresholds: undefined,
+  battleEnabled: true,
+  // F2a 本地通知：默认关，开启后用这两槽（晨间抽塔罗 / 晚间结算）
+  notificationsEnabled: false,
+  notificationSlots: DEFAULT_NOTIF_SLOTS,
+};
+
+/** settings 写入串行锁：见 updateSettings 的注释（并发写会互相吞字段） */
+let settingsWriteLock: Promise<void> = Promise.resolve();
+
+/**
+ * settings 内容没变就沿用旧对象（第 4 轮，界面性能）：loadData 每次都从库里读出一份新对象，
+ * 订阅 settings 的组件（几乎每一页）就全部白渲染一遍——而写库的操作十有八九没碰 settings。
+ * 顶层字段逐个 Object.is；对象 / 数组字段按 JSON 比（都不大，backgroundImage 是字符串走 Object.is）。
+ */
+function settingsEquivalent(a: Settings | undefined, b: Settings): boolean {
+  if (!a) return false;
+  const ra = a as unknown as Record<string, unknown>;
+  const rb = b as unknown as Record<string, unknown>;
+  const ka = Object.keys(ra).filter(k => ra[k] !== undefined);
+  const kb = Object.keys(rb).filter(k => rb[k] !== undefined);
+  if (ka.length !== kb.length) return false;
+  for (const k of kb) {
+    const va = ra[k], vb = rb[k];
+    if (Object.is(va, vb)) continue;
+    if (va && vb && typeof va === 'object' && typeof vb === 'object') {
+      if (JSON.stringify(va) !== JSON.stringify(vb)) return false;
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+/** 通知重排的合并计时（第 4 轮）：记一条 + 完成待办各叫一次 syncNotifications，实际只排一次 */
+let notifSyncPending: { promise: Promise<void>; resolve: () => void; timer: ReturnType<typeof setTimeout> } | null = null;
+/** 战场壮举写入串行锁：一场胜利会连发好几笔，见 recordBattleFeat 的注释 */
+let featWriteLock: Promise<void> = Promise.resolve();
+
+/** 满月心魔换进当前回廊环的顶层（shadows 单例 = 这一环的守卫） */
+async function installMoonGuard(get: () => AppState, ms: MoonShadowState): Promise<void> {
+  const st = get().stratum;
+  if (!st || !ms.shadow) return;
+  await get().saveShadow(ms.shadow);
+  await get().saveStratum({ ...st, moonBossPending: false });
+  const bs = get().battleState;
+  if (bs) await get().saveBattleState({ ...bs, moonShadow: { ...ms, status: 'installed', eligible: true, name: ms.shadow.name, shadow: undefined } });
+}
+
+/** 委托板进度要看的那一包数据：store 里有的直接拿，其余按需读表（配图只读本周 / 指定起点之后的） */
+async function questDataOf(get: () => AppState, now: Date, imagesFrom?: Date): Promise<QuestData> {
+  const st = get();
+  const from = imagesFrom ?? weekRangeOf(now).start;
+  const [divinations, images, ledger] = await Promise.all([
+    db.dailyDivinations.toArray(),
+    db.activityImages.where('createdAt').aboveOrEqual(from).toArray(),
+    db.ledgerEntries.toArray(),
+  ]);
+  const { useCloudStore } = await import('@/store/cloud');
+  return {
+    activities: st.activities,
+    todos: st.todos,
+    completions: st.todoCompletions,
+    divinations,
+    images,
+    summaries: st.summaries,
+    ledger,
+    pacts: useCloudSocialStore.getState().pacts,
+    myId: useCloudStore.getState().cloudUser?.id,
+    battleState: st.battleState,
+    aiReady: !!getAIConfig(st.settings),
+    now,
+  };
+}
+
+/** 自定义技能单个倍数钳 1–3（第 13 轮）；非数字回 1 */
+const clampSkillMultiplier = (v: number): number => {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.min(SKILL_BONUS_MULT_CAP, Math.max(1, n)) : 1;
+};
+
+export const useAppStore = create<AppState>((set, get) => ({
+  user: null,
+  attributes: [],
+  activities: [],
+  achievements: [],
+  skills: [],
+  dailyDivination: null,
+  fateGlimpses: [],
+  longReadings: [],
+  callingCards: [],
+  wishes: [],
+  bigDealClear: null,
+  orphanImagesPrompt: null,
+  todos: [],
+  todoCompletions: [],
+  summaries: [],
+  ledgerEntries: [],
+  ledgerLoaded: false,
+  budgets: [],
+  assets: [],
+  weeklyGoals: [],
+  settings: DEFAULT_SETTINGS,
+  currentPage: 'dashboard',
+  activitiesJumpDate: null,
+  questNotice: null,
+  // 每次启动首进「行动」先落记录页（内存态不持久化，会话内仍记忆上次停留）
+  actionsSubTab: 'activities',
+  levelUpNotification: null,
+  achievementNotification: null,
+  skillNotification: null,
+  modalBlocker: false,
+  persona: null,
+  shadow: null,
+  battleState: null,
+  stratum: null,
+  confidants: [],
+  confidantEvents: [],
+  counselSession: null,
+  counselArchives: [],
+
+  initializeApp: async (opts) => {
+    // 请求持久化存储，防止浏览器主动驱逐 IndexedDB（Chrome/Firefox 有效，iOS 17+ 部分有效）
+    if (navigator.storage?.persist) {
+      navigator.storage.persist().catch(() => {/* 不支持时静默忽略 */});
+    }
+    try {
+      const users = await db.users.toArray();
+      if (users.length === 0) {
+        return;
+      }
+      
+      const user = users[0];
+      set({ user });
+      
+      document.documentElement.setAttribute('data-theme', user.theme);
+      applyUiChannel(user.theme);
+      // 频道就位后立刻按闸门重估 .dark（红频道要摘）；loadData 拿到落盘设置后还会再同步一次
+      syncDarkClass(!!get().settings.darkMode);
+
+      await get().loadData();
+      // F2a：历史成长总结一次性回填 viewedAt（=createdAt，视为已读），避免开启通知时旧总结被判「未读」刷屏。
+      //      仅跑一次（flag 守卫）；此后新总结由保存 / 打开时各自标记已读。
+      if (!get().settings.summaryViewedBackfillDone) {
+        const legacy = (await db.summaries.toArray()).filter(s => !s.viewedAt);
+        if (legacy.length > 0) {
+          await db.summaries.bulkPut(legacy.map(s => ({ ...s, viewedAt: s.createdAt ?? new Date() })));
+          await get().loadSummaries();
+        }
+        await get().updateSettings({ summaryViewedBackfillDone: true });
+      }
+      await get().loadDailyDivination();
+      // 其余表与每日清扫：App 冷启动传 deferTail，首页先画、这些在后台接着读（第 12 轮）；
+      // 云同步 / 导入后的整体重载不传，照旧一口气读完
+      if (!opts?.deferTail) await get().finishBoot();
+    } catch (error) {
+      console.error('初始化应用失败', error);
+    }
+  },
+
+  finishBoot: async () => {
+    if (!get().user) return;
+    try {
+      await get().loadFateGlimpses();
+      await get().loadLongReadings();
+      await get().sweepExpiredReadings();
+      // 宣告卡：先 load，再 sweep；sweep 内部会再 load 一次刷新已归档项
+      await get().loadCallingCards();
+      await get().sweepCallingCards();
+      // 同伴"逆流"衰减与日常状态检查
+      await get().runConfidantDailyMaintenance();
+      // 谏言：载入会话 / 归档，并清理过期消息
+      await get().loadCounsel();
+      // F5 心相记账：载入流水与预算
+      await get().loadLedger();
+      // F3 治疗终端：载入启动素材库
+      await get().loadWishes();
+    } catch (error) {
+      console.error('启动尾巴失败', error);
+    }
+  },
+
+  createUser: async (name: string, attrNames?: Partial<import('@/types').AttributeNames>, blessingAttribute?: AttributeId) => {
+    try {
+      const newUser: User = {
+        id: uuidv4(),
+        name,
+        createdAt: new Date(),
+        theme: 'blue'
+      };
+
+      // 合并初始属性名（用于初始化设置）
+      const mergedAttrNames = {
+        knowledge: '知识',
+        guts: '胆量',
+        dexterity: '灵巧',
+        kindness: '温柔',
+        charm: '魅力',
+        ...attrNames
+      };
+
+      // 用自定义属性名更新初始属性记录的 displayName
+      const initialAttrsWithNames = INITIAL_ATTRIBUTES.map(a => ({
+        ...a,
+        displayName: mergedAttrNames[a.id as keyof typeof mergedAttrNames] || a.displayName
+      }));
+
+      // 根据自定义属性名更新成就描述（属性等级类）
+      const achievementsWithNames = ACHIEVEMENTS.map(ach => {
+        if (ach.condition.type === 'attribute_level' && ach.condition.attribute) {
+          const attrName = mergedAttrNames[ach.condition.attribute as keyof typeof mergedAttrNames];
+          // 只替换描述中的默认属性名
+          const defaultNames: Record<string, string> = { knowledge: '知识', guts: '胆量', dexterity: '灵巧', kindness: '温柔', charm: '魅力' };
+          const oldName = defaultNames[ach.condition.attribute] || ach.condition.attribute;
+          const newDesc = ach.description.replace(oldName, attrName);
+          return { ...ach, description: newDesc };
+        }
+        return ach;
+      });
+
+      // 根据自定义属性名更新技能描述
+      const skillsWithNames = SKILLS.map(skill => {
+        const attrName = mergedAttrNames[skill.requiredAttribute as keyof typeof mergedAttrNames];
+        const defaultNames: Record<string, string> = { knowledge: '知识', guts: '胆量', dexterity: '灵巧', kindness: '温柔', charm: '魅力' };
+        const oldName = defaultNames[skill.requiredAttribute] || skill.requiredAttribute;
+        const escapedOldName = oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const newDesc = skill.description.replace(new RegExp(escapedOldName, 'g'), attrName);
+        return { ...skill, description: newDesc };
+      });
+      
+      // 赐福技能：初始化时用户选择的专长属性，+40% 加点加成，已解锁
+      let allSkills: Skill[] = skillsWithNames;
+      if (blessingAttribute) {
+        const blessingAttrName = mergedAttrNames[blessingAttribute] || blessingAttribute;
+        const blessingSkill: Skill = {
+          id: `blessing_${blessingAttribute}`,
+          name: '馆长的赐福',
+          description: `${blessingAttrName}每次加点额外 +1`,
+          requiredAttribute: blessingAttribute,
+          requiredLevel: 1,
+          unlocked: true,
+          flatBonus: 1,
+        };
+        allSkills = [...skillsWithNames, blessingSkill];
+      }
+
+      /**
+       * 三张系统预设表一律 **bulkPut**，settings 用 **put**——不能用 add。
+       *
+       * add 的语义是「这张表此刻必须是空的」，而这个前提在首装时并不成立：
+       * 引导页还开着的时候，启动链里的迁移/补种已经可能往 achievements 写过一轮
+       * （见 runTasksMergeMigration 的注释）。一旦撞上 ConstraintError，
+       * createUser 会在写完 users/attributes 之后半途抛出：档案只建了一半，
+       * 技能表空、赐福丢失、属性名打回默认，而引导页因为 set({user}) 没跑到而卡死。
+       * 这几张表都是按稳定 id 写死的系统预设，覆盖写是幂等的，没有信息损失。
+       */
+      await db.users.add(newUser);
+      await db.attributes.bulkPut(initialAttrsWithNames);
+      await db.achievements.bulkPut(achievementsWithNames);
+      await db.skills.bulkPut(allSkills);
+
+      const defaultSettings: Settings = {
+        id: 'default',
+        attributeNames: mergedAttrNames,
+        levelThresholds: [...DEFAULT_LEVEL_THRESHOLDS],
+        levelDifficulty: 'easy',
+        attributeLevelTitles: normalizeAttributeLevelTitles(undefined, DEFAULT_LEVEL_THRESHOLDS.length),
+        aiMatchedPresetNames: false,
+        aiPresetNameBackup: undefined,
+        openaiEnabled: false,
+        openaiApiKey: '',
+        keywordRules: DEFAULT_KEYWORD_RULES,
+        darkMode: false,
+        backgroundImage: undefined,
+        backgroundOrientation: undefined,
+        backgroundOpacity: 0.3,
+              backgroundAnimation: ['aurora'],
+        soundMuted: false
+      };
+      await db.settings.put(defaultSettings);
+
+      set({
+        user: newUser, 
+        attributes: initialAttrsWithNames,
+        achievements: achievementsWithNames,
+        skills: allSkills,
+        settings: defaultSettings
+      });
+      
+      document.documentElement.setAttribute('data-theme', newUser.theme);
+      applyUiChannel(newUser.theme);
+      syncDarkClass(!!get().settings.darkMode);
+
+      // 星象：首次创建用户时留白，由用户主动进入星象页抽卡
+      await get().loadDailyDivination();
+      await get().loadLongReadings();
+    } catch (error) {
+      console.error('创建用户失败:', error);
+      throw error;
+    }
+  },
+
+  updateUser: async (patch) => {
+    const { user } = get();
+    if (!user) return;
+    const updates: Partial<User> = {};
+    if (typeof patch.name === 'string') updates.name = patch.name.trim() || user.name;
+    // 用 `in` 判断"是否显式传了这个 key"：
+    //   ✗ 旧写法 `=== undefined` 会把"只改 name"的调用误判为"同时清空头像"
+    //     —— JS 里"没传 key"和"传了 undefined"读取时都返回 undefined，值判断无法区分
+    //   ✓ 只有调用方真正把 avatarDataUrl 列为 key 时才动它（undefined 表示用户主动移除）
+    if ('avatarDataUrl' in patch) {
+      updates.avatarDataUrl = patch.avatarDataUrl;
+    }
+    await db.users.update(user.id, updates);
+    set({ user: { ...user, ...updates } });
+
+    // 头像 / 昵称改动后自动后台推送，只动 users 表那一块"公开档案"，不跑全量同步
+    const profileChanged = 'avatarDataUrl' in patch || typeof patch.name === 'string';
+    if (profileChanged) {
+      void import('@/services/sync').then(({ pushUserProfile }) => {
+        pushUserProfile().catch(err => console.warn('[velvet-store] auto pushUserProfile after profile edit failed', err));
+      }).catch(() => {});
+    }
+  },
+
+  setTheme: async (theme: ThemeType) => {
+    const { user, settings } = get();
+    if (!user) return;
+
+    await db.users.update(user.id, { theme });
+    set({ user: { ...user, theme } });
+    void pushWidgetSnapshot(); // 换主题：组件的频道色 / 夜间口径跟着变（第 5 轮补漏推）
+    document.documentElement.setAttribute('data-theme', theme);
+    applyUiChannel(theme);
+    // 换肤后按闸门重估 .dark：切进红摘掉、切出红（且夜间开着）挂回
+    syncDarkClass(!!settings.darkMode);
+    // 自定义主题：应用 CSS 变量
+    if (theme === 'custom' && settings.customThemeColor) {
+      applyCustomThemeColor(settings.customThemeColor);
+    } else {
+      // 非自定义主题：清除内联覆盖（三个变量一起清，见 clearCustomThemeColor）
+      clearCustomThemeColor();
+    }
+  },
+
+  addActivity: async (description: string, points: Record<string, number>, method: 'local' | 'todo' | 'battle', options?: { important?: boolean; date?: Date; category?: Activity['category']; bigDealId?: string; wishId?: string; skipLoad?: boolean }) => {
+    const { user, dailyDivination, settings } = get();
+    if (!user) return { unlockHints: { achievements: 0, skills: 0 }, activityId: '' };
+
+    const adjustedPoints = { ...points };
+    const levelUps: Array<{ attribute: AttributeId; fromLevel: number; toLevel: number }> = [];
+    /** 精通升星（第 6 轮）：满级后每 500 / 700 点一颗星，星数涨了也算一次「升级」 */
+    const masteryUps: Array<{ attribute: AttributeId; stars: number }> = [];
+    const difficulty = resolveLevelDifficulty(settings);
+    const levelUpActivities: Activity[] = [];
+    const activityDate = options?.date || new Date();
+
+    // ── 前置纯计算：塔罗 / 技能 / 面具加成（只读，不写 DB）─────────────
+    if (dailyDivination && dailyDivination.date === toLocalDateKey()) {
+      const attr = dailyDivination.effect.attribute;
+      if (adjustedPoints[attr]) {
+        adjustedPoints[attr] = Math.round(adjustedPoints[attr] * dailyDivination.effect.multiplier);
+      }
+    }
+    for (const [attrId, pts] of Object.entries(adjustedPoints)) {
+      if (pts > 0) {
+        adjustedPoints[attrId] = get().applySkillBonus(attrId as AttributeId, pts);
+      }
+    }
+    const equippedMask = get().persona?.equippedMaskAttribute;
+    if (equippedMask && (adjustedPoints[equippedMask] || 0) > 0) {
+      adjustedPoints[equippedMask] = adjustedPoints[equippedMask] + 1;
+    }
+
+    // 记录天气（第 6 轮）：只给当天、当下记的用户记录附一份 10 分钟内的缓存天气；没缓存就不附，
+    // 绝不为等天气拖慢保存。字段只存本机，上云时 stripForCloud 剥掉。
+    const isTodayUserRecord = method === 'local' && !options?.category && toLocalDateKey(activityDate) === toLocalDateKey();
+    const weatherNow = isTodayUserRecord ? peekWeatherNow(weatherConfigOf(settings)) : null;
+
+    // 窥探命运 buff（v2.7，3 天）：当日**首次带加点的手动记录** → 加点最高的那项额外 +1。
+    // 判定纯粹从数据推导（当日尚无带加点的手动记录），无需额外标记位；
+    // 只认 method==='local' 且无 category —— 任务完成 / 战场结算 / 系统行不吃这份馈赠。
+    if (method === 'local' && !options?.category) {
+      const dayKey = toLocalDateKey(activityDate);
+      const buffed = get().fateGlimpses.some(g => g.buffStart <= dayKey && dayKey <= g.buffEnd);
+      if (buffed) {
+        const hasPointedToday = get().activities.some(a =>
+          a.method === 'local' && !a.category &&
+          toLocalDateKey(new Date(a.date)) === dayKey &&
+          Object.values(a.pointsAwarded ?? {}).some(v => (v as number) > 0));
+        const top = (Object.entries(adjustedPoints) as Array<[string, number]>)
+          .filter(([, v]) => v > 0)
+          .sort((a, b) => b[1] - a[1])[0];
+        if (!hasPointedToday && top) {
+          adjustedPoints[top[0]] = top[1] + 1;
+        }
+      }
+    }
+
+    // 创建活动记录（事务内填 levelUps 后写入）
+    const activity: Activity = {
+      id: uuidv4(),
+      userId: user.id,
+      date: activityDate,
+      description,
+      ...(weatherNow ? { weather: { icon: weatherNow.icon, temp: Math.round(weatherNow.temp), text: weatherNow.text } } : {}),
+      pointsAwarded: {
+        knowledge: adjustedPoints.knowledge || 0,
+        guts: adjustedPoints.guts || 0,
+        dexterity: adjustedPoints.dexterity || 0,
+        kindness: adjustedPoints.kindness || 0,
+        charm: adjustedPoints.charm || 0,
+      },
+      method,
+      levelUps: [],
+      important: options?.important,
+      category: options?.category,
+      wishId: options?.wishId,
+      bigDealId: options?.bigDealId,
+    };
+
+    // ── 所有 DB 写操作包在事务里：中途崩溃 / 异常时自动回滚 ─────────
+    // 涉及表：confidants（daily_plus 标记）、achievements（关键字/任务/全属性成就进度）、
+    //         attributes（点数/升级）、activities（活动 + 升级行）、以及读 todoCompletions/skills/weeklyGoals
+    let matchedAchievements: Achievement[] = [];
+    let matchedSkills: Skill[] = [];
+    let achievementsSnapshot: Achievement[] = [];
+    let attributesSnapshot: Attribute[] = [];
+    await db.transaction(
+      'rw',
+      [db.confidants, db.achievements, db.attributes, db.activities, db.todoCompletions, db.skills, db.weeklyGoals],
+      async () => {
+        // 同伴「日常加成」——每个同伴当日首次生效，乘区外 flat +N
+        const todayKey = toLocalDateKey(activityDate);
+        const allConfidants = get().confidants;
+        const confidantsToMark: Confidant[] = [];
+        for (const c of allConfidants) {
+          if (c.archivedAt) continue;
+          if (c.dailyUsedDate === todayKey) continue;
+          const buff = (c.buffs ?? []).find(b => b.kind === 'daily_plus');
+          if (!buff || !buff.attribute) continue;
+          const current = adjustedPoints[buff.attribute] ?? 0;
+          if (current <= 0) continue;
+          adjustedPoints[buff.attribute] = current + buff.value;
+          confidantsToMark.push({ ...c, dailyUsedDate: todayKey });
+        }
+        for (const c of confidantsToMark) await db.confidants.put(c);
+        // 注意：loadConfidants() 故意不放在事务内——事务结束后由末尾统一 loadData() 刷新
+
+        // 关键字成就（内部 skipLoad: true，不会触发 loadData）
+        await get().checkKeywordAchievements(description, { skipLoad: true });
+
+        // 属性更新 + 升级判定（一次性读全部属性，避免 N+1）
+        const currentAttrs = await db.attributes.toArray();
+        const attrMap = new Map(currentAttrs.map(a => [a.id, a]));
+        for (const [attrId, pts] of Object.entries(adjustedPoints)) {
+          if (pts > 0) {
+            const attribute = attrMap.get(attrId as AttributeId);
+            if (!attribute) continue;
+            const oldLevel = attribute.level;
+            const newPoints = attribute.points + pts;
+            const thresholds = thresholdsOf(get().settings, attribute);
+            const newLevel = levelForPoints(newPoints, thresholds);
+            const starsBefore = masteryOf(attribute.points, thresholds, difficulty)?.stars ?? 0;
+            const starsAfter = masteryOf(newPoints, thresholds, difficulty)?.stars ?? 0;
+            if (starsAfter > starsBefore) masteryUps.push({ attribute: attrId as AttributeId, stars: starsAfter });
+            if (newLevel > oldLevel) {
+              levelUps.push({
+                attribute: attrId as AttributeId,
+                fromLevel: oldLevel,
+                toLevel: newLevel,
+              });
+              levelUpActivities.push({
+                id: uuidv4(),
+                userId: user.id,
+                date: new Date(),
+                description: `${settings.attributeNames[attrId as AttributeNamesKey]} 升级Lv.${newLevel}`,
+                pointsAwarded: { knowledge: 0, guts: 0, dexterity: 0, kindness: 0, charm: 0 },
+                method: 'local' as const,
+                category: 'level_up',
+              });
+              // 首次升级通知：setTimeout 500ms 后触发（事务早已提交，无副作用）
+              if (levelUps.length === 1) {
+                setTimeout(() => {
+                  set({
+                    levelUpNotification: {
+                      id: attrId,
+                      displayName: settings.attributeNames[attrId as AttributeNamesKey],
+                      level: newLevel,
+                    },
+                  });
+                }, 500);
+              }
+            }
+            await db.attributes.update(attrId, { points: newPoints, level: newLevel });
+          }
+        }
+
+        // 精通升星（第 6 轮）：留一条 level_up 类记录；没有普通升级时也弹一次庆祝（精通口径）
+        for (const m of masteryUps) {
+          levelUpActivities.push({
+            id: uuidv4(),
+            userId: user.id,
+            date: new Date(),
+            description: `${settings.attributeNames[m.attribute as AttributeNamesKey]} 精通 ★${m.stars}`,
+            pointsAwarded: { knowledge: 0, guts: 0, dexterity: 0, kindness: 0, charm: 0 },
+            method: 'local' as const,
+            category: 'level_up',
+          });
+        }
+        if (levelUps.length === 0 && masteryUps.length > 0) {
+          const m = masteryUps[0];
+          const maxLevel = thresholdsOf(get().settings).length || 10;
+          setTimeout(() => {
+            set({
+              levelUpNotification: {
+                id: m.attribute,
+                displayName: settings.attributeNames[m.attribute as AttributeNamesKey],
+                level: maxLevel,
+                masteryStars: m.stars,
+              },
+            });
+          }, 500);
+        }
+
+        // 活动写入（包含刚计算好的 levelUps）
+        activity.levelUps = levelUps;
+        await db.activities.add(activity);
+        if (levelUpActivities.length > 0) {
+          await db.activities.bulkAdd(levelUpActivities);
+        }
+
+        // 后置成就 check（依赖属性已写入 + 活动已写入的最新态）
+        await get().checkTodoCompletionAchievements({ skipLoad: true });
+        await get().checkAllAttributesMaxAchievement();
+
+        // 事务内读快照用于解锁提示（读到的是事务内最新态）
+        const [achievements, attributes, todoCompletions, skills, weeklyGoals] = await Promise.all([
+          db.achievements.toArray(),
+          db.attributes.toArray(),
+          db.todoCompletions.toArray(),
+          db.skills.toArray(),
+          db.weeklyGoals.toArray(),
+        ]);
+        /**
+         * activities **按需**才读 —— 这是记一笔的热路径上最贵的一步。
+         *
+         * 它在这里只有一个用途：算 consecutive_days 那类成就的连续天数。
+         * 而 activities 是全库唯一无上限增长的表（每天 5 条记录 + 自动写入的 level_up 副记录
+         * ≈ 一年 2500 行），原来无条件 toArray() 意味着**每记一笔就把全部历史反序列化一遍**；
+         * 加上本函数结尾的 loadData() 还要再读一遍，一次加点 = 两次全表扫描。
+         *
+         * 实际上只要"还没解锁的 consecutive_days 成就"一个都不剩，这份数据就完全用不上——
+         * 而这类成就通常在使用早期就全解锁了。于是绝大多数用户的绝大多数记录
+         * 从此只剩 loadData() 那一次扫描。
+         *
+         * 必须判 !unlocked：已解锁的成就在下面 filter 的第一行就被挡掉，
+         * 拿它当理由去读全表纯属白读。
+         */
+        const needsStreak = achievements.some(
+          a => !a.unlocked && a.condition.type === 'consecutive_days',
+        );
+        const activities: Activity[] = needsStreak ? await db.activities.toArray() : [];
+        // 「你的记忆」要第一条记录的日子：用内存里 loadData 读好的全量记录，不为它再扫一遍表
+        // （这条成就要挂一整年，照 needsStreak 那样按需读表等于头一年每记一笔都全表扫描）
+        const needsFirstRecord = achievements.some(a => !a.unlocked && a.condition.type === 'days_since_first_record');
+        const firstRecordDays = needsFirstRecord ? daysSinceFirstRecord(streakDates(get().activities)) : 0;
+        achievementsSnapshot = achievements;
+        attributesSnapshot = attributes;
+
+        matchedAchievements = achievements.filter((achievement) => {
+          if (achievement.unlocked) return false;
+          const progress = (() => {
+            switch (achievement.condition.type) {
+              case 'consecutive_days': {
+                const streak = calcMaxStreak(streakDates(activities));
+                return Math.min(streak, achievement.condition.value);
+              }
+              case 'days_since_first_record':
+                return Math.min(firstRecordDays, achievement.condition.value);
+              case 'total_points': {
+                const total = attributes.reduce((sum, attr) => sum + attr.points, 0);
+                return Math.min(total, achievement.condition.value);
+              }
+              case 'attribute_level': {
+                const attr = attributes.find(a => a.id === achievement.condition.attribute);
+                const level = attr?.level || 0;
+                return Math.min(level, achievement.condition.value);
+              }
+              case 'keyword_match': {
+                return Math.min(achievement.condition.currentProgress || 0, achievement.condition.value);
+              }
+              case 'all_attributes_max': {
+                const maxLevelCount = attributes.filter(attr => attr.level >= achievement.condition.value).length;
+                return Math.min(maxLevelCount, attributes.length);
+              }
+              case 'todo_completions': {
+                const total = todoCompletions.reduce((sum, item) => sum + item.count, 0);
+                return Math.min(total, achievement.condition.value);
+              }
+              case 'weekly_goal_completions': {
+                const completedCount = weeklyGoals.filter(g => g.completed).length;
+                return Math.min(completedCount, achievement.condition.value);
+              }
+              case 'confidants_at_level': {
+                const minLv = achievement.condition.minLevel ?? 1;
+                const qualifying = get().confidants.filter(
+                  c => !c.archivedAt && c.intimacy >= minLv,
+                ).length;
+                return Math.min(qualifying, achievement.condition.value);
+              }
+              default:
+                return 0;
+            }
+          })();
+          return progress >= achievement.condition.value;
+        });
+
+        matchedSkills = skills.filter((skill) => {
+          if (skill.unlocked) return false;
+          if (skill.id.startsWith('blessing_')) return false;
+          const attr = attributes.find(a => a.id === skill.requiredAttribute);
+          return !!attr && attr.level >= skill.requiredLevel;
+        });
+      },
+    );
+    // 引用快照以免 TS 判定为未使用（保留语义，便于未来扩展）
+    void achievementsSnapshot; void attributesSnapshot;
+
+    // 事务已提交：一次性刷新所有内存状态（含 confidants）。skipLoad：调用方紧接着还要再记一条（命运加成），由那条统一刷新
+    if (!options?.skipLoad) await get().loadData();
+
+    // 岁时印章（第 6 轮）：当天是节气 / 节日、且这条是当下记的用户记录 → 收进岁时册（只打开 App 不算，用户口径）
+    if (isTodayUserRecord) {
+      try {
+        const mark = seasonMarkOf(toLocalDateKey(activityDate));
+        if (mark && !(await db.stamps.get(mark.key))) {
+          await db.stamps.put({ id: mark.key, kind: mark.kind, name: mark.name, date: mark.date, year: Number(mark.date.slice(0, 4)), collectedAt: new Date().toISOString() });
+        }
+      } catch { /* 印章收不进不影响记录本身 */ }
+    }
+
+    // 为战场 SP 奖励：活动获得的总点数即为 SP
+    const totalPts = Object.values(adjustedPoints).reduce((s, v) => s + (v || 0), 0);
+    if (totalPts > 0 && get().battleState) {
+      await get().earnSP(totalPts);
+    }
+
+    void get().syncNotifications(); // 已记录 → 重排，撤掉「提醒记录」提醒
+
+    // 挂了愿望的记录 → 泵一次进度（PRD_V2.6 §8「每次任务完成都会评估涨了多少」）。
+    // 不 await：AI 评估要几秒，不能让"记一笔"卡在那里等；结果到了自己弹窗。
+    // 愿望已实现时写的那条纪念记录也带 wishId，但那时 status 已是 'done'，泵内自会挡掉。
+    if (options?.wishId) void get().bumpWishProgress(options.wishId);
+
+    return {
+      unlockHints: {
+        achievements: matchedAchievements.length,
+        skills: matchedSkills.length,
+      },
+      activityId: activity.id,
+    };
+  },
+
+  updateAttribute: async (attributeId: string, points: number) => {
+    const attribute = await db.attributes.get(attributeId);
+    if (!attribute) return;
+    
+    const newPoints = attribute.points + points;
+    const newLevel = levelForPoints(newPoints, thresholdsOf(get().settings, attribute));
+    
+    await db.attributes.update(attributeId, { 
+      points: newPoints, 
+      level: newLevel 
+    });
+    
+    // 不再自动解锁技    
+    await get().loadData();
+  },
+
+  unlockAchievement: async (achievementId: string) => {
+    const achievement = await db.achievements.get(achievementId);
+    if (achievement && !achievement.unlocked) {
+      const attributes = await db.attributes.toArray();
+      const todoCompletions = await db.todoCompletions.toArray();
+      const activities = await db.activities.toArray();
+      const weeklyGoalsAll = await db.weeklyGoals.toArray();
+      const questsAll = await db.quests.toArray();
+      const progress = (() => {
+        switch (achievement.condition.type) {
+          case 'quests_claimed':
+            return questsAll.filter(q => !!q.claimedAt).length;
+          case 'consecutive_days':
+            return calcMaxStreak(streakDates(activities));
+          case 'days_since_first_record':
+            return daysSinceFirstRecord(streakDates(activities));
+          case 'total_points':
+            return attributes.reduce((sum, attr) => sum + attr.points, 0);
+          case 'attribute_level': {
+            const attr = attributes.find(a => a.id === achievement.condition.attribute);
+            return attr?.level || 0;
+          }
+          case 'keyword_match':
+            return achievement.condition.currentProgress || 0;
+          case 'all_attributes_max':
+            return attributes.filter(attr => attr.level >= achievement.condition.value).length;
+          case 'todo_completions':
+            return todoCompletions.reduce((sum, item) => sum + item.count, 0);
+          case 'weekly_goal_completions':
+            return weeklyGoalsAll.filter(g => g.completed).length;
+          case 'confidants_at_level': {
+            const minLv = achievement.condition.minLevel ?? 1;
+            return get().confidants.filter(c => !c.archivedAt && c.intimacy >= minLv).length;
+          }
+          case 'battle_feat': {
+            // 批4 战场成就组：事实源 = BattleState.battleFeats（recordBattleFeat 写入）
+            const feats = get().battleState?.battleFeats ?? [];
+            return achievement.condition.feat && feats.includes(achievement.condition.feat) ? 1 : 0;
+          }
+          // 击破累计：事实源 = BattleState.defeatedShadowLog（与成就页 getProgress 同口径）。
+          // 此前漏了这一 case → 落 default 0 → 卡片显示"已达成，点击解锁"但这里被 progress<value
+          // 挡回，点了永远没反应（用户上报"已完成的成就无法解锁"）。
+          case 'shadow_defeats':
+            return get().battleState?.defeatedShadowLog?.length ?? 0;
+          default:
+            return 0;
+        }
+      })();
+      if (progress < achievement.condition.value) {
+        return;
+      }
+      await db.achievements.update(achievementId, { 
+        unlocked: true, 
+        unlockedDate: new Date() 
+      });
+
+      const { user } = get();
+      if (user) {
+        await db.activities.add({
+          id: uuidv4(),
+          userId: user.id,
+          date: new Date(),
+          description: `成就解锁: ${achievement.title}`,
+          pointsAwarded: { knowledge: 0, guts: 0, dexterity: 0, kindness: 0, charm: 0 },
+          method: 'local' as const,
+          category: 'achievement_unlock'
+        });
+      }
+      
+      // 显示成就解锁通知
+      setTimeout(() => {
+        get().setAchievementNotification({
+          id: achievementId,
+          title: achievement.title
+        });
+      }, 500);
+      
+      await get().loadData();
+    }
+  },
+
+  unlockSkill: async (skillId: string) => {
+    const skill = await db.skills.get(skillId);
+    if (skill && !skill.unlocked) {
+      const attribute = await db.attributes.get(skill.requiredAttribute);
+      if (!attribute || attribute.level < skill.requiredLevel) return;
+      await db.skills.update(skillId, { unlocked: true });
+
+      const { user } = get();
+      if (user) {
+        await db.activities.add({
+          id: uuidv4(),
+          userId: user.id,
+          date: new Date(),
+          description: `技能解锁：${skill.name}`,
+          pointsAwarded: { knowledge: 0, guts: 0, dexterity: 0, kindness: 0, charm: 0 },
+          method: 'local' as const,
+          category: 'skill_unlock'
+        });
+      }
+      
+      // 显示技能解锁通知
+      setTimeout(() => {
+        get().setSkillNotification({
+          id: skillId,
+          name: skill.name
+        });
+      }, 500);
+      
+      await get().loadData();
+    }
+  },
+
+  setActivitiesJumpDate: (key: string | null) => set({ activitiesJumpDate: key }),
+
+  setCurrentPage: (page: string) => {
+    set({ currentPage: page });
+  },
+
+  setActionsSubTab: (tab: 'todos' | 'activities') => {
+    set({ actionsSubTab: tab });
+  },
+
+  updateSettings: async (newSettings: Partial<Settings>) => {
+    /**
+     * ⚠️ 底稿必须取**库里那一行**，不能取内存副本。
+     *
+     * 真实事故：云同步「拉取」把 db.settings 整行换成云端那份之后，
+     * 到 initializeApp() 重载完成之前有一个窗口——这期间只要有任何一处调
+     * updateSettings（已读回填 / 主题 / 各种 lastSeen 标记，开机路径上好几处），
+     * 旧的内存副本就会被 put 回去，把刚拉下来的**自定义五维名与等级阈值**
+     * 一起覆盖成默认。用户看到的现象是「存档拉到本地，定制的五维没了」。
+     * 库是持久事实，内存只是它的缓存；合并方向反了就会丢数据。
+     *
+     * 另外用 mutex 串行化：并发两次 updateSettings 都读到同一份底稿时，
+     * 后写的那次会吞掉先写那次的字段。
+     */
+    settingsWriteLock = settingsWriteLock.then(async () => {
+      const persisted = (await db.settings.toArray())[0];
+      const base = persisted ?? get().settings;
+      const nextThresholds = newSettings.levelThresholds ?? base.levelThresholds;
+      const updated = { ...base, ...newSettings } as Settings;
+      if (newSettings.attributeLevelTitles || newSettings.levelThresholds) {
+        updated.attributeLevelTitles = normalizeAttributeLevelTitles(
+          newSettings.attributeLevelTitles ?? base.attributeLevelTitles,
+          nextThresholds.length,
+        );
+      }
+      await db.settings.put(updated);
+      set({ settings: updated });
+    }).catch((err: unknown) => { console.error('[settings] 写入失败', err); });
+    await settingsWriteLock;
+    const settings = get().settings;
+    const updated = settings;
+    void pushWidgetSnapshot(); // 夜间 / 自定义主题色 / 名片状态都在 settings 里（第 5 轮补漏推）
+
+    if (newSettings.levelThresholds) {
+      const thresholds = updated.levelThresholds;
+      const attributes = await db.attributes.toArray();
+      const updatedAttributes = attributes.map((attr) => ({
+        ...attr,
+        level: levelForPoints(attr.points, thresholds),
+        levelThresholds: thresholds,
+      }));
+      await db.attributes.bulkPut(updatedAttributes);
+      set({ attributes: updatedAttributes });
+    }
+    
+    // 应用夜间模式设置（经闸门：红频道不响应夜间）
+    if (updated.darkMode !== undefined) {
+      syncDarkClass(updated.darkMode);
+    }
+
+    // F2a：仅当通知相关设置变动时重排（避免每次写设置都触发排程）
+    if (newSettings.notificationsEnabled !== undefined || newSettings.notificationSlots !== undefined) {
+      void get().syncNotifications();
+    }
+  },
+
+  // ── 星象 / 塔罗 ────────────────────────────────────────────
+
+  /**
+   * 载入今日塔罗。
+   *
+   * **取最早的那一张**，不是 .first()（索引顺序不保证是时间顺序）。
+   * 同一天存在多行是历史遗留：pull 把今天那张擦掉后用户会重抽一次，
+   * 于是库里留下两行同 date、不同 id（根因已在 services/sync.ts 的
+   * todayDivinationFallback 堵住，但存量数据还在）。真正算数的是**第一次抽的那张**
+   * —— 重抽本来就不该发生，认后抽的等于追认那次作弊。
+   */
+  loadDailyDivination: async () => {
+    const today = toLocalDateKey();
+    const sameDay = await db.dailyDivinations.where('date').equals(today).toArray();
+    if (sameDay.length === 0) {
+      set({ dailyDivination: null });
+      return;
+    }
+    const earliest = sameDay.reduce((a, b) =>
+      new Date(a.createdAt).getTime() <= new Date(b.createdAt).getTime() ? a : b,
+    );
+    set({ dailyDivination: earliest });
+  },
+
+  saveDailyDivination: async (d: DailyDivination) => {
+    // 幂等：同日再抽会覆盖（正常不应触发，但保险）。
+    // 清**全部**同日残留而不只是 .first() —— 存量数据里可能已经不止一行（见 loadDailyDivination）。
+    const today = toLocalDateKey();
+    const sameDay = await db.dailyDivinations.where('date').equals(today).toArray();
+    const stale = sameDay.filter(x => x.id !== d.id).map(x => x.id);
+    if (stale.length > 0) await db.dailyDivinations.bulkDelete(stale);
+    await db.dailyDivinations.put(d);
+    set({ dailyDivination: d });
+    void get().syncNotifications(); // 今日塔罗已抽 → 重排，撤掉「塔罗未抽」提醒
+  },
+
+  updateDailyMemo: async (id, memo) => {
+    const row = await db.dailyDivinations.get(id);
+    if (!row) return;
+    const next: DailyDivination = { ...row, memo: memo?.trim() || undefined };
+    await db.dailyDivinations.put(next);
+    if (get().dailyDivination?.id === id) set({ dailyDivination: next });
+  },
+
+  updateLongReadingMemo: async (id, memo) => {
+    const row = await db.longReadings.get(id);
+    if (!row) return;
+    await db.longReadings.put({ ...row, memo: memo?.trim() || undefined });
+    await get().loadLongReadings();
+  },
+
+  // ── 窥探命运（v2.7）────────────────────────────────────────
+
+  loadFateGlimpses: async () => {
+    try {
+      const rows = await db.fateGlimpses.orderBy('createdAt').reverse().toArray();
+      set({ fateGlimpses: rows });
+    } catch (e) {
+      console.warn('[fateGlimpse] 加载失败', e);
+    }
+  },
+
+  createFateGlimpse: async (g: FateGlimpse) => {
+    await db.fateGlimpses.put(g);
+    await get().loadFateGlimpses();
+  },
+
+  getActiveFateBuff: () => {
+    const today = toLocalDateKey();
+    return get().fateGlimpses.find(g => g.buffStart <= today && today <= g.buffEnd) ?? null;
+  },
+
+  getFateWindow: async () => {
+    // 本地时区安全的日期位移（Date.parse('YYYY-MM-DD') 是 UTC 半夜，西半球会漂一天）
+    const addDaysKey = (key: string, n: number): string => {
+      const [y, m, d] = key.split('-').map(Number);
+      return toLocalDateKey(new Date(y, m - 1, d + n));
+    };
+    const dayDiff = (a: string, b: string): number => {
+      const [ya, ma, da] = a.split('-').map(Number);
+      const [yb, mb, db2] = b.split('-').map(Number);
+      return Math.round((new Date(ya, ma - 1, da).getTime() - new Date(yb, mb - 1, db2).getTime()) / 86400_000);
+    };
+    const today = toLocalDateKey();
+    const lastGlimpse = get().fateGlimpses[0] ?? null;
+    const lastDay = lastGlimpse ? toLocalDateKey(new Date(lastGlimpse.createdAt)) : null;
+    const sinceLast = lastDay ? dayDiff(today, lastDay) : Infinity;
+    /**
+     * 窗口统一为**连抽锚定**：起点 = 当前连续抽卡 streak 的第一天（最远回看 6 天、
+     * 不越过上次窥探日——那些牌已被消耗），窗口 = 起点开始的 7 天。未到/未抽的
+     * 日子留空位，于是收集区永远**从左往右逐日点亮**（此前滚动「最近 7 天」把
+     * 今天钉在最右格，第一张牌落在最右、一张张向左退，进度感是倒着的——用户上报）。
+     *
+     * 语义与旧口径等价的证明：complete ⇔ 连续 7 天抽满；且 streak 起点 > 上次窥探日
+     * ⇒ 抽满时今天距上次 ≥7 天，冷却自动满足。断签会让 streak 重新锚定（旧口径的
+     * 滚动窗口同样要求 7 天连抽），窥探后重新计数（次日起）也自然落在同一条规则里；
+     * buff 独立走自己的 3 天，每张牌在任何情况下都只可能被消耗一次。
+     */
+    // streak 判定只需回看昨天起最多 7 天（锚点允许是今天或昨天：今天还没抽时，
+    // 昨天收尾的活 streak 不该断——今天就是窗口里下一个待点亮的空位）
+    const lookback: string[] = [];
+    for (let i = 6; i >= 0; i--) lookback.push(addDaysKey(today, -i));
+    let rows: DailyDivination[] = [];
+    try {
+      rows = await db.dailyDivinations.where('date').anyOf(lookback).toArray();
+    } catch { /* 查询失败按未抽处理 */ }
+    // 同日多行的存量数据取最早那张（与 loadDailyDivination 同口径）
+    const byDate = new Map<string, DailyDivination>();
+    for (const r of rows) {
+      const prev = byDate.get(r.date);
+      if (!prev || new Date(r.createdAt).getTime() < new Date(prev.createdAt).getTime()) {
+        byDate.set(r.date, r);
+      }
+    }
+    // 可计入 streak：已抽 且 晚于上次窥探日（YYYY-MM-DD 零填充，字符串比较安全）
+    const usable = (key: string) => byDate.has(key) && (!lastDay || key > lastDay);
+    const yesterday = addDaysKey(today, -1);
+    const anchor = usable(today) ? today : usable(yesterday) ? yesterday : null;
+    let startKey: string;
+    if (anchor) {
+      startKey = anchor;
+      for (let i = 1; i <= 6; i++) {
+        const prev = addDaysKey(anchor, -i);
+        if (!usable(prev)) break;
+        startKey = prev;
+      }
+    } else {
+      // 没有活 streak：刚窥探完（含当天）→ 从窥探次日起显示空窗口；否则从今天起
+      startKey = lastDay && sinceLast < 7 ? addDaysKey(lastDay, 1) : today;
+    }
+    const dates: string[] = [];
+    for (let i = 0; i < 7; i++) dates.push(addDaysKey(startKey, i));
+    const days = dates.map(date => ({ date, drawn: byDate.get(date) ?? null }));
+    const complete = days.every(d => d.drawn);
+    return { days, complete, eligible: complete && sinceLast >= 7, lastGlimpse };
+  },
+
+  loadLongReadings: async () => {
+    const readings = await db.longReadings.orderBy('createdAt').reverse().toArray();
+    set({ longReadings: readings });
+  },
+
+  saveLongReading: async (r: LongReading) => {
+    await db.longReadings.put(r);
+    await get().loadLongReadings();
+  },
+
+  appendLongReadingFollowUp: async (id: string, followUp: LongReadingFollowUp) => {
+    const existing = await db.longReadings.get(id);
+    if (!existing) return;
+    const next: LongReading = {
+      ...existing,
+      followUps: [...(existing.followUps ?? []), followUp],
+    };
+    await db.longReadings.put(next);
+    await get().loadLongReadings();
+  },
+
+  archiveLongReading: async (id: string, archived: boolean) => {
+    const existing = await db.longReadings.get(id);
+    if (!existing) return;
+    await db.longReadings.put({ ...existing, archived });
+    await get().loadLongReadings();
+  },
+
+  deleteLongReading: async (id: string) => {
+    await db.longReadings.delete(id);
+    await get().loadLongReadings();
+  },
+
+  sweepExpiredReadings: async () => {
+    const today = toLocalDateKey();
+    const all = await db.longReadings.toArray();
+    const toUpdate = all.filter(r => !r.archived && r.expiresAt < today);
+    if (toUpdate.length === 0) return;
+    await Promise.all(toUpdate.map(r => db.longReadings.put({ ...r, archived: true })));
+    await get().loadLongReadings();
+  },
+
+  countActiveReadings: () => {
+    const today = toLocalDateKey();
+    return get().longReadings.filter(r => !r.archived && r.expiresAt >= today).length;
+  },
+
+  // ── CallingCard / 宣告卡（倒计时） ─────────────────────────
+
+  loadCallingCards: async () => {
+    const cards = await db.callingCards.orderBy('createdAt').reverse().toArray();
+    set({ callingCards: cards });
+    // 宣告卡增改钉归档都从这里过：桌面组件跟着刷（第 5 轮补漏推；内部有指纹去重与合并）
+    void pushWidgetSnapshot();
+  },
+
+  saveCallingCard: async (card: CallingCard) => {
+    // pinned=true 时：把其它卡的 pinned 全置 false（互斥）
+    if (card.pinned) {
+      const all = await db.callingCards.toArray();
+      const toUnpin = all.filter(c => c.id !== card.id && c.pinned).map(c => ({ ...c, pinned: false }));
+      if (toUnpin.length) await db.callingCards.bulkPut(toUnpin);
+    }
+    await db.callingCards.put(card);
+    await get().loadCallingCards();
+  },
+
+  deleteCallingCard: async (id: string) => {
+    await db.callingCards.delete(id);
+    await get().loadCallingCards();
+    await get().dropProfileGoalIfCard(id);
+  },
+
+  /** 挂在名片上的目标就是这张卡：卡删了 / 手动收了就取下目标并立刻推送，好友那边不会一直看到旧目标 */
+  dropProfileGoalIfCard: async (cardId: string) => {
+    if (get().settings.profileGoal?.cardId !== cardId) return;
+    await get().updateSettings({ profileGoal: undefined });
+    void import('@/services/sync').then(m => m.pushProfilePresence()).catch(() => { /* 离线：下次同步再推 */ });
+  },
+
+  archiveCallingCard: async (id: string) => {
+    const c = await db.callingCards.get(id);
+    if (!c) return;
+    await db.callingCards.put({
+      ...c,
+      archived: true,
+      archivedAt: c.archivedAt ?? new Date(),
+      archiveReason: c.archiveReason ?? 'manual',
+      // 手动归档不再触发结算屏（视为用户主动放弃 / 提前收）
+      cutInShown: true,
+      pinned: false,
+    });
+    await get().loadCallingCards();
+    await get().dropProfileGoalIfCard(id);
+  },
+
+  unarchiveCallingCard: async (id: string) => {
+    const c = await db.callingCards.get(id);
+    if (!c) return;
+    // F3 终端任务不走宣告卡的取消归档（否则会复活成可再次领奖的幽灵任务）
+    if (c.terminal) return;
+    await db.callingCards.put({
+      ...c,
+      archived: false,
+      archivedAt: undefined,
+      archiveReason: undefined,
+      cutInShown: false,
+      ledgerWritten: false,
+    });
+    await get().loadCallingCards();
+  },
+
+  pinCallingCard: async (id: string | null) => {
+    // F3 终端任务永不占用首页钉选位（不应被当普通宣告卡 pin）
+    if (id !== null) {
+      const target = await db.callingCards.get(id);
+      if (target?.terminal) return;
+    }
+    const all = await db.callingCards.toArray();
+    const updates: CallingCard[] = [];
+    for (const c of all) {
+      if (id !== null && c.id === id) {
+        if (!c.pinned) updates.push({ ...c, pinned: true });
+      } else if (c.pinned) {
+        updates.push({ ...c, pinned: false });
+      }
+    }
+    if (updates.length) await db.callingCards.bulkPut(updates);
+    await get().loadCallingCards();
+  },
+
+  getCallingCardProgress: (id: string) => {
+    const card = get().callingCards.find(c => c.id === id);
+    if (!card) return null;
+
+    const today = toLocalDateKey();
+    const todayDate = new Date(today + 'T00:00:00');
+    /**
+     * startDate 类型上是必填，但这条数据来自 IndexedDB —— 运行时没有类型保护。
+     * 早于该字段引入的旧卡片会是 undefined，于是 `new Date('undefinedT00:00:00')`
+     * 得到 Invalid Date，getTime() 是 NaN，一路传到 overallProgress，
+     * 卡面上就显示成 **NaN%**（实测截到过）。缺就退回 createdAt，再退回今天。
+     */
+    const startKey = card.startDate
+      || (card.createdAt ? toLocalDateKey(new Date(card.createdAt)) : today);
+    const startDate = new Date(startKey + 'T00:00:00');
+
+    let dateProgress: number | undefined;
+    let daysElapsed: number | undefined;
+    let daysTotal: number | undefined;
+    let daysLeft: number | undefined;
+    let dateReached = false;
+    if (card.targetDate) {
+      const targetD = new Date(card.targetDate + 'T00:00:00');
+      // 用本地日期 key 差值算，避开 UTC / DST 偶发的 ±1 天偏差
+      daysElapsed = Math.max(0, Math.round((todayDate.getTime() - startDate.getTime()) / 86400000));
+      daysTotal   = Math.max(1, Math.round((targetD.getTime() - startDate.getTime()) / 86400000));
+      daysLeft    = Math.max(0, Math.round((targetD.getTime() - todayDate.getTime()) / 86400000));
+      dateProgress = Math.max(0, Math.min(1, daysElapsed / daysTotal));
+      dateReached = today >= card.targetDate;
+    }
+
+    let todoProgress: number | undefined;
+    let todosDone: number | undefined;
+    let todosTotal: number | undefined;
+    let todosReached = false;
+    if (card.linkedTodoIds && card.linkedTodoIds.length > 0) {
+      todosTotal = card.linkedTodoIds.length;
+      const todosState = get().todos;
+      const completionsState = get().todoCompletions;
+      let done = 0;
+      for (const tid of card.linkedTodoIds) {
+        const t = todosState.find(x => x.id === tid);
+        if (!t) continue;
+        if (t.repeatDaily) {
+          // 重复任务：只看"今日是否完成"
+          const target = t.frequency === 'count' ? (t.targetCount || 1) : 1;
+          const cmp = completionsState.find(c => c.todoId === tid && c.date === today);
+          if ((cmp?.count ?? 0) >= target) done += 1;
+        } else if (t.isLongTerm) {
+          // 长期任务：累计跨天完成次数 ≥ targetCount
+          const target = t.targetCount || 1;
+          const total = completionsState.filter(c => c.todoId === tid).reduce((s, c) => s + c.count, 0);
+          if (total >= target) done += 1;
+        } else {
+          // 单次任务：看是否最终 completed（!isActive 且 completedAt 存在）
+          if (!t.isActive && t.completedAt) done += 1;
+        }
+      }
+      todosDone = done;
+      todoProgress = Math.max(0, Math.min(1, done / todosTotal));
+      todosReached = done >= todosTotal;
+    }
+
+    // 综合进度（HERO 卡的进度条用这个）：
+    //   - both：取两者较大的（贴近"先到为准"语义）
+    //   - 单一模式：本身
+    let overallProgress = 0;
+    if (card.mode === 'both') {
+      overallProgress = Math.max(dateProgress ?? 0, todoProgress ?? 0);
+    } else if (card.mode === 'deadline') {
+      overallProgress = dateProgress ?? 0;
+    } else {
+      overallProgress = todoProgress ?? 0;
+    }
+
+    // reached：达成 / 触发归档的判定
+    let reached = false;
+    if (card.mode === 'both') reached = dateReached || todosReached;
+    else if (card.mode === 'deadline') reached = dateReached;
+    else reached = todosReached;
+
+    return {
+      daysElapsed, daysTotal, daysLeft, dateProgress,
+      todosDone, todosTotal, todoProgress,
+      overallProgress, reached,
+    };
+  },
+
+  sweepCallingCards: async () => {
+    // 扫一遍未归档卡片，把已达成的归档（不动 ledgerWritten / cutInShown，让 UI 后续触发结算屏）
+    const all = await db.callingCards.toArray();
+    const todayKey = toLocalDateKey();
+    const newlyArchived: CallingCard[] = [];
+    for (const card of all) {
+      if (card.archived) continue;
+      // F3 终端任务不走日期自动归档：完成由用户「我做到了」手动触发，过期也不自动结算
+      if (card.terminal) continue;
+      const todayDate = new Date(todayKey + 'T00:00:00');
+      let dateReached = false;
+      let todosReached = false;
+      if (card.targetDate) {
+        dateReached = todayKey >= card.targetDate;
+      }
+      if (card.linkedTodoIds && card.linkedTodoIds.length > 0) {
+        // 仿 getCallingCardProgress 简化版，避免循环依赖 set
+        const todosState = get().todos;
+        const completionsState = get().todoCompletions;
+        let done = 0;
+        for (const tid of card.linkedTodoIds) {
+          const t = todosState.find(x => x.id === tid);
+          if (!t) continue;
+          if (t.repeatDaily) {
+            const target = t.frequency === 'count' ? (t.targetCount || 1) : 1;
+            const cmp = completionsState.find(c => c.todoId === tid && c.date === todayKey);
+            if ((cmp?.count ?? 0) >= target) done += 1;
+          } else if (t.isLongTerm) {
+            const target = t.targetCount || 1;
+            const total = completionsState.filter(c => c.todoId === tid).reduce((s, c) => s + c.count, 0);
+            if (total >= target) done += 1;
+          } else {
+            if (!t.isActive && t.completedAt) done += 1;
+          }
+        }
+        todosReached = done >= card.linkedTodoIds.length;
+      }
+      let reached = false;
+      let reason: 'auto_date' | 'auto_todos' | undefined;
+      if (card.mode === 'both') {
+        if (todosReached) { reached = true; reason = 'auto_todos'; }
+        else if (dateReached) { reached = true; reason = 'auto_date'; }
+      } else if (card.mode === 'deadline') {
+        if (dateReached) { reached = true; reason = 'auto_date'; }
+      } else {
+        if (todosReached) { reached = true; reason = 'auto_todos'; }
+      }
+      // 占位：todayDate 仅用作上面的 reached 判定派生（提示 TS 已用过）
+      void todayDate;
+
+      if (reached) {
+        const next: CallingCard = {
+          ...card,
+          archived: true,
+          archivedAt: new Date(),
+          archiveReason: reason,
+          cutInShown: false, // 留给 Dashboard 展示一次结算屏
+          pinned: false,
+        };
+        await db.callingCards.put(next);
+        newlyArchived.push(next);
+      }
+    }
+    if (newlyArchived.length) await get().loadCallingCards();
+    // 挂在名片上的那张自动达成了：立刻推一次，好友那边显示「已达成」而不是继续倒数
+    if (newlyArchived.some(c => c.id === get().settings.profileGoal?.cardId)) {
+      void import('@/services/sync').then(m => m.pushProfilePresence()).catch(() => { /* 离线：下次同步再推 */ });
+    }
+    return newlyArchived;
+  },
+
+  markCallingCardCutInShown: async (id: string) => {
+    const c = await db.callingCards.get(id);
+    if (!c) return;
+    await db.callingCards.put({ ...c, cutInShown: true });
+    await get().loadCallingCards();
+  },
+
+  writeCallingCardLedger: async (id: string) => {
+    const c = await db.callingCards.get(id);
+    if (!c || c.ledgerWritten) return;
+    // 写入一条沉浸感"留下记录"——不带具体加点（这是 milestone 而非 grind），
+    // 但仍走 addActivity 让它进 activity 历史 + 计入 streak
+    await get().addActivity(
+      `跨越了「${c.title}」`,
+      { knowledge: 0, guts: 0, dexterity: 0, kindness: 0, charm: 0 },
+      'local',
+      { important: true, category: 'calling_card_clear', date: c.archivedAt ?? new Date() },
+    );
+    await db.callingCards.put({ ...c, ledgerWritten: true });
+    await get().loadCallingCards();
+  },
+
+  // ── F3 治疗终端 · 启动素材库 ──────────────────────
+  loadWishes: async () => {
+    const wishes = await db.wishes.orderBy('createdAt').toArray();
+    set({ wishes });
+  },
+
+  saveWish: async (wish: Wish) => {
+    await db.wishes.put(wish);
+    await get().loadWishes();
+  },
+
+  addWish: async (input) => {
+    const wish: Wish = {
+      id: uuidv4(),
+      parentId: input.parentId,
+      title: input.title.trim(),
+      note: input.note?.trim() || undefined,
+      kind: input.parentId ? undefined : input.kind,
+      currentState: input.parentId ? undefined : input.currentState?.trim() || undefined,
+      attribute: input.attribute,
+      arcanaId: input.arcanaId,
+      status: 'active',
+      source: input.source ?? 'manual',
+      createdAt: new Date(),
+    };
+    await db.wishes.put(wish);
+    await get().loadWishes();
+    return wish;
+  },
+
+  deleteWish: async (id: string) => {
+    // 删父级素材 → 连带删其全部小步骤（避免孤儿步骤）
+    const children = await db.wishes.where('parentId').equals(id).toArray();
+    if (children.length) await db.wishes.bulkDelete(children.map(c => c.id));
+    await db.wishes.delete(id);
+    await get().loadWishes();
+  },
+
+  setWishStatus: async (id: string, status: Wish['status']) => {
+    const w = await db.wishes.get(id);
+    if (!w) return;
+    await db.wishes.put({
+      ...w,
+      status,
+      archivedAt: status === 'active' ? undefined : (w.archivedAt ?? new Date()),
+    });
+    if (w.parentId) {
+      if (status === 'done') {
+        await appendWishStepHistory(w.parentId, {
+          title: w.title,
+          sourceStepId: w.id,
+          via: 'manual',
+        });
+      } else if (status === 'active') {
+        await removeWishStepHistory(w.parentId, w.id);
+      }
+    }
+    await get().loadWishes();
+  },
+
+  getWishProgress: (wishId: string) => {
+    // 只数"用户主动记下的事"：升级/成就解锁这类副记录不算数（它们本来就不带 wishId，
+    // 这里再挡一道是防止将来有人给副记录也挂上）
+    return get().activities.filter(a =>
+      a.wishId === wishId
+      && a.category !== 'level_up'
+      && a.category !== 'achievement_unlock'
+      && a.category !== 'skill_unlock',
+    ).length;
+  },
+
+  fulfillWish: async (id: string) => {
+    const w = await db.wishes.get(id);
+    if (!w) return null;
+    const timesLogged = get().getWishProgress(id);
+    const now = new Date();
+
+    // 本体：实现 + 归档。fulfilledAt 与 archivedAt 都写——
+    // 前者标"这是实现不是放弃"，后者让它走既有的归档筛选
+    await db.wishes.put({ ...w, status: 'done', fulfilledAt: now, archivedAt: w.archivedAt ?? now });
+
+    // 子愿望一并离场（避免"父愿望实现了、子条目还挂在列表里"）
+    const children = await db.wishes.where('parentId').equals(id).toArray();
+    for (const c of children) {
+      if (c.status === 'active') {
+        await db.wishes.put({ ...c, status: 'archived', archivedAt: now });
+      }
+    }
+
+    // 挂在这个愿望上的在途待办同样归档（口径同 BIG DEAL 收官：主体了结则从属一起收）
+    const todos = await db.todos.toArray();
+    let archivedTodos = 0;
+    for (const t of todos) {
+      if (t.wishId === id && t.isActive !== false) {
+        await db.todos.put({ ...t, isActive: false });
+        archivedTodos++;
+      }
+    }
+
+    // 实现愿望同样发一次弹幕投稿机会（与 BIG DEAL 收官同口径）——
+    // 「值得说给别人听的时刻」不该只有大事收官一种（PRD_V2.6 §3 反馈）
+    await get().updateSettings({
+      terminalDanmakuTokens: (get().settings.terminalDanmakuTokens ?? 0) + 1,
+    });
+
+    // 留一条纪念记录（不加点——这是 milestone 不是 grind，同 calling_card_clear 口径）
+    const user = get().user;
+    if (user) {
+      await get().addActivity(
+        `实现了愿望「${w.title}」`,
+        { knowledge: 0, guts: 0, dexterity: 0, kindness: 0, charm: 0 },
+        'local',
+        { important: true, category: 'wish_fulfilled', wishId: id },
+      );
+    }
+
+    await get().loadWishes();
+    await get().loadData();
+    return { title: w.title, timesLogged, archivedTodos };
+  },
+
+  // ── 愿望进度（PRD_V2.6 §8）──────────────────────────────
+
+  addWishStep: async (wishId, title, opts) => {
+    const t = title.trim();
+    const w = await db.wishes.get(wishId);
+    if (!w || !t) return;
+    const step: TodoStep = { id: uuidv4(), title: t, source: opts?.source ?? 'manual' };
+    await db.wishes.put({ ...w, steps: [...(w.steps ?? []), step] });
+    await get().loadWishes();
+  },
+
+  toggleWishStep: async (wishId, stepId) => {
+    const w = await db.wishes.get(wishId);
+    if (!w) return;
+    const steps = w.steps ?? [];
+    const target = steps.find(s => s.id === stepId);
+    if (!target) return;
+    const nowDone = !target.done;
+    await db.wishes.put({
+      ...w,
+      steps: steps.map(s => (s.id === stepId
+        ? { ...s, done: nowDone, doneAt: nowDone ? new Date().toISOString() : undefined }
+        : s)),
+    });
+    await get().loadWishes();
+    // 勾上才泵进度：撤勾是纠错动作，不该反过来弹一张"你退步了"的卡
+    if (nowDone) void get().bumpWishProgress(wishId);
+  },
+
+  removeWishStep: async (wishId, stepId) => {
+    const w = await db.wishes.get(wishId);
+    if (!w) return;
+    await db.wishes.put({ ...w, steps: (w.steps ?? []).filter(s => s.id !== stepId) });
+    await get().loadWishes();
+  },
+
+  decomposeWishStepsAI: async (wishId) => {
+    const w = get().wishes.find(x => x.id === wishId);
+    if (!w) return [];
+    // 同 decomposeBigDealAI 的手法：把 steps 映射成伪子 Wish，避重/限量/清洗全部继承
+    const children: Wish[] = (w.steps ?? []).map(s => ({
+      id: s.id,
+      parentId: w.id,
+      title: s.title,
+      status: s.done ? 'done' : 'active',
+      source: s.source,
+      createdAt: new Date(w.createdAt),
+    }));
+    return get().decomposeWishAI(w, children);
+  },
+
+  getWishRing: (wishId) => {
+    const w = get().wishes.find(x => x.id === wishId);
+    const steps = w?.steps ?? [];
+    const done = steps.filter(s => s.done).length;
+    const times = get().getWishProgress(wishId);
+    return {
+      pct: w?.progressPct ?? localWishEstimate(done, steps.length, times),
+      // 「从未评估过」和「评估结果是 0%」是两回事，环要分别画
+      evaluated: typeof w?.progressPct === 'number',
+      done,
+      total: steps.length,
+      times,
+    };
+  },
+
+  setWishProgress: async (wishId, pct, opts) => {
+    const w = await db.wishes.get(wishId);
+    if (!w) return;
+    const next = Math.max(0, Math.min(100, Math.round(pct)));
+    const prev = w.progressPct;
+    const point: WishProgressPoint = {
+      at: new Date().toISOString(),
+      pct: next,
+      delta: next - (prev ?? 0),
+      reason: opts?.reason,
+      source: opts?.source ?? 'manual',
+    };
+    await db.wishes.put({
+      ...w,
+      progressPct: next,
+      progressBasis: opts?.reason ?? w.progressBasis,
+      progressUpdatedAt: point.at ? new Date(point.at) : new Date(),
+      progressSource: point.source,
+      progressHistory: [...(w.progressHistory ?? []), point].slice(-12),
+    });
+    await get().loadWishes();
+  },
+
+  evaluateWishProgress: async (wishId, opts) => {
+    const w = get().wishes.find(x => x.id === wishId) ?? await db.wishes.get(wishId);
+    // 已实现/已归档的愿望不再评估——那条线已经走完了
+    if (!w || w.status !== 'active') return null;
+
+    const steps = w.steps ?? [];
+    const done = steps.filter(s => s.done).length;
+    const times = get().getWishProgress(wishId);
+    const prev = w.progressPct;
+
+    let pct = localWishEstimate(done, steps.length, times);
+    let reason: string | undefined;
+    let source: WishProgressSource = 'local';
+
+    const cfg = getAIConfig(get().settings);
+    if (cfg) {
+      try {
+        const recent = get().activities
+          .filter(a => a.wishId === wishId)
+          .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+          .slice(0, 8)
+          .map(a => `· ${a.description}`.slice(0, 40));
+        const usr = [
+          `愿望：${w.title}`,
+          w.note ? `补充：${w.note.slice(0, 80)}` : '',
+          w.currentState ? `用户自述现状：${w.currentState.slice(0, 90)}` : '',
+          steps.length ? `子任务：已完成 ${done} / 共 ${steps.length}（${steps.slice(0, 8).map(s => `${s.done ? '✓' : '○'}${s.title.slice(0, 18)}`).join('，')}）` : '子任务：还没拆',
+          `挂到这个愿望的记录：${times} 条${recent.length ? `\n${recent.join('\n')}` : ''}`,
+          typeof prev === 'number' ? `上次评估：${prev}%${w.progressBasis ? `（依据：${w.progressBasis}）` : ''}` : '此前没有评估过',
+          opts?.context ? `用户刚刚在对话里说的（重要，优先据此调整）：${opts.context.slice(0, 300)}` : '',
+          '请给出现在的完成度百分比。',
+        ].filter(Boolean).join('\n');
+        const content = await callWishJson(cfg, [
+          { role: 'system', content: WISH_EVAL_SYS },
+          { role: 'user', content: usr },
+        ]);
+        const parsed = parseWishEval(content);
+        if (parsed) {
+          pct = parsed.pct;
+          reason = parsed.reason;
+          source = 'ai';
+        }
+      } catch {
+        // AI 没接通就用本地估算——这个功能不该因为没网就整块消失
+      }
+    }
+
+    // 自动路径（任务完成后的泵）单调不降：刚做完一件事却看见环缩回去，
+    // 是在惩罚用户干活。要下调只能走面板里手动的「重新评估」（allowDecrease）。
+    if (!opts?.allowDecrease && typeof prev === 'number') pct = Math.max(prev, pct);
+    pct = Math.max(0, Math.min(100, Math.round(pct)));
+
+    const delta = pct - (prev ?? 0);
+    // dryRun：Agent 的提议路径只要一个数字去问用户，写库要等确认（§8）
+    if (!opts?.dryRun) await get().setWishProgress(wishId, pct, { reason, source });
+    return { pct, delta, reason, source };
+  },
+
+  bumpWishProgress: async (wishId) => {
+    const s = get();
+    if (s.settings.wishAutoEvaluate === false) return;
+    const w = s.wishes.find(x => x.id === wishId);
+    if (!w || w.status !== 'active') return;
+    // 同一愿望 20 秒内只泵一次：批量补记 / 连勾多条子步时不该弹一串卡
+    const last = wishBumpAt.get(wishId) ?? 0;
+    if (Date.now() - last < 20_000) return;
+    wishBumpAt.set(wishId, Date.now());
+    try {
+      const r = await get().evaluateWishProgress(wishId);
+      if (!r) return;
+      set({
+        wishProgressCut: {
+          wishId,
+          wishTitle: w.title,
+          pct: r.pct,
+          delta: r.delta,
+          reason: r.reason,
+          source: r.source,
+          times: get().getWishProgress(wishId),
+        },
+      });
+    } catch {
+      // 泵失败静默：它是锦上添花，不该把"完成任务"这件事搞出错误提示
+    }
+  },
+
+  wishProgressCut: null,
+  clearWishProgressCut: () => set({ wishProgressCut: null }),
+  wishProposal: null,
+  setWishProposal: (p) => set({ wishProposal: p }),
+
+  // ── 回归面板（PRD_V2.6 §12）──────────────────────────────
+
+  markAppOpened: async () => {
+    const s = get();
+    const nowIso = new Date().toISOString();
+    const last = s.settings.lastOpenedAt;
+
+    // 第一次打开：只落时间戳。没有"上一次"就谈不上离开
+    if (!last) {
+      await get().updateSettings({ lastOpenedAt: nowIso });
+      return null;
+    }
+
+    const lastMs = new Date(last).getTime();
+    const daysAway = Math.floor((Date.now() - lastMs) / 86400000);
+    await get().updateSettings({ lastOpenedAt: nowIso });
+    if (!Number.isFinite(daysAway) || daysAway < RETURN_MIN_DAYS) return null;
+
+    // 同一次回归只弹一次：面板弹过之后 lastOpenedAt 已被刷新，
+    // 正常不会重入；这一道是防"同一天里反复冷启动"的兜底
+    const panelAt = s.settings.lastReturnPanelAt;
+    if (panelAt && Date.now() - new Date(panelAt).getTime() < 12 * 3600_000) return null;
+    await get().updateSettings({ lastReturnPanelAt: nowIso });
+
+    const tier: ReturnTier = daysAway <= RETURN_RECENT_MAX_DAYS ? 'recent' : 'distant';
+    // 补记范围 = 缺席那几天，上限 14。distant 档不给日历
+    const backfillDays: string[] = [];
+    if (tier === 'recent') {
+      for (let i = daysAway; i >= 1; i--) {
+        backfillDays.push(toLocalDateKey(new Date(Date.now() - i * 86400000)));
+      }
+    }
+
+    const attrs = s.attributes;
+    const top = attrs.length
+      ? attrs.reduce((a, b) => (b.level > a.level ? b : a))
+      : null;
+
+    return {
+      daysAway,
+      tier,
+      returnCount: (s.settings.returnCount ?? 0) + 1,
+      lastSeenKey: toLocalDateKey(new Date(lastMs)),
+      backfillDays,
+      totalRecords: s.activities.length,
+      topAttribute: top
+        ? {
+            id: top.id as AttributeId,
+            name: s.settings.attributeNames[top.id as AttributeNamesKey] ?? top.id,
+            level: top.level,
+          }
+        : null,
+    };
+  },
+
+  getBackfillSuggestions: (limit = 8) => {
+    const since = Date.now() - 60 * 86400000;
+    const freq = new Map<string, { count: number; points: Record<string, number> }>();
+    for (const a of get().activities) {
+      // 只数用户**自己写下的**记录：升级/成就/收官这类副记录不是"我做过的事"
+      if (a.category || a.method !== 'local') continue;
+      // 补记的条目不能反过来喂候选池——否则补过一次的东西会永远挂在 chip 上
+      // 请你再补一次，形成一个自我强化的回路（驱动实测抓到：「补记用·跑步」进了候选）
+      if (a.backfilled) continue;
+      if (new Date(a.date).getTime() < since) continue;
+      const text = a.description.trim();
+      if (!text || text.length > 18) continue;
+      const cur = freq.get(text);
+      if (cur) cur.count++;
+      else freq.set(text, { count: 1, points: a.pointsAwarded ?? {} });
+    }
+    return [...freq.entries()]
+      .sort((a, b) => b[1].count - a[1].count)
+      .slice(0, limit)
+      .map(([text, v]) => ({ text, points: v.points }));
+  },
+
+  commitReturn: async (payload, entries, summary) => {
+    const user = get().user;
+    if (!user) return;
+    const zero = { knowledge: 0, guts: 0, dexterity: 0, kindness: 0, charm: 0 };
+
+    // ① 补记条目。**一律不加点**（§12 红线）：
+    //    追溯性地补发点数就是开了一个可以凭空造点的口子，
+    //    而记录本身的价值——热力图、统计、愿望进度——不需要点数背书。
+    for (const e of entries) {
+      const text = e.text.trim();
+      if (!text) continue;
+      await db.activities.add({
+        id: uuidv4(),
+        userId: user.id,
+        date: new Date(e.dateKey + 'T12:00:00'),
+        description: text,
+        pointsAwarded: { ...zero },
+        method: 'local',
+        backfilled: true,
+      });
+    }
+
+    // ② 一句话概括：distant 档的唯一形态，recent 档也可以选它代替日历
+    if (summary && summary.trim()) {
+      await db.activities.add({
+        id: uuidv4(),
+        userId: user.id,
+        // 落在"离开的最后一天"，而不是今天——它讲的是那段时间的事
+        date: new Date(payload.lastSeenKey + 'T12:00:00'),
+        description: summary.trim().slice(0, 200),
+        pointsAwarded: { ...zero },
+        method: 'local',
+        backfilled: true,
+      });
+    }
+
+    // ③ 那条带 tag 的回归记录。0 加点——milestone 不是 grind（同 wish_fulfilled / calling_card_clear 口径）
+    await db.activities.add({
+      id: uuidv4(),
+      userId: user.id,
+      date: new Date(),
+      description:
+        `你时隔 ${payload.daysAway} 天重新叩响了面具终端的房门，` +
+        `第 ${payload.returnCount} 次回到了更生的旅途上。`,
+      pointsAwarded: { ...zero },
+      method: 'local',
+      important: true,
+      category: 'return',
+    });
+
+    // ④ 回归的犒赏走**非经济**路径：一次弹幕投稿机会。
+    //    给点数等于在为"离开"付钱；给一次说话的机会，是请他把回来这件事说给别人听。
+    await get().updateSettings({
+      returnCount: payload.returnCount,
+      terminalDanmakuTokens: (get().settings.terminalDanmakuTokens ?? 0) + 1,
+    });
+
+    await get().loadData();
+  },
+
+  decomposeWishAI: async (parent: Wish, children: Wish[] = []) => {
+    const cfg = getAIConfig(get().settings);
+    if (!cfg) throw new Error('未配置 AI，请在「设置 → AI 服务」填入 API 密钥，或手动添加小步骤');
+    const compact = (text: string | undefined, max: number) =>
+      (text ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
+    const normalizeStep = (text: string) =>
+      text.replace(/[\s，。,.!！?？、；;：:（）()《》「」『』"'“”‘’]/g, '').toLowerCase();
+    const kind = parent.kind === 'pressure' ? '短期压力' : '长期愿望';
+    const activeSteps = children.filter(c => c.status === 'active').map(c => c.title.trim()).filter(Boolean);
+    const doneChildren = children.filter(c => c.status === 'done').map(c => c.title.trim()).filter(Boolean);
+    const history = (parent.stepHistory ?? []).map(h => h.title.trim()).filter(Boolean);
+    const completed = Array.from(new Set([...history, ...doneChildren])).slice(-6);
+    const visibleActive = activeSteps.slice(0, 5);
+    const maxSuggestions = activeSteps.length >= 3 ? 3 : 5;
+    const existing = new Set([...completed, ...activeSteps].map(normalizeStep).filter(Boolean));
+    const parseSteps = (content: string) => {
+      const raw = content.trim();
+      let candidates: string[] = [];
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) candidates = parsed.map(String);
+      } catch {
+        candidates = [];
+      }
+      if (candidates.length === 0) {
+        candidates = raw
+          .split(/\n+/)
+          .flatMap(line => line.split(/[；;]+/))
+          .flatMap(seg => seg.split(/\s+(?=\d+[.、)）])/));
+      }
+      const seen = new Set<string>();
+      const result: string[] = [];
+      for (const item of candidates) {
+        const cleaned = item
+          .replace(/^(?:[\s\-*·•]+|\d+[.、)）]\s*)+/, '')
+          .replace(/^["'「『（(]+/, '')
+          .replace(/["'」』）),，。.!！?？]+$/, '')
+          .trim();
+        const key = normalizeStep(cleaned);
+        if (!cleaned || cleaned.length > 42 || !/[\p{L}\p{N}]/u.test(cleaned)) continue;
+        if (existing.has(key) || seen.has(key)) continue;
+        seen.add(key);
+        result.push(cleaned);
+        if (result.length >= maxSuggestions) break;
+      }
+      return result;
+    };
+    const sys =
+      '你是停滞诊断后的行动启动教练。用户不是来管理任务，而是从卡住里恢复流动。' +
+      '只给一个方向上的下一组行动，不做长计划，不解释背景，不逐条呼应已有步骤。' +
+      '起步要低门槛：每条都是十分钟内能开始的动作；若已有未完成步骤，把它们视为已排队，只补充不重复的新步骤。' +
+      '每条必须是单一动作、可开始、短句，不超过 28 个中文字符；不要冒号、括号、编号、鼓励语、原因说明。' +
+      '只输出小步骤本身，每行一个。';
+    const usr = [
+      `类型：${kind}`,
+      `主题：${compact(parent.title, 60)}`,
+      parent.currentState ? `当前进度：${compact(parent.currentState, 90)}` : '',
+      parent.note ? `补充：${compact(parent.note, 80)}` : '',
+      completed.length ? `最近完成：${completed.map(s => compact(s, 30)).join('；')}` : '',
+      visibleActive.length ? `已排队未完成：${visibleActive.map(s => compact(s, 30)).join('；')}${activeSteps.length > visibleActive.length ? `；另有 ${activeSteps.length - visibleActive.length} 条` : ''}` : '',
+      `请补充 ${maxSuggestions} 条以内的新小步骤。`,
+    ].filter(Boolean).join('\n');
+    let firstError: unknown;
+    let sawEmptyResponse = false;
+    try {
+      const content = await chatComplete(
+        cfg,
+        [
+          { role: 'system', content: sys },
+          { role: 'user', content: usr },
+        ],
+        { temperature: 0.45, maxTokens: 220 },
+      );
+      const steps = parseSteps(content);
+      if (steps.length > 0) return steps;
+    } catch (e) {
+      sawEmptyResponse = e instanceof Error && e.message.includes('AI 返回空响应');
+      firstError = e;
+    }
+
+    try {
+      const content = await chatComplete(
+        cfg,
+        [
+          { role: 'system', content: '只输出 1 到 3 行中文短行动。不要解释，不要编号，不要重复用户已有内容。' },
+          { role: 'user', content: `主题：${compact(parent.title, 50)}\n当前：${compact(parent.currentState || parent.note, 80)}\n已有：${visibleActive.slice(0, 3).map(s => compact(s, 24)).join('；') || '暂无'}\n请给下一步。` },
+        ],
+        { temperature: 0.35, maxTokens: 140 },
+      );
+      const steps = parseSteps(content);
+      if (steps.length > 0) return steps;
+    } catch (e) {
+      sawEmptyResponse = sawEmptyResponse || (e instanceof Error && e.message.includes('AI 返回空响应'));
+      firstError = firstError ?? e;
+    }
+    if (sawEmptyResponse) {
+      throw new Error('AI 这次没有返回可用的小步骤。上下文已经压短过，可以稍后重试，或先手动补一条。');
+    }
+    throw firstError instanceof Error ? firstError : new Error('AI 拆分没成功');
+  },
+
+  getDueTodosToday: () => {
+    const todayKey = toLocalDateKey();
+    const todayWeekday = new Date().getDay(); // 0=周日…6=周六，与 Todos/Dashboard 同口径
+    return get().todos.filter(t =>
+      t.isActive &&
+      !t.archivedAt &&
+      !t.isBigDeal && // BIG DEAL 不进今日清单：首页走独立聚合卡（批2），此处混入会被当单次任务误完成
+      (!t.startDate || t.startDate <= todayKey) &&
+      (!t.weekdays || t.weekdays.length === 0 || t.weekdays.includes(todayWeekday)),
+    );
+  },
+
+  // F3 终端 24h 小步卡动作已随终端退役（TASKS_MERGE_PRD 批5）：
+  // 历史卡片仍带 card.terminal 元数据（各处按 !c.terminal 过滤照旧），仅动作族删除。
+
+  loadData: async () => {
+    try {
+      const attributes = await db.attributes.toArray();
+      const activities = await db.activities.orderBy('date').reverse().toArray();
+      const achievements = await db.achievements.toArray();
+      let skills = await db.skills.toArray();
+       const settingsArray = await db.settings.toArray();
+       const settings = settingsArray[0] || get().settings;
+
+      // 迁移：将旧格式技能描述统一为新格式「[属性名]积累额外提升 x%」
+      const oldDescPatterns = [
+        /阅读行为额外\+(\d+)%/, /学习行为额外\+(\d+)%/, /挑战行为额外\+(\d+)%/,
+        /运动行为额外\+(\d+)%/, /帮助行为额外\+(\d+)%/, /社交行为额外\+(\d+)%/,
+        /所有行为额外\+(\d+)%/
+      ];
+      const attrNames = settings?.attributeNames || { knowledge: '知识', guts: '胆量', dexterity: '灵巧', kindness: '温柔', charm: '魅力' };
+
+      // 补种老用户缺失的系统预设成就（新版本新增成就时自动同步）
+      const existingAchievementIds = new Set(achievements.map(a => a.id));
+      const missingSystemAchievements = ACHIEVEMENTS.filter(a => !existingAchievementIds.has(a.id));
+      if (missingSystemAchievements.length > 0) {
+        const defaultAttrNames: Record<string, string> = { knowledge: '知识', guts: '胆量', dexterity: '灵巧', kindness: '温柔', charm: '魅力' };
+        const adaptedMissing = missingSystemAchievements.map(ach => {
+          if (ach.condition.type === 'attribute_level' && ach.condition.attribute) {
+            const oldName = defaultAttrNames[ach.condition.attribute] || ach.condition.attribute;
+            const newName = attrNames[ach.condition.attribute as keyof typeof attrNames] || oldName;
+            return { ...ach, description: ach.description.replace(oldName, newName) };
+          }
+          return { ...ach };
+        });
+        // bulkPut 而非 bulkAdd：这批本来就是"库里没有"的，两者等价，
+        // 但 put 不会在并发重入时炸 ConstraintError 把整个 loadData 拖垮
+        await db.achievements.bulkPut(adaptedMissing);
+        achievements.push(...adaptedMissing);
+      }
+
+      /**
+       * 同样补种缺失的系统预设技能。
+       *
+       * 之前这里只迁移描述、从不补条目——于是 v2.6.0 那个首装 bug（createUser 在
+       * achievements 撞 ConstraintError 后半途抛出，skills 一条没写）造出来的残档
+       * **永远修不回来**：技能页空、赐福没了，重装才行。补种是幂等的，
+       * 顺带也让"以后新增系统技能"能自动落到老档上。
+       * 用户自己不会造出这些 id（赐福 id 是 blessing_*，AI 技能另有前缀）。
+       */
+      const existingSkillIds = new Set(skills.map(s => s.id));
+      const missingSystemSkills = SKILLS.filter(s => !existingSkillIds.has(s.id));
+      if (missingSystemSkills.length > 0) {
+        const defaultAttrNames: Record<string, string> = { knowledge: '知识', guts: '胆量', dexterity: '灵巧', kindness: '温柔', charm: '魅力' };
+        const adaptedSkills = missingSystemSkills.map(skill => {
+          const oldName = defaultAttrNames[skill.requiredAttribute] || skill.requiredAttribute;
+          const newName = attrNames[skill.requiredAttribute as keyof typeof attrNames] || oldName;
+          const escaped = oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          return { ...skill, description: skill.description.replace(new RegExp(escaped, 'g'), newName) };
+        });
+        await db.skills.bulkPut(adaptedSkills);
+        skills = [...skills, ...adaptedSkills];
+      }
+
+      const skillsNeedMigration = skills.some(s => s.bonusMultiplier && oldDescPatterns.some(p => p.test(s.description)));
+      if (skillsNeedMigration) {
+        for (const skill of skills) {
+          const needsMigration = oldDescPatterns.some(p => p.test(skill.description));
+          if (needsMigration && skill.bonusMultiplier) {
+            const pct = Math.round((skill.bonusMultiplier - 1) * 100);
+            const attrName = attrNames[skill.requiredAttribute as keyof typeof attrNames] || skill.requiredAttribute;
+            const newDesc = `${attrName}积累额外提升 ${pct}%`;
+            await db.skills.update(skill.id, { description: newDesc });
+            skill.description = newDesc;
+          }
+        }
+        skills = await db.skills.toArray();
+      }
+      const todos = await db.todos.toArray();
+      const todoCompletions = await db.todoCompletions.toArray();
+
+      const todayKey = toLocalDateKey();
+      const migratedTodos: Todo[] = [];
+
+      const now = new Date();
+      const yesterdayDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+      const yesterdayKey = toLocalDateKey(yesterdayDate);
+      // 今天 / 昨天的完成记录一次查出（第 4 轮）：以前每个一次性待办都串行查两次 IDB
+      const completionByTodoDay = new Map<string, TodoCompletion>();
+      for (const c of todoCompletions) {
+        if (c.date === todayKey || c.date === yesterdayKey) completionByTodoDay.set(`${c.todoId}|${c.date}`, c);
+      }
+
+      const todosNeedFormatMigration = todos.some(t => (t.frequency as any) === 'weekdays' || (t.frequency as any) === 'long');
+      for (const todo of todos) {
+        let updatedTodo = todo;
+        const updates: Partial<Todo> = {};
+
+        if (todosNeedFormatMigration) {
+          if ((todo.frequency as any) === 'weekdays') {
+            updates.frequency = 'count';
+            updates.repeatDaily = true;
+          }
+
+          if ((todo.frequency as any) === 'long') {
+            updates.frequency = 'count';
+            updates.isLongTerm = true;
+          }
+        }
+
+        if (todo.isActive && !todo.repeatDaily && !todo.isLongTerm) {
+          const target = todo.frequency === 'count' ? (todo.targetCount || 1) : 1;
+          const completionToday = completionByTodoDay.get(`${todo.id}|${todayKey}`);
+          const completionYesterday = completionByTodoDay.get(`${todo.id}|${yesterdayKey}`);
+          const shouldArchive = (completionToday && completionToday.count >= target) || (completionYesterday && completionYesterday.count >= target);
+
+          if (shouldArchive) {
+            updates.isActive = false;
+            updates.archivedAt = todo.archivedAt || new Date();
+            updates.completedAt = todo.completedAt || new Date();
+          }
+        }
+
+        if (Object.keys(updates).length > 0) {
+          await db.todos.update(todo.id, updates);
+          updatedTodo = { ...todo, ...updates };
+        }
+
+        migratedTodos.push(updatedTodo);
+      }
+      
+       // 迁移：backgroundAnimation 旧字符串格式 数组格式
+       const rawAnim = (settings as any).backgroundAnimation;
+       let migratedAnim: string[] | undefined = undefined;
+       if (typeof rawAnim === 'string') {
+         migratedAnim = rawAnim === 'none' ? [] : [rawAnim];
+       } else if (!Array.isArray(rawAnim)) {
+         migratedAnim = ['aurora']; // 未设置过则默认极光
+       }
+
+       const normalizedThresholds = settings.levelThresholds?.length
+         ? settings.levelThresholds
+         : DEFAULT_LEVEL_THRESHOLDS;
+       const normalizedLevelTitles = normalizeAttributeLevelTitles(
+         settings.attributeLevelTitles,
+         normalizedThresholds.length,
+       );
+       const normalizedSettings = {
+          ...settings,
+          levelThresholds: normalizedThresholds,
+          attributeLevelTitles: normalizedLevelTitles,
+          backgroundOpacity: settings.backgroundOpacity ?? 0.3,
+          soundMuted: settings.soundMuted ?? false,
+          backgroundAnimation: migratedAnim ?? (settings.backgroundAnimation as string[]),
+       };
+
+       const settingsPatch: Partial<Settings> = {};
+       if (settings.backgroundOpacity === undefined) {
+         settingsPatch.backgroundOpacity = 0.3;
+       }
+       if (settings.soundMuted === undefined) {
+         settingsPatch.soundMuted = false;
+       }
+       if (migratedAnim !== undefined) {
+         settingsPatch.backgroundAnimation = migratedAnim;
+       }
+       if (
+         settings.levelThresholds !== normalizedThresholds ||
+         JSON.stringify(settings.attributeLevelTitles) !== JSON.stringify(normalizedLevelTitles)
+       ) {
+         settingsPatch.levelThresholds = normalizedThresholds;
+         settingsPatch.attributeLevelTitles = normalizedLevelTitles;
+       }
+       if (Object.keys(settingsPatch).length > 0) {
+         await db.settings.update('default', settingsPatch);
+       }
+
+       const summaries = await db.summaries.orderBy('startDate').reverse().toArray();
+       let weeklyGoals = await db.weeklyGoals.orderBy('createdAt').reverse().toArray();
+
+       // 清理：删除已过期（weekEnd < 今天）且未完成的每周目标
+       const todayForCleanup = toLocalDateKey();
+       const expiredIds = weeklyGoals
+         .filter(g => !g.completed && g.weekEnd < todayForCleanup)
+         .map(g => g.id);
+       if (expiredIds.length > 0) {
+         await Promise.all(expiredIds.map(id => db.weeklyGoals.delete(id)));
+         weeklyGoals = weeklyGoals.filter(g => !expiredIds.includes(g.id));
+       }
+
+       set({ 
+         attributes, 
+         activities, 
+         achievements, 
+         skills,
+         // 内容没变就沿用旧对象：订阅 settings 的页面不会因为一次记录写库而整页重算
+         settings: settingsEquivalent(get().settings, normalizedSettings) ? get().settings : normalizedSettings,
+         todos: migratedTodos,
+         todoCompletions,
+         summaries,
+         weeklyGoals,
+       });
+      
+      // 应用夜间模式设置（经闸门：红频道不响应夜间）
+       syncDarkClass(!!normalizedSettings.darkMode);
+       // 增删改任务、撤销完成、改截止日或重要标记……凡是写库后全量重读的操作都经过这里：
+       // 桌面组件一并刷（第 5 轮补漏推；300ms 合并 + 指纹去重，多叫几次不多推）
+       void pushWidgetSnapshot();
+       // 自定义主题色
+       const currentTheme = get().user?.theme;
+       if (currentTheme === 'custom' && normalizedSettings.customThemeColor) {
+         applyCustomThemeColor(normalizedSettings.customThemeColor);
+       }
+
+       // 加载战场数据
+       await get().loadBattleData();
+       // 加载同伴数据
+       await get().loadConfidants();
+       // 委托板（第 6 轮）：周一后第一次打开生成本周三张
+       void get().refreshQuests();
+    } catch (error) {
+      console.error('加载数据失败:', error);
+    }
+  },
+
+  setLevelUpNotification: (notification) => {
+    set({ levelUpNotification: notification });
+  },
+
+  setAchievementNotification: (notification) => {
+    set({ achievementNotification: notification });
+  },
+
+  setSkillNotification: (notification) => {
+    set({ skillNotification: notification });
+  },
+
+  setModalBlocker: (value) => {
+    set({ modalBlocker: value });
+  },
+
+  resetAllData: async (opts) => {
+    for (const t of ALL_LOCAL_TABLES) {
+      if (opts?.keepImages && (t === 'activityImages' || t === 'activityImageData' || t === 'bgmTracks')) continue;
+      await db.table(t).clear();
+    }
+    if (!opts?.keepImages) await loadActivityImageIndex(true); // 表清了，内存里的缩略图索引也要清
+    // 黑猫是独立 store：表清了，内存里的人格列表/消息流还留着，不重置会出现
+    //「数据已清空但猫还在接着上一句说」的错乱。
+    try {
+      const { useNavigatorStore } = await import('@/store/navigator');
+      useNavigatorStore.setState({ messages: [], presets: [], sessionId: null, phase: 'idle' });
+    } catch { /* 尚未加载过黑猫模块则无需重置 */ }
+
+    set({
+      user: null,
+      attributes: [],
+      activities: [],
+      achievements: [],
+      skills: [],
+      dailyDivination: null,
+      fateGlimpses: [],
+      longReadings: [],
+      callingCards: [],
+      wishes: [],
+      bigDealClear: null,
+      wishProgressCut: null,
+      wishProposal: null,
+      todos: [],
+      todoCompletions: [],
+      summaries: [],
+      weeklyGoals: [],
+      settings: DEFAULT_SETTINGS,
+      currentPage: 'dashboard',
+      activitiesJumpDate: null,
+  questNotice: null,
+      levelUpNotification: null,
+      achievementNotification: null,
+      skillNotification: null,
+      persona: null,
+      shadow: null,
+      battleState: null,
+      confidants: [],
+      confidantEvents: [],
+      counselSession: null,
+      counselArchives: [],
+      ledgerEntries: [],
+      budgets: [],
+      assets: [],
+    });
+  },
+
+  deleteActivityRecordOnly: async (id: string) => {
+    // 严格只删除活动条目本身，不动属性点 / level / todoCompletion / level_up 副记录。
+    // 当用户在删除弹窗里选择"仅删除条目"时进入这条路径。
+    await db.activities.delete(id);
+    await deleteImagesOfActivity(id);
+    await get().loadData();
+  },
+
+  deleteActivity: async (id: string) => {
+    // ── 撤销语义升级（v2.1）─────────────────────────────────
+    // 旧行为：仅 db.activities.delete(id)，导致：
+    //   1. 加成的属性点数仍保留在 attributes 上（"幽灵点数"）
+    //   2. todo 触发的活动被删，但 todoCompletion 仍计 1 次，今日待办还显示已完成
+    //   3. 对应升级若发生过，level_up 副记录还挂在历史里，看起来像"凭空升级"
+    //
+    // 新行为（事务原子）：
+    //   - 取该活动的 pointsAwarded，从对应属性点数里逐项扣回
+    //   - 扣回后按阈值表回算 level，若跌破则一并下调（最低不低于 1）
+    //   - 删除同 method='todo' 当日的 todoCompletion（或递减计数）
+    //   - 该 todo 若因完成而被自动归档（isActive=false + completedAt），自动恢复成 active
+    //   - 顺手清理掉这次 addActivity 同次写入的 level_up 副记录（同 userId / 同分钟内 / category='level_up'），
+    //     避免历史里出现"幽灵升级"
+    //
+    // 安全边界：
+    //   - 跨日活动也会扣点（这是用户主动按"删除"时的预期）；仅 todo 还原限定为同日，
+    //     因为旧日的 todoCompletion 早已过去，不应回写。
+    //   - 不主动撤销已解锁的 achievement / skill —— 那会引发"得而复失"的复杂态。
+    //     这与"撤销点数"是两个语义层次，留给用户自己在 设置 → 重置 处理。
+    const target = await db.activities.get(id);
+    if (!target) return;
+
+    const todayKey = toLocalDateKey();
+    const targetDateKey = toLocalDateKey(new Date(target.date));
+    const sameDay = targetDateKey === todayKey;
+
+    // 撤掉的那次完成属于「一起进步」的约定：事务结束后再去服务器撤卡（网络请求不能放在 Dexie 事务里）
+    let pactRetract: { id: string; day: string } | null = null;
+    let opRetract: { orgId: string; opId: string } | null = null;
+    await db.transaction(
+      'rw',
+      // 配图两张表也要在事务范围里：deleteImagesOfActivity 内部再开事务，父事务不含这两张表会报
+      // NotFound（被它的 catch 吞掉）——原图就成了孤儿，还会被算进图片包
+      [db.activities, db.attributes, db.todos, db.todoCompletions, db.activityImages, db.activityImageData],
+      async () => {
+        // 1. 删除活动本体（这一行写在事务里、与下面回点等步骤保持原子）
+        await db.activities.delete(id);
+        await deleteImagesOfActivity(id);
+
+        // 2. 扣回属性点数 + 重算 level
+        const attrIds: AttributeId[] = ['knowledge', 'guts', 'dexterity', 'kindness', 'charm'];
+        const settingsThresholds = get().settings.levelThresholds;
+        for (const attrId of attrIds) {
+          const delta = target.pointsAwarded?.[attrId] ?? 0;
+          if (delta <= 0) continue;
+          const attr = await db.attributes.get(attrId);
+          if (!attr) continue;
+          const newPoints = Math.max(0, attr.points - delta);
+          const thresholds = settingsThresholds?.length ? settingsThresholds : attr.levelThresholds;
+          const newLevel = levelForPoints(newPoints, thresholds);
+          await db.attributes.update(attrId, { points: newPoints, level: newLevel });
+        }
+
+        // 3. 清理 level_up 副记录：addActivity 在同事务里把 levelUpActivities push 进 db，
+        //    它们的 date 都是 new Date()，与 target.date 几乎同瞬。
+        //    这里用 ±90s 兜底（兼容跨进程导入时间漂移），并按 attribute 名匹配描述前缀。
+        if ((target.levelUps?.length ?? 0) > 0) {
+          const targetTime = new Date(target.date).getTime();
+          const allActs = await db.activities.toArray();
+          const attrNames = get().settings.attributeNames;
+          for (const lu of target.levelUps ?? []) {
+            const expectedDescPrefix = `${attrNames[lu.attribute as AttributeNamesKey] ?? lu.attribute} 升级Lv.${lu.toLevel}`;
+            const candidate = allActs.find(a =>
+              a.category === 'level_up'
+              && a.description === expectedDescPrefix
+              && Math.abs(new Date(a.date).getTime() - targetTime) < 90_000,
+            );
+            if (candidate) await db.activities.delete(candidate.id);
+          }
+        }
+
+        // 4. todo 联动撤销（仅同日 + method='todo'）
+        if (sameDay && target.method === 'todo') {
+          // 描述形如 "完成任务: <todo.title>"
+          const m = /^完成任务[:：]\s*(.+)$/.exec(target.description.trim());
+          const todoTitle = m?.[1]?.trim();
+          if (todoTitle) {
+            // 先按 title 找 active todo，找不到再尝试已归档的（误触自动归档场景）
+            let todo = await db.todos.toArray().then(arr =>
+              arr.find(t => t.title === todoTitle && t.isActive)
+              ?? arr.find(t => t.title === todoTitle),
+            );
+            if (todo) {
+              const completion = await db.todoCompletions.where('todoId').equals(todo.id)
+                .filter(c => c.date === todayKey).first();
+              if (completion) {
+                if (completion.count > 1) {
+                  await db.todoCompletions.update(completion.id, { count: completion.count - 1 });
+                } else {
+                  await db.todoCompletions.delete(completion.id);
+                }
+              }
+              // 若 todo 因这次完成而被归档（非 repeatDaily / 非 isLongTerm），恢复为 active
+              if (!todo.isActive && !todo.repeatDaily && !todo.isLongTerm) {
+                await db.todos.update(todo.id, { isActive: true, archivedAt: undefined, completedAt: undefined });
+              }
+              if (todo.pact) pactRetract = { id: todo.pact.id, day: todayKey };
+              if (todo.orgOp) opRetract = { orgId: todo.orgOp.orgId, opId: todo.orgOp.opId };
+            }
+          }
+        }
+      },
+    );
+    await get().loadData();
+    const retract = pactRetract as { id: string; day: string } | null; // 在事务回调里赋的值，TS 的流程分析看不见
+    if (retract) {
+      void import('@/services/pactSync').then(m => m.onPactTodoUndone(retract.id, retract.day));
+    }
+    // 组织作战（第 8 轮）：撤销完成也撤回这场作战上的打卡（已经达成的不撤）
+    const opUndo = opRetract as { orgId: string; opId: string } | null;
+    if (opUndo) {
+      void import('@/services/orgOpsSync').then(m => m.onOrgOpTodoUndone(opUndo.orgId, opUndo.opId));
+    }
+  },
+
+  importData: async (jsonData: string) => {
+    // 1. 解析 JSON（在修改任何数据前提前报格式错误）
+    // 防御性清理：
+    //   - 去掉 UTF-8 BOM（\uFEFF），iOS / 一些文本编辑器会在文件开头插入
+    //   - 去掉两端空白：从分享面板 / 剪贴板拿到的文本可能带换行或制表符
+    //   - 去掉 NULL 字节 \u0000：部分系统的"另存为"或文件往返会注入
+    const cleaned = jsonData
+      .replace(/^\uFEFF/, '')
+      .replace(/\u0000/g, '')
+      .trim();
+
+    let data: Record<string, unknown>;
+    try {
+      data = JSON.parse(cleaned);
+    } catch (e) {
+      // 把真实的 parse 错误暴露出来，便于定位
+      const msg = e instanceof Error ? e.message : String(e);
+      // 从错误消息里抠出 position N，截取该位置前后 20 字节，连同 unicode 码点一并展示
+      const posMatch = /position\s+(\d+)/i.exec(msg);
+      let context = '';
+      if (posMatch) {
+        const pos = Number(posMatch[1]);
+        const from = Math.max(0, pos - 20);
+        const to = Math.min(cleaned.length, pos + 20);
+        const slice = cleaned.slice(from, to);
+        const bad = cleaned.charAt(pos);
+        const code = bad ? `U+${bad.charCodeAt(0).toString(16).padStart(4, '0').toUpperCase()}` : '(文件结尾)';
+        context = `；错误位置附近："${slice}"（位置 ${pos} 处字符：${code}）`;
+      } else {
+        const head = cleaned.slice(0, 80).replace(/\s+/g, ' ');
+        context = `；内容开头："${head}"`;
+      }
+      throw new Error(`JSON 格式错误：${msg}${context}`);
+    }
+
+    // 2. 快照当前所有数据，用于失败时恢复。
+    //    ⚠️ 逐表手写会漂（FS7 审查实证：旧版快照漏了 ledgerEntries/budgets/assets，
+    //    而 resetAllData 会清它们 —— 于是"导入失败自动恢复"反而把整本账吃掉）。
+    //    这里改成对 ALL_LOCAL_TABLES 循环，与 resetAllData 共用同一份清单，从此不会再漏。
+    const snapshot: Record<string, unknown[]> = {};
+    for (const t of ALL_LOCAL_TABLES) {
+      if (t === 'bgmTracks') continue; // 导入音乐的 Blob（最多 120MB）不进内存快照：导入时不清它，也不需要恢复
+      snapshot[t] = await db.table(t).toArray();
+    }
+
+    // 3. 写入新数据；若失败则从快照恢复
+    try {
+      // 清空现有数据。配图留着：它们不在主备份里、也不上云，按 activityId 挂回导入后的记录；
+      // 记录不在了的成孤儿（只占空间，图片包里还能导出），比整批清掉稳妥
+      await get().resetAllData({ keepImages: true });
+
+      // 导入用户数据
+      if (data.user && Array.isArray(data.user)) {
+        for (const user of data.user as unknown[]) {
+          const u = user as User;
+          await db.users.add({ ...u, createdAt: new Date(u.createdAt) });
+        }
+      }
+
+      // 导入属性数据
+      if (data.attributes && Array.isArray(data.attributes)) {
+        await db.attributes.bulkAdd(data.attributes as unknown as Attribute[]);
+      }
+
+      // 导入活动数据
+      if (data.activities && Array.isArray(data.activities)) {
+        for (const activity of data.activities as unknown[]) {
+          const a = activity as Activity;
+          await db.activities.add({ ...a, date: new Date(a.date) });
+        }
+      }
+
+      // 导入成就数据
+      if (data.achievements && Array.isArray(data.achievements)) {
+        for (const achievement of data.achievements as unknown[]) {
+          const ac = achievement as Achievement;
+          await db.achievements.add({
+            ...ac,
+            unlockedDate: ac.unlockedDate ? new Date(ac.unlockedDate) : undefined
+          });
+        }
+      }
+
+      // 导入技能数据
+      if (data.skills && Array.isArray(data.skills)) {
+        await db.skills.bulkAdd(data.skills as unknown as Skill[]);
+      }
+
+      // 导入设置数据：备份里带的 Key 优先；备份里缺的（老版本导出的备份不带当前那家的 Key）用本机的补上
+      if (data.settings && Array.isArray(data.settings)) {
+        const localSettings = (snapshot.settings?.[0] ?? undefined) as Settings | undefined;
+        await db.settings.bulkAdd((data.settings as unknown as Settings[]).map((s) => keepLocalAISecrets(s, localSettings)));
+      }
+
+      // 导入任务数据
+      if (data.todos && Array.isArray(data.todos)) {
+        for (const todo of data.todos as unknown[]) {
+          const t = todo as Todo;
+          // archivedAt / completedAt 此前没还原，导入后它们是**字符串**而类型写着 Date。
+          // 目前所有消费点都恰好套了 new Date(...) 才没炸，但那是运气不是设计——
+          // 下一个直接写 todo.completedAt.getTime() 的人只会在"从备份恢复过的用户"身上崩。
+          await db.todos.add({
+            ...t,
+            createdAt: new Date(t.createdAt),
+            archivedAt: t.archivedAt ? new Date(t.archivedAt) : undefined,
+            completedAt: t.completedAt ? new Date(t.completedAt) : undefined,
+          });
+        }
+      }
+
+      if (data.todoCompletions && Array.isArray(data.todoCompletions)) {
+        for (const completion of data.todoCompletions as unknown as TodoCompletion[]) {
+          await db.todoCompletions.add(completion);
+        }
+      }
+
+      // 导入逆影战场数据（v3 新增，v2 备份不含这些字段，跳过即可）
+      if (data.personas && Array.isArray(data.personas)) {
+        for (const p of data.personas as unknown[]) {
+          const persona = p as Persona;
+          await db.personas.put({ ...persona, createdAt: new Date(persona.createdAt) });
+        }
+      }
+      if (data.shadows && Array.isArray(data.shadows)) {
+        for (const s of data.shadows as unknown[]) {
+          const shadow = s as Shadow;
+          await db.shadows.put({ ...shadow, createdAt: new Date(shadow.createdAt) });
+        }
+      }
+      if (data.battleStates && Array.isArray(data.battleStates)) {
+        await db.battleStates.bulkPut(data.battleStates as unknown as BattleState[]);
+      }
+      if (data.strata && Array.isArray(data.strata)) {
+        for (const s of data.strata as unknown[]) {
+          const st = s as TowerStratum;
+          await db.strata.put({ ...st, createdAt: new Date(st.createdAt) });
+        }
+      }
+
+      // 星象数据（v6 新增，旧备份缺失则跳过）
+      if (data.dailyDivinations && Array.isArray(data.dailyDivinations)) {
+        for (const d of data.dailyDivinations as unknown[]) {
+          const dd = d as DailyDivination;
+          await db.dailyDivinations.put({ ...dd, createdAt: new Date(dd.createdAt) });
+        }
+      }
+      if (data.longReadings && Array.isArray(data.longReadings)) {
+        for (const r of data.longReadings as unknown[]) {
+          const lr = r as LongReading;
+          await db.longReadings.put({
+            ...lr,
+            createdAt: new Date(lr.createdAt),
+            followUps: (lr.followUps ?? []).map(f => ({ ...f, createdAt: new Date(f.createdAt) })),
+          });
+        }
+      }
+      // 窥探命运（v2.7，备份 _version 10+；旧备份无此 key 自然跳过）
+      if (data.fateGlimpses && Array.isArray(data.fateGlimpses)) {
+        for (const g of data.fateGlimpses as unknown[]) {
+          const fg = g as FateGlimpse;
+          await db.fateGlimpses.put({ ...fg, createdAt: new Date(fg.createdAt) });
+        }
+      }
+      if (data.callingCards && Array.isArray(data.callingCards)) {
+        for (const c of data.callingCards as unknown[]) {
+          const cc = c as CallingCard;
+          await db.callingCards.put({
+            ...cc,
+            createdAt: new Date(cc.createdAt),
+            archivedAt: cc.archivedAt ? new Date(cc.archivedAt) : undefined,
+          });
+        }
+      }
+
+      // 周总结（v4 新增字段）
+      if (data.summaries && Array.isArray(data.summaries)) {
+        for (const s of data.summaries as unknown[]) {
+          const ps = s as PeriodSummary;
+          await db.summaries.put({ ...ps, createdAt: new Date(ps.createdAt) });
+        }
+      }
+      // 本周目标
+      if (data.weeklyGoals && Array.isArray(data.weeklyGoals)) {
+        for (const g of data.weeklyGoals as unknown[]) {
+          const wg = g as WeeklyGoal;
+          await db.weeklyGoals.put({
+            ...wg,
+            createdAt: new Date(wg.createdAt),
+            completedAt: wg.completedAt ? new Date(wg.completedAt) : undefined,
+          });
+        }
+      }
+
+      // 同伴（v5 新增，旧备份缺失则跳过）
+      if (data.confidants && Array.isArray(data.confidants)) {
+        for (const c of data.confidants as unknown[]) {
+          const cf = c as Confidant;
+          await db.confidants.put({
+            ...cf,
+            createdAt: new Date(cf.createdAt),
+            lastInteractionAt: cf.lastInteractionAt ? new Date(cf.lastInteractionAt) : undefined,
+            archivedAt: cf.archivedAt ? new Date(cf.archivedAt) : undefined,
+          });
+        }
+      }
+      if (data.confidantEvents && Array.isArray(data.confidantEvents)) {
+        for (const e of data.confidantEvents as unknown[]) {
+          const ev = e as ConfidantEvent;
+          await db.confidantEvents.put({ ...ev, createdAt: new Date(ev.createdAt) });
+        }
+      }
+
+      // 谏言归档摘要（v6 新增；旧备份无此字段则跳过）
+      if (data.counselArchives && Array.isArray(data.counselArchives)) {
+        for (const a of data.counselArchives as unknown[]) {
+          const ca = a as CounselArchive;
+          await db.counselArchives.put({
+            ...ca,
+            createdAt: new Date(ca.createdAt),
+            sessionStartedAt: new Date(ca.sessionStartedAt),
+            sessionEndedAt: new Date(ca.sessionEndedAt),
+          });
+        }
+      }
+
+      // 启动素材库（F3 v11 新增；旧备份无此字段则跳过）
+      if (data.wishes && Array.isArray(data.wishes)) {
+        for (const w of data.wishes as unknown[]) {
+          const wi = w as Wish;
+          await db.wishes.put({
+            ...wi,
+            createdAt: new Date(wi.createdAt),
+            archivedAt: wi.archivedAt ? new Date(wi.archivedAt) : undefined,
+            // JSON 里这两个是字符串，不还原成 Date 的话归档区的「已实现」标签
+            // 和进度面板的「上次评估」都会拿到 string 去调 Date 方法
+            fulfilledAt: wi.fulfilledAt ? new Date(wi.fulfilledAt) : undefined,
+            progressUpdatedAt: wi.progressUpdatedAt ? new Date(wi.progressUpdatedAt) : undefined,
+          });
+        }
+      }
+
+      // ── 备份 v8 补挂（FS7）：这几张表此前导出端整段缺失，导入端自然也没分支。
+      //    对旧备份（无这些 key）全部走 if 短路跳过，向后兼容。
+      // F5 心相记账：永不上云，备份文件是它唯一的迁移载体
+      if (data.ledgerEntries && Array.isArray(data.ledgerEntries)) {
+        for (const e of data.ledgerEntries as unknown[]) {
+          const le = e as LedgerEntry;
+          await db.ledgerEntries.put({ ...le, createdAt: new Date(le.createdAt) });
+        }
+      }
+      if (data.budgets && Array.isArray(data.budgets)) {
+        // Budget.createdAt 是 Date，bulkPut 原样写回会留下字符串（同 todos 的理由）
+        await db.budgets.bulkPut(
+          (data.budgets as unknown[]).map(b => {
+            const bg = b as Budget;
+            return { ...bg, createdAt: new Date(bg.createdAt) };
+          }),
+        );
+      }
+      if (data.assets && Array.isArray(data.assets)) {
+        for (const a of data.assets as unknown[]) {
+          const as = a as LedgerAsset;
+          await db.assets.put({ ...as, createdAt: new Date(as.createdAt) });
+        }
+      }
+      // F6 黑猫：自定义人格 + 原子记忆（聊天原文不入备份，同 counselSessions 口径）
+      if (data.navigatorPresets && Array.isArray(data.navigatorPresets)) {
+        for (const p of data.navigatorPresets as unknown[]) {
+          const np = p as NavigatorPreset;
+          await db.navigatorPresets.put({ ...np, createdAt: new Date(np.createdAt) });
+        }
+      }
+      if (data.navigatorMemos && Array.isArray(data.navigatorMemos)) {
+        for (const m of data.navigatorMemos as unknown[]) {
+          const nm = m as NavigatorMemo;
+          await db.navigatorMemos.put({
+            ...nm,
+            createdAt: new Date(nm.createdAt),
+            lastRecalledAt: nm.lastRecalledAt ? new Date(nm.lastRecalledAt) : undefined,
+          });
+        }
+      }
+      // v9 补挂：旧版每日事件。全字段字符串，无 Date 需还原（见 backup.ts 同处注释）
+      if (data.dailyEvents && Array.isArray(data.dailyEvents)) {
+        await db.dailyEvents.bulkPut(data.dailyEvents as DailyEvent[]);
+      }
+      // 第 6 轮：岁时印章 / 委托板——备份里一直有，导入时漏了写回（导入会先清空本地，漏了就丢）。全字段字符串
+      if (data.stamps && Array.isArray(data.stamps)) {
+        await db.stamps.bulkPut(data.stamps as SeasonStamp[]);
+      }
+      if (data.quests && Array.isArray(data.quests)) {
+        await db.quests.bulkPut(data.quests as Quest[]);
+      }
+
+      // 重新加载应用
+      await get().initializeApp();
+      // 导入成功了才数孤儿图；数不出来也不算导入失败
+      let orphanImages: ImportDataResult['orphanImages'] = { count: 0, bytes: 0 };
+      try { orphanImages = await findOrphanActivityImages(); } catch { /* 只是数一数 */ }
+      if (orphanImages.count > 0) set({ orphanImagesPrompt: orphanImages });
+      return { orphanImages };
+    } catch (error) {
+      console.error('导入数据失败，正在恢复原有数据', error);
+
+      // 4. 恢复快照：先清空（部分写入可能已发生），再按同一份表清单写回（配图没动过，跳过）
+      try {
+        await get().resetAllData({ keepImages: true });
+        for (const t of ALL_LOCAL_TABLES) {
+          if (t === 'activityImages' || t === 'activityImageData' || t === 'bgmTracks') continue;
+          const rows = snapshot[t];
+          if (rows && rows.length) await db.table(t).bulkAdd(rows as never[]);
+        }
+        await get().initializeApp();
+      } catch (restoreError) {
+        console.error('恢复原有数据失败:', restoreError);
+      }
+
+      throw new Error('导入失败，已恢复原有数据。请检查备份文件是否完整');
+    }
+  },
+
+  addCustomAchievement: async (achievement) => {
+    const newAchievement: Achievement = {
+      ...achievement,
+      unlocked: false
+    };
+    await db.achievements.add(newAchievement);
+    await get().loadData();
+  },
+
+  addCustomSkill: async (skill) => {
+    const newSkill: Skill = {
+      ...skill,
+      // 第 13 轮：单个倍数钳 1–3（原来只在页面钳，导入 / 旧数据可绕过）
+      ...(skill.bonusMultiplier != null ? { bonusMultiplier: clampSkillMultiplier(skill.bonusMultiplier) } : {}),
+      unlocked: false
+    };
+    await db.skills.add(newSkill);
+    await get().loadData();
+  },
+
+   checkKeywordAchievements: async (description: string, options?: { skipLoad?: boolean }) => {
+    const achievements = await db.achievements.toArray();
+    const keywordAchievements = achievements.filter(
+      a => !a.unlocked && a.condition.type === 'keyword_match' && a.condition.keywords
+    );
+
+    for (const achievement of keywordAchievements) {
+      const keywords = achievement.condition.keywords || [];
+      const hasMatch = keywords.some(keyword => 
+        description.toLowerCase().includes(keyword.toLowerCase())
+      );
+
+       if (hasMatch) {
+         const currentProgress = (achievement.condition.currentProgress || 0) + 1;
+         const updatedCondition = {
+           ...achievement.condition,
+           currentProgress
+         };
+
+         await db.achievements.update(achievement.id, {
+           condition: updatedCondition
+         });
+       }
+     }
+
+    if (!options?.skipLoad) {
+      await get().loadData();
+    }
+  },
+
+   checkTodoCompletionAchievements: async (options?: { skipLoad?: boolean }) => {
+     const achievements = await db.achievements.toArray();
+     const todoAchievements = achievements.filter(
+       a => !a.unlocked && a.condition.type === 'todo_completions'
+     );
+
+     if (todoAchievements.length === 0) return;
+
+     const completions = await db.todoCompletions.toArray();
+     const totalCompletions = completions.reduce((sum, item) => sum + item.count, 0);
+
+     for (const achievement of todoAchievements) {
+       const progress = Math.min(totalCompletions, achievement.condition.value);
+       await db.achievements.update(achievement.id, {
+         condition: {
+           ...achievement.condition,
+           currentProgress: progress
+         }
+       });
+
+     }
+
+     if (!options?.skipLoad) {
+       await get().loadData();
+     }
+    },
+
+   checkWeeklyGoalAchievements: async (options?: { skipLoad?: boolean }) => {
+     const achievements = await db.achievements.toArray();
+     const weeklyAchievements = achievements.filter(
+       a => !a.unlocked && a.condition.type === 'weekly_goal_completions'
+     );
+
+     if (weeklyAchievements.length === 0) return;
+
+     const weeklyGoals = await db.weeklyGoals.toArray();
+     const completedCount = weeklyGoals.filter(g => g.completed).length;
+
+     for (const achievement of weeklyAchievements) {
+       const progress = Math.min(completedCount, achievement.condition.value);
+       await db.achievements.update(achievement.id, {
+         condition: { ...achievement.condition, currentProgress: progress }
+       });
+     }
+
+     if (!options?.skipLoad) {
+       await get().loadData();
+     }
+   },
+
+  checkAllAttributesMaxAchievement: async () => {
+    const attributes = await db.attributes.toArray();
+    const achievements = await db.achievements.toArray();
+    const allAttributesMaxAchievement = achievements.find(
+      a => a.condition.type === 'all_attributes_max' && !a.unlocked
+    );
+
+    if (allAttributesMaxAchievement) {
+      const maxLevelCount = attributes.filter(attr => attr.level >= allAttributesMaxAchievement.condition.value).length;
+      await db.achievements.update(allAttributesMaxAchievement.id, {
+        condition: {
+          ...allAttributesMaxAchievement.condition,
+          currentProgress: Math.min(maxLevelCount, attributes.length)
+        }
+      });
+    }
+  },
+
+  updateCustomAchievement: async (id: string, achievement: Partial<Achievement>) => {
+    await db.achievements.update(id, achievement);
+    
+    // 同时更新设置中的自定义成就
+    const { settings } = get();
+    const customAchievements = settings.customAchievements || [];
+    const updatedAchievements = customAchievements.map(a => 
+      a.id === id ? { ...a, ...achievement } : a
+    );
+    await get().updateSettings({ customAchievements: updatedAchievements });
+    
+    await get().loadData();
+  },
+
+  updateCustomSkill: async (id: string, skillPatch: Partial<Skill>) => {
+    const skill: Partial<Skill> = skillPatch.bonusMultiplier != null
+      ? { ...skillPatch, bonusMultiplier: clampSkillMultiplier(skillPatch.bonusMultiplier) }
+      : skillPatch;
+    await db.skills.update(id, skill);
+    
+    // 同时更新设置中的自定义技能
+    const { settings } = get();
+    const customSkills = settings.customSkills || [];
+    const updatedSkills = customSkills.map(s => 
+      s.id === id ? { ...s, ...skill } : s
+    );
+    await get().updateSettings({ customSkills: updatedSkills });
+    
+    await get().loadData();
+  },
+
+  deleteCustomAchievement: async (id: string) => {
+    await db.achievements.delete(id);
+    
+    // 同时从设置中删除
+    const { settings } = get();
+    const customAchievements = settings.customAchievements || [];
+    const updatedAchievements = customAchievements.filter(a => a.id !== id);
+    await get().updateSettings({ customAchievements: updatedAchievements });
+    
+    await get().loadData();
+  },
+
+  deleteCustomSkill: async (id: string) => {
+    await db.skills.delete(id);
+    
+    // 同时从设置中删除
+    const { settings } = get();
+    const customSkills = settings.customSkills || [];
+    const updatedSkills = customSkills.filter(s => s.id !== id);
+    await get().updateSettings({ customSkills: updatedSkills });
+    
+    await get().loadData();
+  },
+
+  toggleSkillUnlock: async (id: string) => {
+    const skill = await db.skills.get(id);
+    if (skill) {
+      await db.skills.update(id, { unlocked: !skill.unlocked });
+      await get().loadData();
+    }
+  },
+
+  addTodo: async (todo) => {
+    const newTodo: Todo = {
+      ...todo,
+      id: uuidv4(),
+      createdAt: new Date()
+    };
+    await db.todos.add(newTodo);
+    await get().loadData();
+  },
+
+  updateTodo: async (id, updates) => {
+    const existing = await db.todos.get(id);
+    if (!existing) return;
+
+    const nextUpdates: Partial<Todo> = { ...updates };
+
+    // Bug fix #7: 关闭"是否启用"仅移到归档，不视为完成一次（不奖励点数）
+    if (updates.isActive === false && existing.isActive) {
+      if (!existing.archivedAt) {
+        nextUpdates.archivedAt = new Date();
+      }
+    }
+
+    // Bug fix #9: 从归档恢复时，清除今日完成记录，使任务在首页可点击
+    if (updates.isActive === true && !existing.isActive) {
+      const todayKey = toLocalDateKey();
+      await db.todoCompletions.where('todoId').equals(id).filter(c => c.date === todayKey).delete();
+      nextUpdates.completedAt = undefined;
+    }
+
+    await db.todos.update(id, nextUpdates);
+    await get().loadData();
+  },
+
+  deleteTodo: async (id) => {
+    await db.todos.delete(id);
+    await db.todoCompletions.where('todoId').equals(id).delete();
+    await get().loadData();
+  },
+
+  getTodayTodoProgress: (todoId) => {
+    const today = toLocalDateKey();
+    const todo = get().todos.find(t => t.id === todoId);
+    // BIG DEAL：进度恒为 steps 派生（生涯口径），不走 todoCompletion 计数
+    if (todo?.isBigDeal) {
+      const steps = todo.steps ?? [];
+      const done = steps.filter(s => s.done).length;
+      return { count: done, isComplete: steps.length > 0 && done >= steps.length, target: Math.max(1, steps.length) };
+    }
+    const target = todo?.frequency === 'count' ? (todo.targetCount || 1) : 1;
+    let count: number;
+    if (todo?.isLongTerm) {
+      // 长期任务：累计所有天的完成次数
+      const allCompletions = get().todoCompletions.filter(c => c.todoId === todoId);
+      count = allCompletions.reduce((sum, c) => sum + c.count, 0);
+    } else {
+      const completion = get().todoCompletions.find(c => c.todoId === todoId && c.date === today);
+      count = completion?.count || 0;
+    }
+    return { count, isComplete: count >= target, target };
+  },
+
+  getTodoDateLabel: (date: Date) => {
+    const today = new Date();
+    const startOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    const startOfDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+    const diffDays = Math.round((startOfToday.getTime() - startOfDate.getTime()) / (1000 * 60 * 60 * 24));
+    if (diffDays === 0 || diffDays === 1 || diffDays === 2) return '';
+    return date.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' });
+  },
+
+  completeTodo: async (todoId) => {
+    const { user, todos } = get();
+    if (!user) return null;
+
+    const todo = todos.find(t => t.id === todoId);
+    if (!todo || !todo.isActive) return null;
+    if (todo.isBigDeal) return null; // 大事只能逐子步完成（completeTodoStep），整单完成路径拦死
+
+    const today = toLocalDateKey();
+    const completion = await db.todoCompletions.where('todoId').equals(todoId).filter(c => c.date === today).first();
+    const target = todo.frequency === 'count' ? (todo.targetCount || 1) : 1;
+
+    if (completion && completion.count >= target) return null;
+
+    const newCount = completion ? completion.count + 1 : 1;
+    if (completion) {
+      await db.todoCompletions.update(completion.id, { count: newCount });
+    } else {
+      await db.todoCompletions.add({
+        id: uuidv4(),
+        todoId,
+        date: today,
+        count: newCount
+      });
+    }
+
+    const reachedTarget = newCount >= target;
+    if (reachedTarget) {
+      const points = {
+        knowledge: 0,
+        guts: 0,
+        dexterity: 0,
+        kindness: 0,
+        charm: 0
+      } as Record<string, number>;
+      points[todo.attribute] = todo.points;
+      // 合并多属性额外加成
+      if (todo.extraBoosts) {
+        for (const boost of todo.extraBoosts) {
+          points[boost.attribute] = (points[boost.attribute] || 0) + boost.points;
+        }
+      }
+      // 待办挂了愿望 → 完成它产生的活动带上同一个 wishId，愿望进度才数得到（V2.6 §1.3）
+      const fateBonus = todo.fateDrawnDate === today;
+      // 命运加成会紧接着再记一条：两条只在第二条之后刷新一次内存（第 4 轮，以前跑两整轮 loadData）
+      const result = await get().addActivity(`完成任务: ${todo.title}`, points, 'todo', { important: !!todo.important, wishId: todo.wishId, skipLoad: fateBonus });
+      // 命运加成（TASKS_MERGE_PRD §4.2）：当日抽中并完成 → 主属性额外 +1。
+      // 独立小记录而非改主记录描述——undoTodayTodoCompletion/deleteActivity 都按
+      // 「完成任务: {title}」逐字匹配，动模板会断撤销链；单删本记录也能正确回档
+      if (fateBonus) {
+        const bonus = { knowledge: 0, guts: 0, dexterity: 0, kindness: 0, charm: 0 } as Record<string, number>;
+        bonus[todo.attribute] = 1;
+        await get().addActivity(`命运加成: ${todo.title}`, bonus, 'todo');
+      }
+      await get().checkTodoCompletionAchievements({ skipLoad: true });
+
+      if (!todo.repeatDaily && !todo.isLongTerm) {
+        await db.todos.update(todo.id, { archivedAt: new Date(), completedAt: new Date(), isActive: false });
+      }
+
+      // ✦ 倒计时联动：完成 todo 后扫一遍宣告卡，若关联的全部完成会自动归档；
+      //   归档后 cutInShown=false，App.tsx 顶层会立即弹出"宣告 · 达成"结算屏，
+      //   不需要等用户回到 Dashboard。
+      try {
+        await get().sweepCallingCards();
+      } catch (e) {
+        console.warn('[velvet] sweepCallingCards after completeTodo failed', e);
+      }
+
+      // 一起进步（v2.7.0.6）：完成即打卡；离线 / 失败时下次社交同步补上
+      if (todo.pact) {
+        const pactId = todo.pact.id;
+        void import('@/services/pactSync').then(m => m.onPactTodoCompleted(pactId, today));
+      }
+      // 组织作战（第 8 轮）：同上，完成即在这场作战上打卡
+      if (todo.orgOp) {
+        const { orgId, opId } = todo.orgOp;
+        void import('@/services/orgOpsSync').then(m => m.onOrgOpTodoCompleted(orgId, opId, today));
+      }
+
+      void get().syncNotifications(); // 待办完成 → 重排，撤掉已完成的「今日待办」提醒
+      return result;
+    } else {
+      await get().loadData();
+      return null;
+    }
+  },
+
+  undoTodayTodoCompletion: async (todoId: string) => {
+    // ── 设计契约 ─────────────────────────────────────────
+    // "当天误触" 的语义：把这一次 todo 完成当成从未发生过：
+    //   · 属性点数扣回，level 跌破阈值则下调
+    //   · 历史 activity 记录连同 level_up 副记录一起删掉
+    //   · todoCompletion 计数减 1（=0 则整条删）
+    //   · todo 重新 isActive=true、清掉 completedAt/archivedAt
+    // 实现复用 deleteActivity 已有的事务化撤销（v2.1 改造），保证语义统一。
+    const todo = get().todos.find(t => t.id === todoId);
+    if (!todo) return;
+
+    const today = toLocalDateKey();
+    // 一起进步：撤销完成也撤回今天的打卡
+    if (todo.pact) {
+      const pactId = todo.pact.id;
+      void import('@/services/pactSync').then(m => m.onPactTodoUndone(pactId, today));
+    }
+    const all = await db.activities.toArray();
+    // 注意：completeTodo 的 description 模板是 `完成任务: ${todo.title}`，这里逐字匹配
+    const expectedDesc = `完成任务: ${todo.title}`;
+    const target = all.find(a =>
+      a.method === 'todo'
+      && toLocalDateKey(new Date(a.date)) === today
+      && a.description === expectedDesc,
+    );
+
+    if (target) {
+      await get().deleteActivity(target.id);
+      return;
+    }
+
+    // 兜底：找不到对应活动（例如老数据没记 method='todo'，或描述被改过）
+    // 至少把 todoCompletion / todo 状态还原成"未完成"，否则按钮形同虚设。
+    await db.transaction('rw', [db.todos, db.todoCompletions], async () => {
+      const completion = await db.todoCompletions
+        .where('todoId').equals(todoId)
+        .filter(c => c.date === today)
+        .first();
+      if (completion) {
+        if (completion.count > 1) {
+          await db.todoCompletions.update(completion.id, { count: completion.count - 1 });
+        } else {
+          await db.todoCompletions.delete(completion.id);
+        }
+      }
+      const t = await db.todos.get(todoId);
+      if (t && !t.isActive) {
+        await db.todos.update(todoId, { isActive: true, completedAt: undefined, archivedAt: undefined });
+      }
+    });
+    await get().loadData();
+    // 组织作战：找到记录的那条路径由 deleteActivity 撤回打卡；这里是兜底路径
+    if (todo.orgOp) {
+      const { orgId, opId } = todo.orgOp;
+      void import('@/services/orgOpsSync').then(m => m.onOrgOpTodoUndone(orgId, opId));
+    }
+  },
+
+  // ── BIG DEAL（任务×终端二合一，TASKS_MERGE_PRD 批1）───────────────────
+
+  addTodoStep: async (todoId, title, opts) => {
+    const clean = title.trim();
+    if (!clean) return;
+    const todo = await db.todos.get(todoId);
+    if (!todo?.isBigDeal || todo.clearedActivityId) return;
+    const step: TodoStep = { id: uuidv4(), title: clean, attribute: opts?.attribute, source: opts?.source ?? 'manual' };
+    await db.todos.update(todoId, { steps: [...(todo.steps ?? []), step] });
+    await get().loadData();
+  },
+
+  updateTodoStep: async (todoId, stepId, patch) => {
+    const todo = await db.todos.get(todoId);
+    if (!todo?.isBigDeal) return;
+    await db.todos.update(todoId, {
+      steps: (todo.steps ?? []).map(s => (s.id === stepId ? { ...s, ...patch, title: (patch.title ?? s.title).trim() || s.title } : s)),
+    });
+    await get().loadData();
+  },
+
+  removeTodoStep: async (todoId, stepId) => {
+    const todo = await db.todos.get(todoId);
+    if (!todo?.isBigDeal || todo.clearedActivityId) return;
+    // 已完成子步的删除 = 先撤勾（连点数回档）再移除，避免幽灵点数
+    const step = (todo.steps ?? []).find(s => s.id === stepId);
+    if (step?.done) await get().undoTodoStep(todoId, stepId);
+    const fresh = await db.todos.get(todoId);
+    if (!fresh) return;
+    await db.todos.update(todoId, { steps: (fresh.steps ?? []).filter(s => s.id !== stepId) });
+    await get().loadData();
+  },
+
+  completeTodoStep: async (todoId, stepId) => {
+    // 在途锁：同一子步双击在 addActivity 异步窗口内重入会双发点数
+    if (_completingStepIds.has(stepId)) return null;
+    _completingStepIds.add(stepId);
+    try {
+      const { user } = get();
+      if (!user) return null;
+      const todo = await db.todos.get(todoId);
+      if (!todo?.isBigDeal || !todo.isActive || todo.clearedActivityId) return null;
+      const steps = todo.steps ?? [];
+      const idx = steps.findIndex(s => s.id === stepId);
+      if (idx < 0 || steps[idx].done) return null;
+
+      const doneStep: TodoStep = { ...steps[idx], done: true, doneAt: new Date().toISOString() };
+      const nextSteps = steps.map((s, i) => (i === idx ? doneStep : s));
+      await db.todos.update(todoId, { steps: nextSteps });
+
+      // 子步点数 = 父条目 points，落在子步覆写属性（缺省父属性）；
+      // 描述模板固定带主任务标注（D4：Agent 读记录时识别非独立任务），改动需同步 undoTodoStep 的匹配
+      const attr = doneStep.attribute ?? todo.attribute;
+      const points = { knowledge: 0, guts: 0, dexterity: 0, kindness: 0, charm: 0 } as Record<string, number>;
+      points[attr] = todo.points;
+      const doneCount = nextSteps.filter(s => s.done).length;
+      await get().addActivity(
+        `完成小步: ${doneStep.title}（大事「${todo.title}」第 ${doneCount}/${nextSteps.length} 步）`,
+        points, 'todo',
+        // wishId 随行：大事挂到某个愿望上时，它的每一小步都该算进那个愿望的靠近度（§8）
+        { category: 'bigdeal_step', bigDealId: todoId, wishId: todo.wishId },
+      );
+
+      if (nextSteps.every(s => s.done)) {
+        await get().collapseBigDeal(todoId);
+        return { collapsed: true };
+      }
+      return { collapsed: false };
+    } finally {
+      _completingStepIds.delete(stepId);
+    }
+  },
+
+  undoTodoStep: async (todoId, stepId) => {
+    const todo = await db.todos.get(todoId);
+    // 已收官后不可逐步撤：整体撤销 = 删除收官记录（批4 给入口）
+    if (!todo?.isBigDeal || todo.clearedActivityId) return;
+    const steps = todo.steps ?? [];
+    const step = steps.find(s => s.id === stepId);
+    if (!step?.done) return;
+    await db.todos.update(todoId, { steps: steps.map(s => (s.id === stepId ? { ...s, done: false, doneAt: undefined } : s)) });
+    // 对应 bigdeal_step 记录 → deleteActivity 完整回档（扣点/回算等级/清 level_up 副记录）。
+    // activities 已按日期倒序，find 即取最近一次命中（同名子步取最新，可接受的边界）
+    const act = get().activities.find(a =>
+      a.category === 'bigdeal_step' && a.bigDealId === todoId
+      && a.description.startsWith(`完成小步: ${step.title}（`),
+    );
+    if (act) await get().deleteActivity(act.id);
+    else await get().loadData();
+  },
+
+  collapseBigDeal: async (todoId) => {
+    const todo = await db.todos.get(todoId);
+    if (!todo?.isBigDeal || todo.clearedActivityId) return;
+    const steps = todo.steps ?? [];
+    if (steps.length === 0 || !steps.some(s => s.done) || !steps.every(s => s.done)) return;
+
+    // 触及属性各 +1（D3）：直接承载在收官记录的 pointsAwarded 上——deleteActivity 撤销链路免费继承
+    const touched = new Set<AttributeId>(steps.map(s => s.attribute ?? todo.attribute));
+    const points = { knowledge: 0, guts: 0, dexterity: 0, kindness: 0, charm: 0 } as Record<string, number>;
+    touched.forEach(a => { points[a] = 1; });
+    const { activityId } = await get().addActivity(
+      `大事收官: ${todo.title}（${steps.length} 步全成）`,
+      points, 'todo',
+      { important: true, category: 'bigdeal_clear', bigDealId: todoId, wishId: todo.wishId },
+    );
+
+    // 收官 SP = min(20, 子步数×3)：战场模块关闭不发；从未初始化战场（无 battleState）也不发
+    const spGrant = get().settings.battleEnabled !== false && get().battleState
+      ? Math.min(BIGDEAL_CLEAR_SP_CAP, steps.length * BIGDEAL_CLEAR_SP_PER_STEP)
+      : 0;
+    if (spGrant > 0) await get().earnSP(spGrant);
+    // 收官投稿权 +1（弹幕闭环，结算屏消费）
+    await get().updateSettings({ terminalDanmakuTokens: (get().settings.terminalDanmakuTokens ?? 0) + 1 });
+
+    await db.todos.update(todoId, {
+      clearedActivityId: activityId,
+      completedAt: new Date(),
+      archivedAt: new Date(),
+      isActive: false,
+    });
+    await get().loadData();
+    // 结算屏载荷（App 顶层 BigDealClearCutIn 消费）
+    set({
+      bigDealClear: {
+        todoId,
+        title: todo.title,
+        stepsCount: steps.length,
+        sp: spGrant,
+        attrs: Array.from(touched),
+      },
+    });
+    void get().syncNotifications();
+  },
+
+  clearBigDealClear: () => set({ bigDealClear: null }),
+
+  dismissOrphanImagesPrompt: () => set({ orphanImagesPrompt: null }),
+  pruneOrphanImages: async () => {
+    set({ orphanImagesPrompt: null });
+    return pruneOrphanActivityImages();
+  },
+
+  getBigDealProgress: (todoId) => {
+    const todo = get().todos.find(t => t.id === todoId);
+    const steps = todo?.steps ?? [];
+    return {
+      done: steps.filter(s => s.done).length,
+      total: steps.length,
+      nextStep: steps.find(s => !s.done) ?? null,
+    };
+  },
+
+  decomposeBigDealAI: async (todoId) => {
+    const todo = get().todos.find(t => t.id === todoId);
+    if (!todo?.isBigDeal) return [];
+    // 复用 decomposeWishAI：把大事映射成伪 Wish 树，避重/限量/清洗逻辑免费继承
+    const parent: Wish = {
+      id: todo.id,
+      title: todo.title,
+      kind: todo.deadline ? 'pressure' : 'long_term',
+      currentState: todo.currentState,
+      status: 'active',
+      source: 'manual',
+      createdAt: new Date(todo.createdAt),
+    };
+    const children: Wish[] = (todo.steps ?? []).map(s => ({
+      id: s.id,
+      parentId: todo.id,
+      title: s.title,
+      status: s.done ? 'done' : 'active',
+      source: s.source,
+      createdAt: new Date(todo.createdAt),
+    }));
+    return get().decomposeWishAI(parent, children);
+  },
+
+  rebuildBigDeal: async (todoId: string) => {
+    const old = await db.todos.get(todoId);
+    if (!old || !old.isBigDeal) return null;
+    // 旧的原样归档（保留 clearedActivityId，历史与统计不受影响）
+    await db.todos.put({ ...old, isActive: false, archivedAt: old.archivedAt ?? new Date() });
+    // 新的：同名同步骤，子步全部重置为未完成，清掉收官痕迹
+    const fresh: Todo = {
+      ...old,
+      id: uuidv4(),
+      isActive: true,
+      createdAt: new Date(),
+      archivedAt: undefined,
+      completedAt: undefined,
+      clearedActivityId: undefined,
+      fateDrawnDate: undefined,
+      steps: (old.steps ?? []).map(st => ({ ...st, id: uuidv4(), done: false, doneAt: undefined })),
+    };
+    await db.todos.put(fresh);
+    await get().loadData();
+    return fresh.id;
+  },
+
+  runTasksMergeMigration: async () => {
+    /**
+     * 没有档案就直接返回——**这不只是省一次空跑**。
+     *
+     * App 启动时这条紧跟在 initializeApp 后面无条件调用；全新安装那一刻 users 表是空的，
+     * 引导页还开着，可这里照样往下走，末尾的 `loadData()` 会把 24 条系统预设成就
+     * 抢先补种进库（且用的是默认属性名）。等用户走完引导按下「接受赐福」，
+     * createUser 的 `achievements.bulkAdd` 就整批撞 ConstraintError 抛出 ——
+     * users/attributes 已落库、skills 与 settings 全没写成、set({user}) 没执行，
+     * 于是引导页原地卡死（用户上报「点了没反应」），重启却因为 users 表有行直接进首页，
+     * 带着一个没有技能、没有赐福、属性名被打回默认的残档。
+     * createUser 那侧已改 bulkPut 兜底，这里是第一道闸。
+     */
+    if (!get().user) return;
+    if (_tasksMergeMigrationPromise) return _tasksMergeMigrationPromise;
+    _tasksMergeMigrationPromise = (async () => {
+    if (get().settings.tasksMergeMigratedAt) return;
+    const wishes = await db.wishes.toArray();
+    // 轻量恢复保险：原始 wishes 全量快照进 localStorage（数据量小；隐私模式失败不阻塞）
+    try { localStorage.setItem('velvet:wishes-premigrate', JSON.stringify(wishes)); } catch { /* ignore */ }
+
+    const roots = wishes.filter(w => !w.parentId);
+    for (const root of roots) {
+      // 已完成/已归档的根不迁移（历史在 activities 里）；对应子步一并清走避免孤儿
+      const children = wishes.filter(w => w.parentId === root.id);
+      if (root.status !== 'active') {
+        if (children.length) for (const c of children) await db.wishes.delete(c.id);
+        if (root.status === 'archived') await db.wishes.delete(root.id);
+        continue;
+      }
+      // 无子步的活跃根 → 原地留作愿望纸片（D8）
+      if (children.length === 0) continue;
+
+      // 带子步的根 → BIG DEAL：children 全量成子步；stepHistory 里无对应 child 的完成项补录为已完成子步
+      const steps: TodoStep[] = children
+        .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
+        .map(c => ({
+          id: c.id,
+          title: c.title,
+          attribute: c.attribute,
+          done: c.status === 'done',
+          doneAt: c.status === 'done' ? new Date(c.archivedAt ?? c.createdAt).toISOString() : undefined,
+          source: c.source,
+        }));
+      const childIds = new Set(children.map(c => c.id));
+      for (const h of root.stepHistory ?? []) {
+        if (h.sourceStepId && childIds.has(h.sourceStepId)) continue;
+        steps.push({ id: h.id, title: h.title, done: true, doneAt: h.completedAt, source: 'manual' });
+      }
+      const todo: Todo = {
+        id: uuidv4(),
+        title: root.title,
+        attribute: root.attribute ?? 'guts',
+        points: 2,
+        frequency: 'single',
+        isActive: true,
+        createdAt: new Date(root.createdAt),
+        isBigDeal: true,
+        steps,
+        currentState: root.currentState,
+      };
+      // 注：迁移时即使 steps 全 done 也不自动收官——收官是有奖励的仪式，留给用户在批2 面板里主动按
+      await db.todos.add(todo);
+      await db.wishes.delete(root.id);
+      for (const c of children) await db.wishes.delete(c.id);
+    }
+
+    // 在途 24h 终端卡 → 静默归档（终端不再有入口，防止孤儿活跃卡）
+    const cards = await db.callingCards.toArray();
+    for (const c of cards) {
+      if (c.terminal && !c.archived) {
+        await db.callingCards.update(c.id, { archived: true, archivedAt: new Date(), archiveReason: 'manual' as const });
+      }
+    }
+
+    await get().updateSettings({ tasksMergeMigratedAt: new Date().toISOString() });
+    await get().loadData();
+    await get().loadWishes();
+    await get().loadCallingCards();
+    })();
+    // 跑完即释放这把锁：它只用来防"同一时刻并发进入"，**不是**幂等守卫——
+    // 幂等由 settings.tasksMergeMigratedAt 负责。原来跑完不释放，
+    // 于是「云端拉回一份来自未迁移设备的数据」之后，本会话再也不会补迁移（FS7 审查）。
+    _tasksMergeMigrationPromise.finally(() => { _tasksMergeMigrationPromise = null; });
+    return _tasksMergeMigrationPromise;
+  },
+
+  // ── 抽签（TASKS_MERGE_PRD §4.2 批3）────────────────────────────────────
+
+  getFateDrawPool: () => {
+    const today = toLocalDateKey();
+    const st = get().settings.fateDrawState;
+    const sunk = new Set(st && st.date === today ? st.drawnKeys : []);
+    const pool: FateCandidate[] = [];
+
+    // ① 今日未完成待办（义务；大事已被 getDueTodosToday 排除）
+    for (const t of get().getDueTodosToday()) {
+      if (get().getTodayTodoProgress(t.id).isComplete) continue;
+      pool.push({ key: `todo:${t.id}`, kind: 'todo', title: t.title, todoId: t.id, weight: FATE_SOURCE_WEIGHT.todo });
+    }
+    // ② 愿望纸片（新鲜感；迁移后 wishes 表只剩平铺条目）
+    for (const w of get().wishes) {
+      if (w.parentId || w.status !== 'active') continue;
+      pool.push({ key: `wish:${w.id}`, kind: 'wish', title: w.title, wishId: w.id, attribute: w.attribute ?? 'guts', points: 2, weight: FATE_SOURCE_WEIGHT.wish });
+    }
+    // ③ 旧事（第 17 批重做，见 utils/fateDraw）：近 60 天里至少两天做过的事，今天昨天做过的不出、隔得越久越容易抽到，
+    //    最多 2 张；「以后别抽这件」的不出。以前是近 30 天每条手记都进、不看次数，一次性的事也老被抽到
+    const { user, settings, activities, todos, todoCompletions } = get();
+    const seedKey = user?.id ?? user?.name ?? 'me';
+    pool.push(...fateHistoryCandidates({ activities, today, muted: settings.fateHistoryMuted, sunk, seed: seedKey }));
+    // ④ 今日委托（第 17 批）：今天这批里还没加进清单的。委托板没打开过也替今天定好这一批，和委托板是同一批。
+    //    自定义属性名、AI 对应关系还在路上：这次先不放委托（别用「改过名的几类不出」的残缺版定下一整天），顺手催它开工
+    try {
+      void ensureLifeQuestAttrMap(settings, (patch) => get().updateSettings(patch));
+      const day = ensureLifeQuestDay({ todayKey: today, seedKey, activities, todos, completions: todoCompletions, settings, waitForAttrMap: lifeAttrMapStatus(settings) === 'pending' });
+      const aiCard = settings.lifeQuestAiCard ? readLifeQuestAiCard(seedKey, today) : null;
+      for (const q of [...(day?.items ?? []), ...(aiCard ? [aiCard] : [])]) {
+        const added = todos.some(t => lifeDayKeyOf(t.createdAt) === today && (t.lifeQuest === q.presetId || normTitle(t.title) === normTitle(q.title)));
+        if (added) continue;
+        pool.push({ key: `quest:${q.presetId}`, kind: 'quest', title: q.title, presetId: q.presetId, attribute: q.attribute, points: q.points, weight: FATE_SOURCE_WEIGHT.quest });
+      }
+    } catch (e) {
+      console.warn('[velvet] 抽签取今日委托失败', e);
+    }
+    return pool.filter(c => !sunk.has(c.key));
+  },
+
+  drawFate: async (pool) => {
+    const today = toLocalDateKey();
+    const candidates = pool ?? get().getFateDrawPool();
+    if (candidates.length === 0) return null;
+    // 按来源加权（第 17 批）：今日待办 > 愿望 > 今日委托 = 旧事；旧事再按「隔了多久」加权
+    const picked = pickWeighted(candidates) ?? candidates[0];
+    // 今日委托被翻到：学取舍记一笔「翻到过」（和委托板轮播里翻到同一口径）
+    if (picked.kind === 'quest' && picked.presetId) {
+      const u = get().user;
+      recordLifeQuestEvent(u?.id ?? u?.name ?? 'me', today, 'viewed', [picked.presetId]);
+    }
+    const st = get().settings.fateDrawState;
+    const drawnKeys = st && st.date === today ? [...st.drawnKeys, picked.key] : [picked.key];
+    await get().updateSettings({ fateDrawState: { date: today, drawnKeys } });
+    return picked;
+  },
+
+  acceptFateDraw: async (c) => {
+    const today = toLocalDateKey();
+    if (c.kind === 'todo' && c.todoId) {
+      await db.todos.update(c.todoId, { fateDrawnDate: today });
+      await get().loadData();
+      return;
+    }
+    // 愿望转正 / 历史复刻 / 今日委托 → 今日一次性任务（带签）
+    const todo: Todo = {
+      id: uuidv4(),
+      title: c.title,
+      attribute: c.attribute ?? 'guts',
+      points: c.points ?? 2,
+      frequency: 'single',
+      isActive: true,
+      createdAt: new Date(),
+      fateDrawnDate: today,
+      // 今日委托：带上预设 id，委托板显示「已加入」、本周委托「完成 3 张今日委托」也数它（第 17 批）
+      ...(c.kind === 'quest' && c.presetId ? { lifeQuest: c.presetId } : {}),
+    };
+    await db.todos.add(todo);
+    if (c.kind === 'wish' && c.wishId) {
+      // 纸片转正即离场（archived；完成与否由任务本体承接）
+      const w = await db.wishes.get(c.wishId);
+      if (w) await db.wishes.put({ ...w, status: 'archived', archivedAt: new Date() });
+      await get().loadWishes();
+    }
+    await get().loadData();
+  },
+
+  muteFateHistory: async (c) => {
+    if (c.kind !== 'history' || !c.key.startsWith('hist:')) return;
+    const key = c.key.slice(5);
+    const cur = get().settings.fateHistoryMuted ?? [];
+    if (cur.includes(key)) return;
+    // 只留最近 200 条，免得设置越滚越大
+    await get().updateSettings({ fateHistoryMuted: [...cur, key].slice(-200) });
+  },
+
+  applySkillBonus: (attributeId: string, points: number) => {
+    const { skills } = get();
+    const unlockedSkills = skills.filter(s => s.unlocked && s.requiredAttribute === attributeId);
+
+    let totalBonus = 1;
+    let totalFlat = 0;
+    for (const skill of unlockedSkills) {
+      if (skill.bonusMultiplier) {
+        totalBonus *= skill.bonusMultiplier;
+      }
+      if (skill.flatBonus) {
+        totalFlat += skill.flatBonus;
+      }
+    }
+    // 第 13 轮：总倍数封顶（自定义技能可以堆到 ×9、×27……）；乘算先于 flat 加算
+    totalBonus = Math.min(SKILL_BONUS_MULT_CAP, totalBonus);
+
+    const boosted = Math.round(points * totalBonus) + totalFlat;
+    if (totalBonus > 1 && boosted === points + totalFlat) {
+      return points + totalFlat + 1;
+    }
+    return boosted;
+  },
+
+  // ── 总结功能 ─────────────────────────────────────────────
+
+  getSummaryLabel: (period: SummaryPeriod, startDate: string): string => {
+    const d = new Date(startDate);
+    if (period === 'month') {
+      return `${d.getFullYear()}年${d.getMonth() + 1}月`;
+    }
+    // week: compute ISO week number
+    const jan1 = new Date(d.getFullYear(), 0, 1);
+    const weekNo = Math.ceil(((d.getTime() - jan1.getTime()) / 86400000 + jan1.getDay() + 1) / 7);
+    return `${d.getFullYear()}年第${weekNo}周`;
+  },
+
+  getActiveSummaryPreset: (): SummaryPromptPreset => getActiveSummaryPresetAI(get().settings),
+
+  loadSummaries: async () => {
+    // 按「哪一期最近结束」排、同一天结束的长的在前：按起始日排的话，年度总结（1/1 起）会沉到当年所有月报下面
+    const summaries = (await db.summaries.toArray())
+      .sort((a, b) => b.endDate.localeCompare(a.endDate) || a.startDate.localeCompare(b.startDate));
+    set({ summaries });
+  },
+
+  saveSummary: async (summary: PeriodSummary) => {
+    await db.summaries.put(summary);
+    await get().loadSummaries();
+    void get().syncNotifications(); // 新总结默认未读 → 安排「未读成长总结」提醒
+  },
+
+  markSummaryViewed: async (id: string) => {
+    const { summaries } = get();
+    const target = summaries.find(s => s.id === id);
+    if (!target || target.viewedAt) return; // 不存在或已读 → 跳过
+    const viewedAt = new Date();
+    await db.summaries.update(id, { viewedAt });
+    set({ summaries: summaries.map(s => (s.id === id ? { ...s, viewedAt } : s)) });
+    void get().syncNotifications(); // 已读后撤掉「未读成长总结」提醒
+  },
+
+  syncNotifications: () => {
+    const run = () => {
+      const p = notifSyncPending;
+      notifSyncPending = null;
+      if (!p) return;
+      get().syncNotificationsNow()
+        .catch(e => console.warn('[velvet] syncNotifications failed', e))
+        .finally(() => p.resolve());
+    };
+    if (notifSyncPending) {
+      clearTimeout(notifSyncPending.timer);
+      notifSyncPending.timer = setTimeout(run, 250);
+      return notifSyncPending.promise;
+    }
+    let resolve: () => void = () => {};
+    const promise = new Promise<void>(r => { resolve = r; });
+    notifSyncPending = { promise, resolve, timer: setTimeout(run, 250) };
+    return promise;
+  },
+
+  syncNotificationsNow: async () => {
+    const { settings, dailyDivination, todos, summaries, activities } = get();
+    const todayKey = toLocalDateKey();
+    // v2.7.0.6：老用户含「今日待办」的时段补上「一起进步」（只补一次；updateSettings 触发的那次重排因标记已置不会再进来）
+    let slots = settings.notificationSlots ?? [];
+    if (!settings.notifTogetherAdded && slots.length) {
+      if (!slots.some(s => s.contents.includes('together'))) {
+        slots = slots.map(s => (s.contents.includes('todos') ? { ...s, contents: [...s.contents, 'together'] } : s));
+      }
+      void get().updateSettings({ notificationSlots: slots, notifTogetherAdded: true });
+    }
+    // 第 6 轮：老用户含「今日塔罗」的时段补上「委托板」（只补一次）
+    if (!settings.notifQuestsAdded && slots.length) {
+      if (!slots.some(s => s.contents.includes('quests'))) {
+        slots = slots.map(s => (s.contents.includes('tarot') ? { ...s, contents: [...s.contents, 'quests'] } : s));
+      }
+      void get().updateSettings({ notificationSlots: slots, notifQuestsAdded: true });
+    }
+    const questWeek = await db.quests.where('weekKey').equals(weekRangeOf(new Date()).weekKey).toArray();
+    const dueTodos = todos.filter(t =>
+      t.isActive && !t.archivedAt && (!t.startDate || t.startDate <= todayKey),
+    );
+    const snapshot: NotifSnapshot = {
+      enabled: !!settings.notificationsEnabled,
+      slots,
+      attributeNames: settings.attributeNames,
+      tarotDrawnToday: !!dailyDivination && dailyDivination.date === todayKey,
+      incompleteTodoCount: dueTodos.filter(t => !get().getTodayTodoProgress(t.id).isComplete).length,
+      hasActiveDailyTodos: dueTodos.some(t => t.repeatDaily),
+      countercurrentWarnings: get().getCountercurrentWarnings(),
+      // 只提醒「新报告」一次（v2.7.0.6）：写好 7 天内、未读、推送还没送达过
+      summaryNotice: (() => {
+        const fresh = freshUnreadSummary(summaries);
+        return fresh && !reportPushDelivered(fresh.id) ? { id: fresh.id } : null;
+      })(),
+      loggedToday: activities.some(a => !a.category && toLocalDateKey(new Date(a.date)) === todayKey),
+      // 委托板（第 6 轮）：解锁了才在周一提；本周三张都领了就不提
+      questBoardUnlocked: questBoardUnlocked(activities),
+      questsAllClaimedThisWeek: questWeek.length >= 3 && questWeek.every(q => !!q.claimedAt),
+      // 一起进步（v2.7.0.6）：今天还没完成的约定，被催过的优先
+      together: pickTogetherReminder(todos, useCloudSocialStore.getState().pacts, todayKey, id => get().getTodayTodoProgress(id).isComplete),
+      // 组织（第 7 轮）：这一场（或下一场）周日会议还没写下周目标的组织；提醒默认不开，用户在提醒设置里勾「据点会议」
+      orgMeeting: meetingReminder(useCloudSocialStore.getState().orgs),
+      // 助手口吻（v2.7 notifVoice）：只取当日缓存，绝不在这里等生成——先排内置文案
+      aiCopy: settings.notifAIVoice ? getCachedNotifVoice(settings.navigatorPresetId ?? 'board') : null,
+    };
+    // 后台刷新（档 2）跟着提醒设置走：关了提醒 / 各时段都去掉「一起进步」，后台也不再弹催促
+    void import('@/services/pactBackground').then(m => m.setPactRunnerEnabled(
+      !!settings.notificationsEnabled && slots.some(s => s.enabled && s.contents.includes('together')),
+    ));
+    try {
+      const outcome = await computeAndSchedule(snapshot);
+      // 记下这份报告排到了哪一刻：那一刻一过就算送达，之后的重排不再排它
+      if (snapshot.summaryNotice && outcome.summaryAt) markReportPushScheduled(snapshot.summaryNotice.id, outcome.summaryAt);
+    } catch (e) {
+      console.warn('[notifications] sync failed', e);
+    }
+    // 助手找你（第二批 C）：自己一段通知 ID，和时段提醒同一个触发点（判送达 → 重算 → 撤旧排新）
+    void import('@/utils/navigatorPush').then(m => m.syncAssistantPush(get().settings)).catch(() => {});
+    // 缓存未命中则后台生成，货到重排（幂等：生成成功后缓存命中，不会循环）
+    refreshNotifVoiceIfNeeded(settings, () => void get().syncNotifications());
+    // 桌面小组件快照（PRD_V2.6 §8）搭这趟车：
+    // syncNotifications 的触发点（记录/勾任务/抽塔罗/改设置）恰好就是
+    // 组件需要重画的时机，不必再铺一套自己的钩子。内部自带指纹去重与静默失败。
+    void pushWidgetSnapshot();
+  },
+
+  deleteSummary: async (id: string) => {
+    await db.summaries.delete(id);
+    await get().loadSummaries();
+  },
+
+  /**
+   * 成长总结的请求组装（v2.7.0.6 迁到 utils/summaryAI）：简报 + 手记 + 写法规则 + 分档。
+   * 这里只是把 settings / attributes 递过去，方便组件从 store 一处取。
+   */
+  buildSummaryRequest: async (period: SummaryPeriod, startDate: string, endDate: string, opts?: { signal?: AbortSignal }): Promise<SummaryRequestData> => {
+    const { settings, attributes } = get();
+    return buildSummaryRequestAI({ settings, attributes, period, startDate, endDate, signal: opts?.signal });
+  },
+
+  // ── 本周目标 ─────────────────────────────────────────────
+
+  saveWeeklyGoal: async (goal: WeeklyGoal) => {
+    await db.weeklyGoals.put(goal);
+    await get().loadData();
+  },
+
+  deleteWeeklyGoal: async (id: string) => {
+    await db.weeklyGoals.delete(id);
+    await get().loadData();
+  },
+
+  completeWeeklyGoal: async (id: string, rewardAttribute: AttributeId) => {
+    const goal = await db.weeklyGoals.get(id);
+    if (!goal || goal.completed) return;
+
+    // 奖励点数：LV3+ 7, 否则 5
+    const { attributes, user } = get();
+    const attr = attributes.find(a => a.id === rewardAttribute);
+    const rewardPoints = (attr && attr.level >= 3) ? 7 : 5;
+
+    // 标记完成
+    await db.weeklyGoals.update(id, {
+      completed: true,
+      completedAt: new Date(),
+      rewardAttribute,
+      rewardPoints,
+    });
+
+    if (user) {
+      // 直接加点（不经过 addActivity 的每日事件倍率 / 技能加成）
+      if (attr) {
+        const newPoints = attr.points + rewardPoints;
+        const newLevel = levelForPoints(newPoints, thresholdsOf(get().settings, attr));
+        await db.attributes.update(attr.id, { points: newPoints, level: newLevel });
+      }
+
+      // 记入历史记录
+      const rewardAttrName = get().settings.attributeNames[rewardAttribute] || rewardAttribute;
+      const pointsAwarded = { knowledge: 0, guts: 0, dexterity: 0, kindness: 0, charm: 0 };
+      pointsAwarded[rewardAttribute] = rewardPoints;
+      await db.activities.add({
+        id: uuidv4(),
+        userId: user.id,
+        date: new Date(),
+        description: `本周目标达成！奖${rewardAttrName} +${rewardPoints}${goal.reward ? `{goal.reward}）` : ''}`,
+        pointsAwarded,
+        method: 'local' as const,
+        important: true,
+        category: 'weekly_goal',
+      });
+    }
+
+    // 检查计划通等每周目标完成成就
+    await get().checkWeeklyGoalAchievements({ skipLoad: true });
+
+    await get().loadData();
+  },
+
+  getWeeklyGoalProgress: (goal: WeeklyGoal): WeeklyGoalItem[] => {
+    const { activities, todoCompletions } = get();
+    const start = goal.weekStart;
+    const end = goal.weekEnd;
+
+    // 本周活动
+    const weekActivities = activities.filter(a => {
+      const d = toLocalDateKey(new Date(a.date));
+      return d >= start && d <= end && !a.category; // 排除系统活动
+    });
+
+    // 本周任务完成
+    const weekTodoCompletions = todoCompletions.filter(c => c.date >= start && c.date <= end);
+    const totalTodoCount = weekTodoCompletions.reduce((s, c) => s + c.count, 0);
+
+    return goal.goals.map(g => {
+      let current = 0;
+      switch (g.type) {
+        case 'activity_count':
+          current = weekActivities.filter(a => {
+            if (!g.attribute) return true;
+            return (a.pointsAwarded[g.attribute as keyof typeof a.pointsAwarded] || 0) > 0;
+          }).length;
+          break;
+        case 'todo_count':
+          current = totalTodoCount;
+          break;
+        case 'attr_points':
+          if (g.attribute) {
+            current = weekActivities.reduce((s, a) =>
+              s + (a.pointsAwarded[g.attribute as keyof typeof a.pointsAwarded] || 0), 0);
+          }
+          break;
+        case 'total_points':
+          current = weekActivities.reduce((s, a) =>
+            s + Object.values(a.pointsAwarded).reduce((x, y) => x + y, 0), 0);
+          break;
+      }
+      return { ...g, current };
+    });
+  },
+
+  // ── 逆流 ─────────────────────────────────────────────────
+
+  /** 共用：判断某属性过lookback 天（不含今天）是否有正向增长 */
+
+  // 返回今天需要扣减的属性列表（连续3日无增长，且今天还未扣减过）
+  // 3日窗口为 today-3 .. today-1，且需早于 countercurrentEnabledAt+3 才会触发
+  applyCountercurrentDecay: async (): Promise<AttributeId[]> => {
+    const { settings, attributes, user } = get();
+    if (!settings.countercurrentEnabled || !user) return [];
+
+    const ATTR_IDS: AttributeId[] = ['knowledge', 'guts', 'dexterity', 'kindness', 'charm'];
+    const todayKey = toLocalDateKey();
+    const decayed: AttributeId[] = [];
+
+    // Must have been enabled at least 3 full days ago for decay to possibly fire
+    if (settings.countercurrentEnabledAt) {
+      const enabledDate = new Date(settings.countercurrentEnabledAt + 'T00:00:00');
+      const todayDate = new Date(todayKey + 'T00:00:00');
+      const daysSinceEnabled = Math.floor((todayDate.getTime() - enabledDate.getTime()) / 86400000);
+      if (daysSinceEnabled < 3) return [];
+    }
+
+    // Past 3 days (today-1, today-2, today-3) all 3 must have no growth
+    const dayKeys: string[] = [];
+    for (let i = 1; i <= 3; i++) {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      dayKeys.push(toLocalDateKey(d));
+    }
+
+    const activities = await db.activities.toArray();
+
+    for (const attrId of ATTR_IDS) {
+      const attr = attributes.find(a => a.id === attrId);
+      if (!attr) continue;
+      if (attr.points <= 0) continue;
+
+      // No growth in past 3 days?
+      const hadGrowth = dayKeys.some(dk =>
+        activities.some(a =>
+          toLocalDateKey(new Date(a.date)) === dk &&
+          !a.category &&
+          (a.pointsAwarded[attrId as keyof typeof a.pointsAwarded] || 0) > 0
+        )
+      );
+      if (hadGrowth) continue;
+
+      // Today's decay not yet applied
+      const alreadyDecayed = activities.some(a =>
+        toLocalDateKey(new Date(a.date)) === todayKey &&
+        a.category === 'countercurrent' &&
+        (a.pointsAwarded[attrId as keyof typeof a.pointsAwarded] || 0) < 0
+      );
+      if (alreadyDecayed) continue;
+
+      decayed.push(attrId);
+    }
+
+    if (decayed.length === 0) return [];
+
+    for (const attrId of decayed) {
+      const attr = attributes.find(a => a.id === attrId);
+      if (!attr) continue;
+      const newPoints = Math.max(0, attr.points - 1);
+      const newLevel = levelForPoints(newPoints, thresholdsOf(settings, attr));
+      await db.attributes.update(attrId, { points: newPoints, level: newLevel });
+
+      const attrName = settings.attributeNames[attrId] || attrId;
+      const pointsAwarded = { knowledge: 0, guts: 0, dexterity: 0, kindness: 0, charm: 0 };
+      pointsAwarded[attrId] = -1;
+      await db.activities.add({
+        id: uuidv4(),
+        userId: user.id,
+        date: new Date(),
+        description: `逆流 ${attrName} -1（连日无增长）`,
+        pointsAwarded,
+        method: 'local' as const,
+        important: false,
+        category: 'countercurrent' as Activity['category'],
+      });
+    }
+
+    await get().loadData();
+    return decayed;
+  },
+
+  // 返回明天将要扣减的属性（今天是连续无增长天，明天会触decay  // 逻辑：今+ 过去2天（天）均无增长，且今天没有decay记录（已经decay就不再预警）  // 且距离开启日至少2 天（否则明天也不会触发）
+  // ── F5 心相记账 ──────────────────────────────────────────
+  loadLedger: async () => {
+    const [ledgerEntries, budgets, assets] = await Promise.all([
+      db.ledgerEntries.toArray(),
+      db.budgets.toArray(),
+      db.assets.toArray(),
+    ]);
+    set({ ledgerEntries, budgets, assets, ledgerLoaded: true });
+    await get().ensureBudgetCarry();
+  },
+
+  addLedgerEntry: async (input) => {
+    const entry: LedgerEntry = {
+      ...input,
+      amount: roundMoney(input.amount),
+      id: uuidv4(),
+      currency: input.currency ?? get().settings.currency ?? 'CNY',
+      createdAt: new Date(),
+    };
+    await db.ledgerEntries.put(entry);
+    set({ ledgerEntries: [...get().ledgerEntries, entry] });
+    return entry;
+  },
+
+  deleteLedgerEntry: async (id) => {
+    const entry = get().ledgerEntries.find(e => e.id === id);
+    // 回收落账时发放的奖励，封堵「增→删」刷分（H1/M3）
+    if (entry?.reward) {
+      if (entry.reward.attr) {
+        try { await get().deleteActivity(entry.reward.attr.activityId); } catch { /* 活动可能已被手动删除 */ }
+      }
+      if (entry.reward.sp > 0 && get().battleState) {
+        const bs = get().battleState!;
+        await get().saveBattleState({
+          ...bs,
+          sp: Math.max(0, bs.sp - entry.reward.sp),
+          totalSpEarned: Math.max(0, bs.totalSpEarned - entry.reward.sp),
+        });
+      }
+      // 注意：不回退当日封顶计数（ledgerSpToday 等），使同日反复「增→删」仍被 20/日 上限挡住。
+    }
+    await db.ledgerEntries.delete(id);
+    set({ ledgerEntries: get().ledgerEntries.filter(e => e.id !== id) });
+  },
+
+  setBudget: async (period, patch) => {
+    const existing = get().budgets.find(b => b.period === period);
+    const budget: Budget = existing
+      ? { ...existing, ...patch }
+      : { id: period, period, createdAt: new Date(), ...patch };
+    await db.budgets.put(budget);
+    set({ budgets: [...get().budgets.filter(b => b.period !== period), budget] });
+  },
+
+  ensureBudgetCarry: async () => {
+    const s = get().settings;
+    if (s.ledgerEnabled === false || get().ledgerEntries.length === 0) return; // 没开记账 / 新用户（开局引导）不碰
+    const key = ledgerCycle(s.ledgerPayCycleEnabled === true, s.ledgerResetDay ?? 1, toLocalDateKey()).key;
+    if (get().budgets.some(b => b.period === key)) return;
+    // 往前找最近一期设过的花费上限（最多 12 期）；只沿用上限，省钱挑战每期自己立（用户拍板「新周期沿用上期预算」）
+    for (let i = 1; i <= 12; i++) {
+      const prev = get().budgets.find(b => b.period === shiftMonth(key, -i));
+      if (prev?.monthlyLimit != null && prev.monthlyLimit > 0) {
+        await get().setBudget(key, { monthlyLimit: prev.monthlyLimit, carriedFrom: prev.period });
+        return;
+      }
+    }
+  },
+
+  adjustTotalBalance: async (targetTotal) => {
+    // 老入口（总余额一个数）：差额记到「未分配」，走同一套轮次逻辑
+    const unassigned = get().getAccountBalances().find(a => a.unassigned)?.balance ?? 0;
+    const delta = roundMoney(targetTotal - get().getTotalBalance());
+    return get().adjustAccountBalances([{ account: null, target: roundMoney(unassigned + delta) }]);
+  },
+
+  getAccountBalances: () => {
+    const names = get().settings.ledgerChannels ?? DEFAULT_CHANNELS;
+    const sums = new Map<string, number>();
+    for (const n of names) sums.set(n, 0);
+    let unassigned = 0;
+    let hasUnassigned = false;
+    for (const e of get().ledgerEntries) {
+      const delta = e.direction === 'income' ? e.amount : e.direction === 'expense' ? -e.amount : e.amount;
+      const ch = (e.channel ?? '').trim();
+      if (!ch) { unassigned += delta; hasUnassigned = true; continue; }
+      sums.set(ch, (sums.get(ch) ?? 0) + delta);
+    }
+    const out: AccountBalance[] = [...sums.entries()].map(([name, balance]) => ({ name, balance: roundMoney(balance), isDebt: isDebtAccount(name), unassigned: false }));
+    if (hasUnassigned) out.push({ name: UNASSIGNED_ACCOUNT, balance: roundMoney(unassigned), isDebt: false, unassigned: true });
+    return out;
+  },
+
+  adjustAccountBalances: async (targets) => {
+    // 开局「设置当前余额」（还没有任何流水）：不占每月 3 轮名额，备注区分开
+    const initial = get().ledgerEntries.length === 0;
+    if (!initial && get().getAdjustCountThisMonth() >= 3) {
+      return { ok: false, reason: '本月对账已用完 3 轮' };
+    }
+    const balances = get().getAccountBalances();
+    const roundId = uuidv4();
+    const today = toLocalDateKey();
+    for (const t of targets) {
+      const cur = t.account
+        ? (balances.find(a => !a.unassigned && a.name === t.account)?.balance ?? 0)
+        : (balances.find(a => a.unassigned)?.balance ?? 0);
+      const delta = roundMoney(t.target - cur);
+      if (Math.abs(delta) < 0.005) continue;
+      await get().addLedgerEntry({
+        direction: 'adjust',
+        amount: delta,
+        date: today,
+        source: 'manual',
+        note: initial ? '初始余额' : '余额对账',
+        channel: t.account ?? undefined,
+        adjustRound: roundId,
+      });
+    }
+    return { ok: true };
+  },
+
+  getTotalBalance: () => {
+    return roundMoney(get().ledgerEntries.reduce((sum, e) => {
+      if (e.direction === 'income') return sum + e.amount;
+      if (e.direction === 'expense') return sum - e.amount;
+      return sum + e.amount; // adjust：可正可负
+    }, 0));
+  },
+
+  // 按「周期」（日历月或发薪日周期，依 settings.ledgerPayCycleEnabled）统计支出/收入（M4）。
+  // 口径（第 13 轮统一）：对账调整（adjust）既不算收入也不算支出，只进余额——此前页面把正向对账算进收入、
+  // 统计忽略、结算算「未记流水」，三处不一致。
+  getPeriodExpense: (periodKey) => {
+    const s = get().settings;
+    const [start, end] = cycleRangeForKey(!!s.ledgerPayCycleEnabled, s.ledgerResetDay ?? 1, periodKey);
+    return roundMoney(get().ledgerEntries
+      .filter(e => e.direction === 'expense' && e.date >= start && e.date <= end)
+      .reduce((a, e) => a + e.amount, 0));
+  },
+  getPeriodIncome: (periodKey) => {
+    const s = get().settings;
+    const [start, end] = cycleRangeForKey(!!s.ledgerPayCycleEnabled, s.ledgerResetDay ?? 1, periodKey);
+    return roundMoney(get().ledgerEntries
+      .filter(e => e.direction === 'income' && e.date >= start && e.date <= end)
+      .reduce((a, e) => a + e.amount, 0));
+  },
+
+  getBudget: (period) => {
+    const p = period ?? toLocalDateKey().slice(0, 7);
+    return get().budgets.find(b => b.period === p);
+  },
+
+  // 本月对账用了几轮：同一轮（一次按账户校准）写的几条共享 adjustRound；老数据没有轮次 id 的一条算一轮
+  getAdjustCountThisMonth: () => {
+    const p = toLocalDateKey().slice(0, 7);
+    const rounds = new Set<string>();
+    let legacy = 0;
+    for (const e of get().ledgerEntries) {
+      if (e.direction !== 'adjust' || e.note === '初始余额' || e.date.slice(0, 7) !== p) continue;
+      if (e.adjustRound) rounds.add(e.adjustRound); else legacy++;
+    }
+    return rounds.size + legacy;
+  },
+
+  // 发放记账 SP：bonus=true（劳动/值得/月末）不占每日封顶；普通每笔受 20/日封顶。
+  // 无 battleState（未启用战场）→ SP 无处可放，静默跳过。
+  earnLedgerSp: async (amount, tier = 'regular') => {
+    if (!get().battleState || amount <= 0) return 0;
+    const today = toLocalDateKey();
+    const st = ledgerDailyState(get().settings, today);
+    // regular（每笔 +2）受 20/日；bonus（劳动/值得）另设 20/日封顶；flat（月末奖励）不封顶、不计数
+    const grant = tier === 'regular' ? Math.min(amount, Math.max(0, 20 - st.sp))
+                : tier === 'bonus' ? Math.min(amount, Math.max(0, 20 - st.bonus))
+                : amount;
+    if (grant <= 0) return 0;
+    const before = get().battleState?.sp ?? 0;
+    await get().earnSP(grant);
+    const added = (get().battleState?.sp ?? 0) - before; // 实发（含战场倍率）
+    if (tier === 'regular') {
+      await get().updateSettings({ ledgerRewardDate: today, ledgerSpToday: st.sp + grant, ledgerAttrToday: st.attr, ledgerBonusSpToday: st.bonus });
+    } else if (tier === 'bonus') {
+      await get().updateSettings({ ledgerRewardDate: today, ledgerSpToday: st.sp, ledgerAttrToday: st.attr, ledgerBonusSpToday: st.bonus + grant });
+    }
+    return added;
+  },
+
+  // 一笔记账落账后的奖励编排（saveDraft 调用，仅创建时一次）：
+  //   · 每笔记账 +2 SP（封顶） · 劳动收入 +10 SP · 投资类自选属性 +1~2（封顶 2/日，走 addActivity）
+  //   · 消费评估「值得」+1 SP。adjust（对账）不奖励。守「不奖励花钱」：必要/欲望/冲动只拿记账 SP。
+  rewardForLedgerEntry: async (entry, opts) => {
+    if (entry.direction === 'adjust') return;
+    let sp = await get().earnLedgerSp(2, 'regular');
+    let attr: NonNullable<LedgerEntry['reward']>['attr'];
+    if (entry.direction === 'income') {
+      if (entry.incomeType === 'labor') sp += await get().earnLedgerSp(10, 'bonus');
+    } else {
+      // expense：成长类目自选属性 +1~2（日封顶 2）
+      if (isGrowthCategory(entry.type) && opts?.attribute && (opts.attrPoints ?? 0) > 0) {
+        const today = toLocalDateKey();
+        const st = ledgerDailyState(get().settings, today);
+        const grant = Math.min(opts.attrPoints as number, Math.max(0, 2 - st.attr));
+        if (grant > 0) {
+          const { activityId } = await get().addActivity(`心相投资 · ${entry.note || '自我投资'}`, { [opts.attribute]: grant }, 'local', { category: 'ledger' });
+          await get().updateSettings({ ledgerRewardDate: today, ledgerSpToday: st.sp, ledgerAttrToday: st.attr + grant, ledgerBonusSpToday: st.bonus });
+          attr = { activityId, attribute: opts.attribute, points: grant };
+        }
+      }
+      if (opts?.evalWorth === 'worth') sp += await get().earnLedgerSp(1, 'bonus');
+    }
+    // 记录实发奖励，供删除时精确回收（H1/M3）
+    if (sp > 0 || attr) {
+      const reward = { sp, ...(attr ? { attr } : {}) };
+      await db.ledgerEntries.update(entry.id, { reward });
+      set({ ledgerEntries: get().ledgerEntries.map(e => (e.id === entry.id ? { ...e, reward } : e)) });
+    }
+  },
+
+  // ── F5 资产板块 ──
+  addAsset: async (input) => {
+    const asset: LedgerAsset = { ...input, id: uuidv4(), createdAt: new Date() };
+    await db.assets.put(asset);
+    set({ assets: [...get().assets, asset] });
+    return asset;
+  },
+  updateAsset: async (id, patch) => {
+    const cur = get().assets.find(a => a.id === id);
+    if (!cur) return;
+    const next = { ...cur, ...patch };
+    await db.assets.put(next);
+    set({ assets: get().assets.map(a => (a.id === id ? next : a)) });
+  },
+  deleteAsset: async (id) => {
+    await db.assets.delete(id);
+    set({ assets: get().assets.filter(a => a.id !== id) });
+  },
+  getFixedAssetTotal: () => {
+    return get().assets
+      .filter(a => a.status !== 'soldout')
+      .reduce((s, a) => s + a.price + (a.addOns?.reduce((x, o) => x + o.amount, 0) ?? 0), 0);
+  },
+
+  getSavings: () => {
+    const st = get().settings;
+    const todayKey = toLocalDateKey();
+    // 仅统计「已完整结束」的周期（日历月或发薪日周期）；周期内省下 = 预算 − 该周期支出
+    return roundMoney(get().budgets
+      .filter(b => b.monthlyLimit != null && cycleRangeForKey(!!st.ledgerPayCycleEnabled, st.ledgerResetDay ?? 1, b.period)[1] < todayKey)
+      .reduce((acc, b) => acc + Math.max(0, roundMoney((b.monthlyLimit ?? 0) - get().getPeriodExpense(b.period))), 0));
+  },
+
+  claimLedgerBudgetBonus: async (period) => {
+    const s = get().settings;
+    if ((s.ledgerBudgetBonusMonths ?? []).includes(period)) return false;
+    if (cycleRangeForKey(!!s.ledgerPayCycleEnabled, s.ledgerResetDay ?? 1, period)[1] >= toLocalDateKey()) return false; // 仅已完整结束的周期发放
+    const budget = get().getBudget(period)?.monthlyLimit;
+    if (budget == null || get().getPeriodExpense(period) > roundMoney(budget)) return false;
+    const granted = await get().earnLedgerSp(10, 'flat');
+    if (granted <= 0) return false; // 无战场→SP 没发，不烧名额、不弹横幅（M1）
+    // 名额数组必须在 await 之后**重读**再追加：earnLedgerSp 内部也写 settings，
+    // 拿 await 之前抓的 s 去展开就是一次 lost update，会把期间写进去的其它名额抹掉（FS7 审查）
+    const claimed = get().settings.ledgerBudgetBonusMonths ?? [];
+    if (claimed.includes(period)) return true; // 竞态下已被另一次调用记账，不重复追加
+    await get().updateSettings({ ledgerBudgetBonusMonths: [...claimed, period] });
+    return true;
+  },
+
+  claimLedgerChallengeBonus: async (period) => {
+    const s = get().settings;
+    if ((s.ledgerChallengeWonMonths ?? []).includes(period)) return null;
+    if (cycleRangeForKey(!!s.ledgerPayCycleEnabled, s.ledgerResetDay ?? 1, period)[1] >= toLocalDateKey()) return null; // 仅已完整结束的周期
+    const b = get().getBudget(period);
+    if (b?.monthlyLimit == null || b.savingsGoal == null || b.savingsGoal <= 0) return null;
+    const saved = roundMoney(b.monthlyLimit - get().getPeriodExpense(period));
+    if (saved < roundMoney(b.savingsGoal)) return null; // 未达成挑战
+    const granted = await get().earnLedgerSp(10, 'flat');
+    if (granted <= 0) return null; // 无战场→不发不烧名额（M1）
+    const won = get().settings.ledgerChallengeWonMonths ?? []; // 同上：await 之后重读再追加
+    if (won.includes(period)) return saved;
+    await get().updateSettings({ ledgerChallengeWonMonths: [...won, period] });
+    return saved;
+  },
+
+  getCountercurrentWarnings: (): AttributeId[] => {
+    const { settings, attributes, activities } = get();
+    if (!settings.countercurrentEnabled) return [];
+
+    const ATTR_IDS: AttributeId[] = ['knowledge', 'guts', 'dexterity', 'kindness', 'charm'];
+    const todayKey = toLocalDateKey();
+    const warnings: AttributeId[] = [];
+
+    // Need at least 2 full days since enabled for tomorrow's decay to potentially fire
+    if (settings.countercurrentEnabledAt) {
+      const enabledDate = new Date(settings.countercurrentEnabledAt + 'T00:00:00');
+      const todayDate = new Date(todayKey + 'T00:00:00');
+      const daysSinceEnabled = Math.floor((todayDate.getTime() - enabledDate.getTime()) / 86400000);
+      if (daysSinceEnabled < 2) return [];
+    }
+
+    // Today + past 2 days = 3-day window ending today
+    const dayKeys: string[] = [];
+    for (let i = 0; i <= 2; i++) {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      dayKeys.push(toLocalDateKey(d));
+    }
+
+    for (const attrId of ATTR_IDS) {
+      const attr = attributes.find(a => a.id === attrId);
+      if (!attr || attr.points <= 0) continue;
+
+      const hadGrowth = dayKeys.some(dk =>
+        activities.some(a =>
+          toLocalDateKey(new Date(a.date)) === dk &&
+          !a.category &&
+          (a.pointsAwarded[attrId as keyof typeof a.pointsAwarded] || 0) > 0
+        )
+      );
+      if (hadGrowth) continue;
+
+      // If today already decayed, no warning needed (decay already happened this morning)
+      const decayedToday = activities.some(a =>
+        toLocalDateKey(new Date(a.date)) === todayKey &&
+        a.category === 'countercurrent' &&
+        (a.pointsAwarded[attrId as keyof typeof a.pointsAwarded] || 0) < 0
+      );
+      if (decayedToday) continue;
+
+      warnings.push(attrId);
+    }
+    return warnings;
+  },
+
+  // ── 逆影战场 ─────────────────────────────────────────────
+
+  loadBattleData: async () => {
+    try {
+      const [personas, shadows, battleStates, strata] = await Promise.all([
+        db.personas.toArray(),
+        db.shadows.toArray(),
+        db.battleStates.toArray(),
+        db.strata.toArray(),
+      ]);
+      const latestStratum = strata
+        .slice()
+        .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0] || null;
+      set({ persona: personas[0] || null, shadow: shadows[0] || null, battleState: battleStates[0] || null, stratum: latestStratum });
+
+      // 惰性迁移（§2.7）：存量单只 Shadow 且从未生成过区层 → 迁入同级区层（保留主影本体，区层名用模板，AI 名后置）
+      const sh = shadows[0];
+      if (sh && strata.length === 0) {
+        const tpl = migrationStratumName(sh.name);
+        const migrated = buildStratum({
+          id: uuidv4(),
+          level: sh.level,
+          name: tpl.name,
+          description: tpl.description,
+          baseFloor: 0,
+          now: new Date(),
+          eventPoolIds: TOWER_EVENT_IDS,
+          memoryEcho: memoryEchoCandidates(get().activities).length >= MEMORY_ECHO_MIN_CANDIDATES,
+          chestSp: (floor) => nodeSpReward(sh.level, floor, 0, Math.random) + 5,
+        });
+        await db.strata.put(migrated);
+        set({ stratum: migrated });
+      }
+      // 满月心魔（第 6 轮）：满月当天第一次打开就在后台开始显形
+      void get().ensureMoonShadow();
+    } catch { /* ignore */ }
+  },
+
+  savePersona: async (persona: Persona) => {
+    await db.personas.clear();
+    await db.personas.put(persona);
+    set({ persona });
+  },
+
+  saveShadow: async (shadow: Shadow) => {
+    await db.shadows.clear();
+    await db.shadows.put(shadow);
+    set({ shadow });
+  },
+
+  saveBattleState: async (state: BattleState) => {
+    await db.battleStates.put(state);
+    set({ battleState: state });
+  },
+
+  earnSP: async (amount: number) => {
+    const { battleState } = get();
+    if (!battleState) return;
+    const earned = Math.round(amount);
+    const updated = { ...battleState, sp: battleState.sp + earned, totalSpEarned: battleState.totalSpEarned + earned };
+    await get().saveBattleState(updated);
+  },
+
+  // ── 委托板（第 6 轮 · PRD §11.3）──────────────────────────────
+  refreshQuests: async () => {
+    const st = get();
+    if (!st.user || !questBoardUnlocked(st.activities)) return;
+    const now = new Date();
+    const range = weekRangeOf(now);
+    const existing = await db.quests.where('weekKey').equals(range.weekKey).toArray();
+    if (existing.length >= 3) return;
+    const data = await questDataOf(get, now);
+    // 上周做完没领的：替你领了，留一句话
+    const prevKey = previousWeekKey(range.weekKey);
+    const prev = await db.quests.where('weekKey').equals(prevKey).toArray();
+    const prevRange = weekRangeOfKey(prevKey);
+    const prevData: QuestData = { ...data, images: await db.activityImages.where('createdAt').aboveOrEqual(prevRange.start).toArray() };
+    const auto: string[] = [];
+    let autoSp = 0;
+    for (const q of prev) {
+      if (q.claimedAt || !questDone(q, prevData, prevRange)) continue;
+      await db.quests.update(q.id, { claimedAt: now.toISOString(), autoClaimed: true });
+      auto.push(questTitle(q, st.settings.attributeNames));
+      autoSp += q.rewardSp;
+    }
+    if (auto.length) {
+      if (get().battleState) await get().earnSP(autoSp);
+      set({ questNotice: `上周的「${auto.join('」「')}」做完了没来得及领，已经替你领了${get().battleState ? `，+${autoSp} SP` : ''}。` });
+    }
+    // 本周三张：周键 + 账号 id 做种，两台设备各自生成也是同一组
+    const { useCloudStore } = await import('@/store/cloud');
+    const seed = useCloudStore.getState().cloudUser?.id ?? st.user.id;
+    const fresh = generateWeekQuests(range, seed, data, now);
+    const have = new Set(existing.map((q) => q.id));
+    await db.quests.bulkPut(fresh.filter((q) => !have.has(q.id)));
+  },
+
+  claimQuest: async (id: string) => {
+    const q = await db.quests.get(id);
+    if (!q || q.claimedAt) return { ok: false, sp: 0 };
+    const now = new Date();
+    const range = weekRangeOfKey(q.weekKey);
+    const data = await questDataOf(get, now, range.start);
+    if (!questDone(q, data, range)) return { ok: false, sp: 0 };
+    await db.quests.update(id, { claimedAt: now.toISOString() });
+    const sp = get().battleState ? q.rewardSp : 0;
+    if (sp > 0) await get().earnSP(sp);
+    // 一周三张都领了：岁时册收一枚「委托全清」印记
+    const week = await db.quests.where('weekKey').equals(q.weekKey).toArray();
+    if (week.length >= 3 && week.every((x) => !!x.claimedAt)) {
+      await db.stamps.put({ id: `${q.weekKey}-quest`, kind: 'quest', name: '委托全清', date: q.weekKey, year: Number(q.weekKey.slice(0, 4)), collectedAt: now.toISOString() });
+    }
+    return { ok: true, sp };
+  },
+
+  swapQuest: async (id: string) => {
+    const q = await db.quests.get(id);
+    if (!q) return { ok: false, reason: '这张委托不见了' };
+    if (q.claimedAt) return { ok: false, reason: '领过的不能换' };
+    const week = await db.quests.where('weekKey').equals(q.weekKey).toArray();
+    if (week.some((x) => x.swapped)) return { ok: false, reason: '本周已经换过一张了' };
+    const now = new Date();
+    const range = weekRangeOfKey(q.weekKey);
+    const data = await questDataOf(get, now, range.start);
+    if (questDone(q, data, range)) return { ok: false, reason: '已经做完了，领了吧' };
+    const { useCloudStore } = await import('@/store/cloud');
+    const seed = useCloudStore.getState().cloudUser?.id ?? get().user?.id ?? 'me';
+    const next = swapQuestFor(range, seed, data, week, q, now);
+    if (!next) return { ok: false, reason: '这周没有别的委托可换了' };
+    await db.quests.put(next);
+    return { ok: true };
+  },
+
+  clearQuestNotice: () => set({ questNotice: null }),
+
+  // 战斗结算已全部移入 src/battle/engine.ts（引擎 v2）；store 只负责跨 session 持久化。
+  // （旧单影模型的每日回血 checkShadowHpRegen 已删：塔模型下从不生效，第 6 轮清理）
+
+  startBattleSession: () => {
+    const { battleState, shadow, settings } = get();
+    if (!battleState) return;
+    const baseHp = settings.battlePlayerMaxHp ?? PLAYER_BASE_HP;
+    const maxHp = baseHp + (battleState.hpBonusFromDefeats ?? 0);
+    const alreadyPhase2 = shadow !== null && shadow.maxHp2 !== undefined &&
+      shadow.currentHp <= 0 && (shadow.currentHp2 ?? shadow.maxHp2) > 0;
+    const newStatus = alreadyPhase2 ? 'shadow_phase2' as const : 'in_battle' as const;
+    const updated = { ...battleState, playerHp: maxHp, playerMaxHp: maxHp, status: newStatus, lastChallengeDate: toLocalDateKey() };
+    set({ battleState: updated });
+    get().saveBattleState(updated);
+  },
+
+  endBattleSession: () => {
+    const { battleState } = get();
+    if (!battleState) return;
+    const updated = { ...battleState, status: 'idle' as const };
+    set({ battleState: updated });
+    get().saveBattleState(updated);
+  },
+
+  defeatShadow: async () => {
+    const { battleState, shadow, attributes, stratum } = get();
+    if (!battleState) return;
+    const isAbyss = !!stratum?.abyssRing; // 批5：深渊环击破——不加 HP 上限（无尽模式防膨胀）、更新最深纪录
+    // R19「回头看看」：重游层的心魔只是回响——不进档案、不加 HP 上限、不动进度
+    const isRevisit = !!stratum?.revisit;
+    // 批3 阴影档案馆：新藏品带 描述/词缀/代表台词/击败时的你/区层等级（存量记录字段留空 = 首批藏品）
+    // 满月心魔（第 6 轮）：它就是这一环的守卫，额外 +30 SP、档案标月份、岁时册收一枚满月印记
+    const isMoon = isAbyss && !!shadow?.moonSlot;
+    // 第 13 轮：孤儿胜利（status=victory 但本体没了）用区层拼的占位本体兜底——档案照记、HP 上限照加，
+    // 否则奖励屏「领取奖励」一按只清状态不留痕（用户上报「结算卡住领不到奖励」的一种落地形态）
+    const foe = shadow ?? (battleState.status === 'victory' ? orphanBossOf(stratum) : null);
+    const newRecord = foe && !isRevisit ? {
+      shadowName: isMoon ? `${foe.name}（满月 · 回廊第${stratum!.abyssRing}环）` : isAbyss ? `${foe.name}（回廊第${stratum!.abyssRing}环）` : foe.name,
+      ...(isMoon && shadow ? { moonMonth: shadow.moonMonth } : {}),
+      level: foe.level,
+      // 用本地日期口径（toLocalDateKey），不要 toISOString().slice —— 那是 UTC：
+      // 东八区凌晨 0–8 点击破，档案里会写成"昨天"（FS7 审查；全站其余日期都走这个函数）
+      breachDate: toLocalDateKey(new Date(foe.createdAt)),
+      defeatDate: toLocalDateKey(),
+      daysElapsed: Math.max(1, Math.floor((Date.now() - new Date(foe.createdAt).getTime()) / 86400000)),
+      description: foe.description,
+      affixes: shadow?.affixes,
+      quote: shadow ? shadow.responseLines[Math.floor(Math.random() * Math.max(1, shadow.responseLines.length))] : undefined,
+      playerTotalLevel: attributes.reduce((s, a) => s + (a.unlocked === false ? 0 : (a.level ?? 1)), 0),
+      stratumLevel: stratum?.level,
+    } : null;
+    // HP bonus from defeating this shadow（深渊不加）
+    const hpGain = foe && !isAbyss && !isRevisit ? (HP_BONUS_PER_DEFEAT[Math.min(foe.level - 1, HP_BONUS_PER_DEFEAT.length - 1)] ?? 2) : 0;
+    const newHpBonus = (battleState.hpBonusFromDefeats ?? 0) + hpGain;
+    const updated: BattleState = {
+      ...battleState,
+      status: 'idle',
+      shadowsDefeated: battleState.shadowsDefeated + 1,
+      lastDefeatedWeakAttribute: shadow?.weakAttribute,
+      defeatedShadowLog: newRecord
+        ? [...(battleState.defeatedShadowLog ?? []), newRecord]
+        : battleState.defeatedShadowLog,
+      hpBonusFromDefeats: newHpBonus,
+      abyssHighestRing: isAbyss
+        ? Math.max(battleState.abyssHighestRing ?? 0, stratum!.abyssRing!)
+        : battleState.abyssHighestRing,
+      // 深渊周常（第 6 轮）：本周最好 / 每条规则最好，只和自己比
+      // 「本周」按击破这一刻的周算：上周进的环这周才打完，也算进这周
+      abyssWeekly: isAbyss && stratum!.abyssRuleId
+        ? (() => {
+            const wk = weekKeyOf(new Date());
+            const prev = battleState.abyssWeekly && battleState.abyssWeekly.weekKey === wk ? battleState.abyssWeekly : null;
+            return { weekKey: wk, ruleId: prev?.ruleId ?? abyssWeeklyRule(wk).id, bestRing: Math.max(prev?.bestRing ?? 0, stratum!.abyssRing!) };
+          })()
+        : battleState.abyssWeekly,
+      abyssRuleBest: isAbyss && stratum!.abyssRuleId
+        ? { ...(battleState.abyssRuleBest ?? {}), [stratum!.abyssRuleId]: Math.max(battleState.abyssRuleBest?.[stratum!.abyssRuleId] ?? 0, stratum!.abyssRing!) }
+        : battleState.abyssRuleBest,
+      // 主塔通关才推进度（重游 / 深渊都不算）
+      maxStratumLevel: !isAbyss && !isRevisit && stratum
+        ? Math.max(battleState.maxStratumLevel ?? 0, Math.min(5, stratum.level))
+        : battleState.maxStratumLevel,
+      moonDefeats: isMoon ? (battleState.moonDefeats ?? 0) + 1 : battleState.moonDefeats,
+      moonShadow: isMoon && battleState.moonShadow && battleState.moonShadow.slot === shadow!.moonSlot
+        ? { ...battleState.moonShadow, status: 'defeated' as const, name: shadow!.name }
+        : battleState.moonShadow,
+    };
+    await get().saveBattleState(updated);
+    if (isMoon && shadow) {
+      await get().earnSP(MOON_BOSS_SP);
+      const dk = toLocalDateKey();
+      await db.stamps.put({ id: `${dk}-moon`, kind: 'moon', name: shadow.name, date: dk, year: Number(dk.slice(0, 4)), collectedAt: new Date().toISOString() });
+    }
+    // 批2：区层主影被击破 → 区层通关（上方新区层随「显形仪式」解锁；深渊环通关 → 同晚可深入下一环）
+    const st = get().stratum;
+    if (st && st.status === 'climbing') {
+      await get().saveStratum({ ...st, status: 'cleared' });
+    }
+  },
+
+  repairOrphanVictory: async () => {
+    const bs = get().battleState;
+    if (!bs || bs.status !== 'victory' || get().shadow) return;
+    if (orphanBossOf(get().stratum)) return; // 区层还在爬 = 奖没领过，交给奖励屏兜底领
+    console.warn('[battle] 孤儿胜利且无奖可领：status 修回 idle');
+    await get().saveBattleState({ ...bs, status: 'idle' });
+  },
+
+  resetBattle: async () => {
+    // 保留未使用的 SP
+    const { battleState: prev } = get();
+    const preservedSp = prev?.sp ?? 0;
+    const preservedTotalSp = prev?.totalSpEarned ?? 0;
+    await db.personas.clear();
+    await db.shadows.clear();
+    await db.battleStates.clear();
+    await db.strata.clear();
+    if (preservedSp > 0) {
+      const freshState: BattleState = {
+        id: 'current',
+        playerHp: 10,
+        playerMaxHp: 10,
+        sp: preservedSp,
+        totalSpEarned: preservedTotalSp,
+        status: 'idle',
+        shadowsDefeated: 0,
+      };
+      await db.battleStates.put(freshState);
+      set({ persona: null, shadow: null, battleState: freshState, stratum: null });
+    } else {
+      set({ persona: null, shadow: null, battleState: null, stratum: null });
+    }
+  },
+
+  equipMask: async (attr: AttributeId | null) => {
+    const { persona } = get();
+    if (!persona) return;
+    const updated = { ...persona, equippedMaskAttribute: attr };
+    await db.personas.put(updated);
+    set({ persona: updated });
+  },
+
+  // ── 影时间高塔（批2）：区层攀登 ─────────────────────────
+
+  saveStratum: async (s: TowerStratum) => {
+    await db.strata.put(s);
+    set({ stratum: s });
+  },
+
+  revealStratum: async ({ level, name, description, themeAttribute, boss: rawBoss }) => {
+    // 批3 §5.1：心魔显形带 0-1 条词缀（50%）；「顽固」的 HP+30% 生成时应用
+    const boss = { ...rawBoss };
+    if (!boss.affixes) {
+      const rolled = Math.random() < 0.5 ? rollAffixes(1, Math.random) : [];
+      boss.affixes = rolled;
+      if (rolled.includes('stubborn')) {
+        boss.maxHp = Math.round(boss.maxHp * AFFIX_HP_MULT);
+        boss.currentHp = boss.maxHp;
+        if (boss.maxHp2 !== undefined) {
+          boss.maxHp2 = Math.round(boss.maxHp2 * AFFIX_HP_MULT);
+          boss.currentHp2 = boss.maxHp2;
+        }
+      }
+    }
+    const prev = get().stratum;
+    const baseFloor = prev ? prev.baseFloor + prev.floors : 0;
+    const stratum = buildStratum({
+      id: uuidv4(),
+      level,
+      name,
+      description,
+      themeAttribute,
+      baseFloor,
+      now: new Date(),
+      eventPoolIds: TOWER_EVENT_IDS,
+      memoryEcho: memoryEchoCandidates(get().activities).length >= MEMORY_ECHO_MIN_CANDIDATES,
+      chestSp: (floor) => nodeSpReward(level, floor, 0, Math.random) + 5,
+    });
+    await get().saveShadow(boss); // shadows 单例 = 当前区层主影
+    await get().saveStratum(stratum);
+    const bs = get().battleState;
+    if (bs) await get().saveBattleState({ ...bs, status: 'idle' });
+  },
+
+  enterTowerToday: async () => {
+    // 满月心魔（第 6 轮）：满月当天第一次潜入时判定这个月的月度心魔（先确保它已建好）
+    await get().ensureMoonShadow();
+    if (get().battleState?.lastChallengeDate !== toLocalDateKey()) await get().moonCheckOnEntry();
+    const { stratum, battleState: prevBs, activities } = get();
+    // 批3 记忆台词：在 lastChallengeDate 被覆写前快照缺席天数
+    const prevKey = prevBs?.lastChallengeDate;
+    const daysAway = prevKey
+      ? Math.max(0, Math.floor((new Date(toLocalDateKey() + 'T00:00:00').getTime() - new Date(prevKey + 'T00:00:00').getTime()) / 86400000))
+      : 0;
+    // 批4 勤勉的光辉：连续记录 3 天 → +1 枚（上限 2；距上次发放 ≥3 天）
+    const todayKey = toLocalDateKey();
+    const streak = currentRecordStreak(activities.map(a => a.date), todayKey);
+    const grantDiligence = shouldGrantDiligence(streak, prevBs?.diligenceLastGrantKey, todayKey)
+      && (prevBs?.diligenceCharges ?? 0) < DILIGENCE_MAX_CHARGES;
+    get().startBattleSession(); // 满 HP + lastChallengeDate
+    const bs = get().battleState;
+    if (!bs) return;
+    const curFloor = stratum?.nodes.find(n => n.id === stratum.currentNodeId)?.floor ?? 0;
+    await get().saveBattleState({
+      ...bs,
+      diligenceCharges: grantDiligence ? Math.min(DILIGENCE_MAX_CHARGES, (bs.diligenceCharges ?? 0) + 1) : bs.diligenceCharges,
+      diligenceLastGrantKey: grantDiligence ? todayKey : bs.diligenceLastGrantKey,
+      towerSession: {
+        dateKey: todayKey,
+        startFloor: curFloor,
+        floorsClimbed: 0,
+        nodesCleared: 0,
+        mobsDefeated: 0,
+        damageDealt: 0,
+        maxSingleHit: 0,
+        weaknessHits: 0,
+        spEarned: 0,
+        buffs: [],
+        daysAway,
+      },
+    });
+  },
+
+  moveToTowerNode: async (nodeId: string) => {
+    const { stratum } = get();
+    if (!stratum) return null;
+    if (!reachableNodeIds(stratum).includes(nodeId)) return null;
+    const node = stratum.nodes.find(n => n.id === nodeId) ?? null;
+    if (!node) return null;
+    if (stratum.currentNodeId !== nodeId) {
+      await get().saveStratum({ ...stratum, currentNodeId: nodeId });
+    }
+    return node;
+  },
+
+  completeTowerNode: async (nodeId: string, opts) => {
+    const { stratum, battleState, shadow } = get();
+    if (!stratum || !battleState) return 0;
+    const node = stratum.nodes.find(n => n.id === nodeId);
+    if (!node || node.cleared) return 0;
+    let sp = 0;
+    if (node.type === 'boss') sp = bossSpReward(stratum.level, stratum.deepenCount);
+    else if (node.type === 'chest') sp = node.lootSp ?? 0;
+    else if (node.type === 'mob' || node.type === 'elite') sp = nodeSpReward(stratum.level, node.floor, stratum.deepenCount, Math.random);
+    else if (node.type === 'golden') sp = Math.round(nodeSpReward(stratum.level, node.floor, stratum.deepenCount, Math.random) * GOLDEN_SP_MULT); // 批5 金色回响
+    // 事件引出的遭遇战（第 6 轮修）：打赢了照小影节点发；其余 event / echo 的收益由效果本身发放
+    else if (node.type === 'event' && opts?.wasMob) sp = nodeSpReward(stratum.level, node.floor, stratum.deepenCount, Math.random);
+    // 深渊周常「厚甲」：本环 SP 收益 ×1.5
+    if (sp > 0 && stratum.abyssRing && stratum.abyssRuleId === 'thick_armor') sp = Math.round(sp * ABYSS_RULE_THICK_SP);
+    // 批3：贪婪词缀（击败多掉 50% SP）+ 登塔者罗盘（节点 SP 收益+）
+    const affixes = node.type === 'boss' ? shadow?.affixes : node.mob?.affixes;
+    if (sp > 0 && affixes?.includes('greedy')) sp = Math.round(sp * 1.5);
+    const { nodeSpPct } = towerRelicBonus(battleState.arsenal?.relics);
+    if (sp > 0 && nodeSpPct > 0) sp = Math.round(sp * (1 + nodeSpPct));
+    const nodes = stratum.nodes.map(n => (n.id === nodeId ? { ...n, cleared: true } : n));
+    await get().saveStratum({ ...stratum, nodes });
+    const bs = get().battleState!;
+    const ts = bs.towerSession;
+    const session = ts && ts.dateKey === toLocalDateKey()
+      ? {
+          ...ts,
+          nodesCleared: ts.nodesCleared + 1,
+          mobsDefeated: ts.mobsDefeated + (opts?.wasMob ? 1 : 0),
+          floorsClimbed: Math.max(ts.floorsClimbed, node.floor - ts.startFloor),
+          spEarned: ts.spEarned + sp,
+        }
+      : ts;
+    await get().saveBattleState({ ...bs, sp: bs.sp + sp, towerSession: session });
+    return sp;
+  },
+
+  towerAdjust: async ({ hpDeltaPct, spDelta, buff, stealFirstStrike }) => {
+    const bs = get().battleState;
+    if (!bs) return;
+    let playerHp = bs.playerHp;
+    if (hpDeltaPct) {
+      playerHp = Math.max(0, Math.min(bs.playerMaxHp, playerHp + Math.round(bs.playerMaxHp * hpDeltaPct)));
+    }
+    const sp = Math.max(0, bs.sp + (spDelta ?? 0));
+    let session = bs.towerSession;
+    if (session && session.dateKey === toLocalDateKey()) {
+      if (buff && !session.buffs.some(b => b.id === buff.id)) {
+        session = { ...session, buffs: [...session.buffs, buff] };
+      }
+      if (stealFirstStrike) session = { ...session, pendingFirstStrike: true };
+      if (spDelta && spDelta > 0) session = { ...session, spEarned: session.spEarned + spDelta };
+    }
+    await get().saveBattleState({ ...bs, playerHp, sp, towerSession: session });
+  },
+
+  towerSkipNextFloor: async () => {
+    const { stratum } = get();
+    if (!stratum || !stratum.currentNodeId) return;
+    const cur = stratum.nodes.find(n => n.id === stratum.currentNodeId);
+    if (!cur || !cur.cleared) return;
+    const target = cur.edges
+      .map(id => stratum.nodes.find(n => n.id === id))
+      .find(n => n && n.type !== 'boss'); // 主影层不可跃过
+    if (!target) return;
+    const nodes = stratum.nodes.map(n => (n.id === target.id ? { ...n, cleared: true } : n));
+    await get().saveStratum({ ...stratum, nodes, currentNodeId: target.id });
+  },
+
+  towerRerollNextFloor: async () => {
+    const { stratum } = get();
+    if (!stratum || !stratum.currentNodeId) return;
+    const cur = stratum.nodes.find(n => n.id === stratum.currentNodeId);
+    if (!cur) return;
+    const rng = Math.random;
+    const nodes = stratum.nodes.map(n => {
+      if (!cur.edges.includes(n.id) || n.cleared || n.type === 'boss' || n.type === 'elite' || n.type === 'golden') return n;
+      const roll = rng();
+      const type: StratumNode['type'] = roll < 0.45 ? 'mob' : roll < 0.7 ? 'event' : roll < 0.85 ? 'echo' : 'chest';
+      const next: StratumNode = { ...n, type, mob: undefined, eventPoolId: undefined, lootSp: undefined };
+      if (type === 'mob') next.mob = rollMobSpec(stratum.level, 'mob', rng);
+      else if (type === 'event') next.eventPoolId = TOWER_EVENT_IDS[Math.floor(rng() * TOWER_EVENT_IDS.length)];
+      else if (type === 'chest') next.lootSp = nodeSpReward(stratum.level, n.floor, stratum.deepenCount, rng) + 5;
+      return next;
+    });
+    await get().saveStratum({ ...stratum, nodes });
+  },
+
+  towerRecordBattleStats: async ({ damage, maxHit, weaknessHits }) => {
+    const bs = get().battleState;
+    if (!bs?.towerSession || bs.towerSession.dateKey !== toLocalDateKey()) return;
+    const ts = bs.towerSession;
+    await get().saveBattleState({
+      ...bs,
+      towerSession: {
+        ...ts,
+        damageDealt: ts.damageDealt + damage,
+        maxSingleHit: Math.max(ts.maxSingleHit, maxHit),
+        weaknessHits: ts.weaknessHits + weaknessHits,
+        pendingFirstStrike: undefined, // 战斗已发生 → 先手债消费
+      },
+    });
+  },
+
+  deepenStratumIfNewWeek: async () => {
+    const { stratum, shadow } = get();
+    if (!stratum || stratum.status !== 'climbing') return false;
+    // 心魔已破、奖还没领（status=victory）：别把尸体回满血再加词缀——奖励屏领完它就清掉了
+    if (get().battleState?.status === 'victory') return false;
+    if (stratum.abyssRing) return false; // 批5：深渊环无月相加深（每环短命，压力走词缀递增）
+    // 伪神不加深：它的三条血和「指认」是显形时一次定死的，词缀（尤其「顽固」的回血扩容）会破坏终局的口径
+    if (shadow?.isFinalBoss || stratum.level >= 6) return false;
+    const wk = weekKeyOf(new Date());
+    if (wk === stratum.createdWeekKey || stratum.lastDeepenWeekKey === wk) return false;
+    if (shadow) {
+      // 批3 §5.1：异变加深每次 +1 词缀（不与已有重复）；新增「顽固」时血池同步扩容
+      const added = rollAffixes(1, Math.random, shadow.affixes ?? []);
+      const affixes = [...(shadow.affixes ?? []), ...added];
+      let { maxHp, maxHp2 } = shadow;
+      if (added.includes('stubborn')) {
+        maxHp = Math.round(maxHp * AFFIX_HP_MULT);
+        if (maxHp2 !== undefined) maxHp2 = Math.round(maxHp2 * AFFIX_HP_MULT);
+      }
+      await get().saveShadow({ ...shadow, affixes, maxHp, maxHp2, currentHp: maxHp, currentHp2: maxHp2 });
+    }
+    await get().saveStratum({ ...stratum, deepenCount: stratum.deepenCount + 1, lastDeepenWeekKey: wk });
+    return true;
+  },
+
+  // ── 批3 · 养成与生态：战利品 / 迷思誓约 / 共鸣链 / 熟练度 ──
+
+  rollTowerLoot: async (source, floorRatio) => {
+    const { stratum, battleState } = get();
+    if (!battleState) return [];
+    const arsenal: BattleArsenal = battleState.arsenal ?? { relics: [], myths: [], oaths: [], chains: [] };
+    const drops = rollNodeLoot(source, {
+      stratumLevel: stratum?.level ?? 1,
+      floorRatio,
+      ownedChainKeys: arsenal.chains.map(c => c.key),
+      ownedOathKinds: arsenal.oaths.map(o => o.kind),
+      rng: Math.random,
+      makeId: uuidv4,
+      today: toLocalDateKey(),
+      // 深渊周常「贪婪」：概率性掉落 ×2
+      rateMult: stratum?.abyssRing && stratum.abyssRuleId === 'greed' ? ABYSS_RULE_GREED_DROP : 1,
+    });
+    if (drops.length === 0) return drops;
+    const next: BattleArsenal = {
+      ...arsenal,
+      relics: [...arsenal.relics, ...drops.filter(d => d.kind === 'relic').map(d => (d as Extract<LootDrop, { kind: 'relic' }>).relic)],
+      myths: [...arsenal.myths, ...drops.filter(d => d.kind === 'myth').map(d => (d as Extract<LootDrop, { kind: 'myth' }>).myth)],
+      oaths: [...arsenal.oaths, ...drops.filter(d => d.kind === 'oath').map(d => (d as Extract<LootDrop, { kind: 'oath' }>).oath)],
+      chains: [...arsenal.chains, ...drops.filter(d => d.kind === 'chain').map(d => (d as Extract<LootDrop, { kind: 'chain' }>).chain)],
+    };
+    const spBonus = drops.filter(d => d.kind === 'sp').reduce((s, d) => s + (d as Extract<LootDrop, { kind: 'sp' }>).amount, 0);
+    const bs = get().battleState!;
+    await get().saveBattleState({ ...bs, arsenal: next, sp: bs.sp + spBonus });
+    return drops;
+  },
+
+  // ── 批4 · 日常闭环 ──
+
+  applyPrepBuff: async (buff) => {
+    const bs = get().battleState;
+    const ts = bs?.towerSession;
+    if (!bs || !ts || ts.dateKey !== toLocalDateKey() || ts.prepDrawnId) return; // 每次登塔限一次
+    let session = { ...ts, prepDrawnId: buff.id };
+    if (buff.addPct) {
+      session = { ...session, buffs: [...session.buffs, { id: buff.id, label: buff.label, addPct: buff.addPct }] };
+    }
+    const sp = bs.sp + (buff.sp ?? 0);
+    await get().saveBattleState({ ...bs, sp, towerSession: session });
+  },
+
+  claimDiligence: async () => {
+    const bs = get().battleState;
+    if (!bs || (bs.diligenceCharges ?? 0) <= 0) return false;
+    await get().saveBattleState({
+      ...bs,
+      playerHp: bs.playerMaxHp,
+      diligenceCharges: (bs.diligenceCharges ?? 0) - 1,
+    });
+    return true;
+  },
+
+  recordBattleFeat: async (feat) => {
+    /**
+     * ⚠️ 必须在锁**里面**现读 battleState，并且写完才去解锁成就。
+     *
+     * 真实事故：一场胜利会连开好几发 `void recordBattleFeat(...)`
+     * （BattleArena 的 first_clear + night_climb、BattleModal 的 allout /
+     * five_masks / flawless / poison_elite），全都 fire-and-forget。
+     * 旧写法在函数顶部读一次 bs，几发拿到的是**同一份快照**，
+     * 于是 `[...old, feat]` 互相覆盖——只有最后落地的那一发留在 battleFeats 里。
+     * 更糟的是 unlockAchievement 紧接着按 battleFeats 判进度，
+     * 写还没落它就查，progress=0 → 解锁被静默拒绝。
+     * 用户看到的就是「一夜通天有记录，第一层月光和五面之力没有」。
+     */
+    featWriteLock = featWriteLock.then(async () => {
+      const bs = get().battleState;
+      if (!bs) return;
+      if ((bs.battleFeats ?? []).includes(feat)) return;
+      await get().saveBattleState({ ...bs, battleFeats: [...(bs.battleFeats ?? []), feat] });
+    }).catch((err: unknown) => { console.error('[battleFeat] 写入失败', err); });
+    await featWriteLock;
+    // 壮举 id 与成就 id 一一对应（constants/ACHIEVEMENTS battle_feat 条目）
+    await get().unlockAchievement(`battle_${feat}`);
+  },
+
+  repairBattleFeats: async () => {
+    const bs = get().battleState;
+    if (!bs) return;
+    const feats = new Set(bs.battleFeats ?? []);
+    const before = feats.size;
+    // ① 可从别处推出来的事实：通关过区层 ⇒ 一定拿过「第一层月光」；
+    //    「一夜通天」与它是同一句里记的，有后者必有前者
+    if ((bs.defeatedShadowLog?.length ?? 0) > 0 || (bs.maxStratumLevel ?? 0) > 0) feats.add('first_clear');
+    if (feats.has('night_climb')) feats.add('first_clear');
+    // ② 成就已解锁但壮举丢了 → 按成就补回壮举（竞态里丢的那几发）
+    for (const a of get().achievements) {
+      if (a.unlocked && a.id.startsWith('battle_')) feats.add(a.id.slice('battle_'.length));
+    }
+    if (feats.size !== before) {
+      await get().saveBattleState({ ...bs, battleFeats: [...feats] });
+    }
+    // ③ 反向：壮举在、成就却没解锁（写落地前就被查过进度的那几发）
+    for (const f of feats) {
+      const ach = get().achievements.find(a => a.id === `battle_${f}`);
+      if (ach && !ach.unlocked) await get().unlockAchievement(`battle_${f}`);
+    }
+  },
+
+  deliverDefeatLetter: async () => {
+    const { battleState: bs, shadow, stratum, settings } = get();
+    if (!bs || !shadow || !stratum) return;
+    const todayKey = toLocalDateKey();
+    if (bs.pendingCatLetter?.dateKey === todayKey) return; // 当晚只写一封
+    const ts = bs.towerSession;
+    const curFloor = stratum.nodes.find(n => n.id === stratum.currentNodeId)?.floor ?? 0;
+    const facts = {
+      shadowName: shadow.name,
+      stratumName: stratum.name,
+      floor: stratum.baseFloor + curFloor,
+      damageDealt: ts?.damageDealt ?? 0,
+      maxSingleHit: ts?.maxSingleHit ?? 0,
+      weaknessHits: ts?.weaknessHits ?? 0,
+      mobsDefeated: ts?.mobsDefeated ?? 0,
+    };
+    // F6 observation 记忆源首发：中性事实，供黑猫日后自然提起（信正文不进记忆，避免口吻污染）
+    try {
+      await db.navigatorMemos.put({
+        id: uuidv4(),
+        source: 'observation',
+        text: `${todayKey} 晚，用户在影时间高塔【${facts.stratumName}】第${facts.floor}层败退（对手「${facts.shadowName}」，本晚造成 ${facts.damageDealt} 点伤害、讨伐 ${facts.mobsDefeated} 只杂影）。`,
+        importance: 3,
+        status: 'active',
+        createdAt: new Date(),
+      });
+    } catch { /* memo 失败不阻塞信 */ }
+    const text = await generateDefeatLetter(settings, facts);
+    const cur = get().battleState;
+    if (!cur) return;
+    await get().saveBattleState({ ...cur, pendingCatLetter: { text, dateKey: todayKey } });
+  },
+
+  // ── Lv6 · 最终 BOSS「伪神」（PRD_FINAL_BOSS §3/§6）───────────
+
+  collectFinalBossFacts: () => {
+    const { attributes, activities, todos, callingCards, wishes, battleState } = get();
+    const ATTR_LIST: AttributeId[] = ['knowledge', 'guts', 'dexterity', 'kindness', 'charm'];
+    const attrLevels = Object.fromEntries(
+      ATTR_LIST.map(a => [a, attributes.find(x => x.id === a)?.level ?? 1]),
+    ) as Record<AttributeId, number>;
+    const attrPoints = Object.fromEntries(
+      ATTR_LIST.map(a => [a, attributes.find(x => x.id === a)?.points ?? 0]),
+    ) as Record<AttributeId, number>;
+    // 强/弱以点数排序（等级会因阈值不同而并列，点数才是连续量）
+    const sorted = [...ATTR_LIST].sort((a, b) => attrPoints[b] - attrPoints[a]);
+
+    // 记录日期序列 → 首条距今 / 当前连续 / 历史最长断链
+    const dayKeys = Array.from(new Set(activities.map(a => toLocalDateKey(new Date(a.date))))).sort();
+    const todayKey = toLocalDateKey();
+    const dayNum = (k: string) => Math.floor(new Date(k + 'T00:00:00').getTime() / 86400000);
+    let longestGapDays = 0;
+    for (let i = 1; i < dayKeys.length; i++) {
+      longestGapDays = Math.max(longestGapDays, dayNum(dayKeys[i]) - dayNum(dayKeys[i - 1]) - 1);
+    }
+    const daysSinceFirstRecord = dayKeys.length > 0 ? Math.max(0, dayNum(todayKey) - dayNum(dayKeys[0])) : 0;
+
+    const activeCards = callingCards ?? [];
+    const openWishes = (wishes ?? []).filter(w => !w.archivedAt && w.status !== 'archived');
+    const wishAges = openWishes.map(w => Math.max(0, dayNum(todayKey) - Math.floor(new Date(w.createdAt).getTime() / 86400000)));
+
+    return {
+      attrLevels,
+      attrPoints,
+      strongest: sorted[0],
+      weakest: sorted[sorted.length - 1],
+      countercurrentCount: activities.filter(a => a.category === 'countercurrent').length,
+      totalRecords: activities.length,
+      daysSinceFirstRecord,
+      currentStreak: currentRecordStreak(activities.map(a => a.date), todayKey),
+      longestGapDays,
+      todosDone: todos.filter(t => !!t.completedAt).length,
+      todosOpen: todos.filter(t => t.isActive && !t.archivedAt && !t.completedAt).length,
+      cardsAchieved: activeCards.filter(c => c.archiveReason === 'auto_todos').length,
+      cardsExpired: activeCards.filter(c => c.archiveReason === 'auto_date').length,
+      wishesOpen: openWishes.length,
+      wishAvgDays: wishAges.length > 0 ? Math.round(wishAges.reduce((s, v) => s + v, 0) / wishAges.length) : 0,
+      shadowsDefeated: battleState?.shadowsDefeated ?? 0,
+    } satisfies FinalBossFacts;
+  },
+
+  revealFinalBoss: async ({ stratumName, stratumDescription, name, description, invertedAttributes, responseLines, weakAttribute, flaw }) => {
+    const prev = get().stratum;
+    const cfg = SHADOW_LEVEL_CONFIG[5];
+    const boss: Shadow = {
+      id: uuidv4(),
+      level: 6,
+      name,
+      description,
+      invertedAttributes,
+      weakAttribute,
+      maxHp: cfg.maxHp, currentHp: cfg.maxHp,
+      maxHp2: cfg.maxHp2, currentHp2: cfg.maxHp2,
+      maxHp3: cfg.maxHp3, currentHp3: cfg.maxHp3,
+      responseLines,
+      attackPower: BOSS_ATTACK_BY_LEVEL[5],
+      // 固定词缀，不走随机 roll：敏锐（更痛）/迅捷（先制）/月蚀（弱点须洞察揭开）。
+      // 刻意不给「顽固」——血池已在 SHADOW_LEVEL_CONFIG[5] 显式定档，再 ×1.3 就成了磨。
+      affixes: ['keen', 'swift', 'eclipse'],
+      isFinalBoss: true,
+      flaw,
+      createdAt: new Date(),
+    };
+    const stratum = buildFinalStratum({
+      stratumId: uuidv4(),
+      baseFloor: prev ? prev.baseFloor + prev.floors : 0,
+      now: new Date(),
+      name: stratumName,
+      description: stratumDescription,
+    });
+    await get().saveShadow(boss);
+    await get().saveStratum(stratum);
+    const bs = get().battleState;
+    if (bs) {
+      await get().saveBattleState({
+        ...bs, status: 'idle',
+        finalBossStage: 'revealed', finalBossFlaw: flaw,
+      });
+    }
+  },
+
+  beginFinalBossFinale: async () => {
+    const bs = get().battleState;
+    if (!bs || bs.finalBossStage === 'defeated') return;
+    if (bs.finalBossStage === 'finale') return;   // 已在演出中：不要把阶段冲回 shock
+    await get().saveBattleState({
+      ...bs, finalBossStage: 'finale', finalePhase: 'shock', finaleHits: 0, finaleAllySp: 0,
+      // 正常路线这个值在致命一击落地时就记了；坏档自愈走到这里时补记，终结后才还得回被碾掉的 SP
+      finaleSpBefore: bs.finaleSpBefore ?? bs.sp,
+    });
+  },
+
+  saveFinaleProgress: async ({ phase, hits, allySp, playerHp, sp }) => {
+    const bs = get().battleState;
+    if (!bs) return;
+    await get().saveBattleState({
+      ...bs,
+      finalePhase: phase ?? bs.finalePhase,
+      finaleHits: hits ?? bs.finaleHits,
+      finaleAllySp: allySp ?? bs.finaleAllySp,
+      playerHp: playerHp ?? bs.playerHp,
+      sp: sp ?? bs.sp,
+    });
+  },
+
+  defeatFinalBoss: async () => {
+    const { battleState, shadow, attributes, stratum } = get();
+    if (!battleState) return null;
+    if (battleState.finalBossStage === 'defeated') return null;
+    const todayKey = toLocalDateKey();
+    const arsenal: BattleArsenal = battleState.arsenal ?? { relics: [], myths: [], oaths: [], chains: [] };
+    // 英雄的证明：唯一、满月、一生一枚（重入演出不会再发第二枚）
+    const already = arsenal.relics.find(r => r.kind === 'heroproof');
+    const relic: RelicInstance = already ?? {
+      id: uuidv4(),
+      kind: 'heroproof',
+      quality: 'full',
+      value: HEROPROOF_SP_CUT,
+      obtainedAt: todayKey,
+    };
+    const record = shadow ? {
+      shadowName: shadow.name,
+      level: shadow.level,
+      breachDate: toLocalDateKey(new Date(shadow.createdAt)),
+      defeatDate: todayKey,
+      daysElapsed: Math.max(1, Math.floor((Date.now() - new Date(shadow.createdAt).getTime()) / 86400000)),
+      description: shadow.description,
+      affixes: shadow.affixes,
+      quote: battleState.finalBossFlaw?.verdict ?? shadow.responseLines[0],
+      playerTotalLevel: attributes.reduce((s, a) => s + (a.unlocked === false ? 0 : (a.level ?? 1)), 0),
+      stratumLevel: 6,
+    } : null;
+    await get().saveBattleState({
+      ...battleState,
+      status: 'idle',
+      shadowsDefeated: battleState.shadowsDefeated + 1,
+      lastDefeatedWeakAttribute: shadow?.weakAttribute,
+      defeatedShadowLog: record
+        ? [...(battleState.defeatedShadowLog ?? []), record]
+        : battleState.defeatedShadowLog,
+      arsenal: already ? arsenal : { ...arsenal, relics: [...arsenal.relics, relic] },
+      // 演出里 SP 被碾到 1 再加援军：终结后按「致命一击时的 SP + 援军」还回去，不吞玩家原来的存量
+      sp: Math.max(battleState.sp, (battleState.finaleSpBefore ?? 0) + (battleState.finaleAllySp ?? 0)),
+      finalBossStage: 'defeated',
+      finalBossDefeatedAt: todayKey,
+      finalePhase: 'reward',
+    });
+    // 顶阙通关 → 深渊回廊入口在 BattleArena 恢复显示
+    const st = get().stratum ?? stratum;
+    if (st && st.status === 'climbing') {
+      await get().saveStratum({
+        ...st,
+        status: 'cleared',
+        // 伪神不走 completeTowerNode（它的胜利被终局演出接管），boss 节点在这里补标
+        nodes: st.nodes.map(n => (n.type === 'boss' ? { ...n, cleared: true } : n)),
+      });
+    }
+    return relic;
+  },
+
+  highestClearedStratum: () => {
+    const { battleState, stratum } = get();
+    let best = battleState?.maxStratumLevel ?? 0;
+    // 存量档没有 maxStratumLevel：从档案里的心魔等级 + 当前已通关区层反推
+    for (const r of battleState?.defeatedShadowLog ?? []) {
+      const lv = Math.min(5, r.stratumLevel ?? r.level ?? 0);
+      if (lv > best) best = lv;
+    }
+    if (stratum && !stratum.abyssRing && !stratum.revisit && stratum.status === 'cleared') {
+      best = Math.max(best, Math.min(5, stratum.level));
+    }
+    // 打过深渊 / 顶阙的人，主塔五层必然全通
+    if (stratum?.abyssRing || (battleState?.finalBossStage && battleState.finalBossStage !== 'revealed')) best = 5;
+    return Math.min(5, best);
+  },
+
+  startRevisit: async (level) => {
+    const { stratum, shadow, battleState, settings } = get();
+    if (!battleState) return;
+    const lv = Math.max(1, Math.min(5, Math.round(level)));
+    const cfg = SHADOW_LEVEL_CONFIG[lv - 1];
+    // 已寄存过就不要再存一次（否则第二次重游会把「重游层」当主线存进去）
+    const alreadyParked = !!battleState.parkedStratum;
+    const archived = (battleState.defeatedShadowLog ?? [])
+      .filter(r => (r.stratumLevel ?? r.level) === lv)
+      .slice(-1)[0]?.shadowName;
+    const { stratum: rv, boss } = buildRevisitStratum({
+      level: lv,
+      stratumId: uuidv4(),
+      bossId: uuidv4(),
+      baseFloor: 0,
+      now: new Date(),
+      eventPoolIds: TOWER_EVENT_IDS,
+      memoryEcho: memoryEchoCandidates(get().activities).length >= MEMORY_ECHO_MIN_CANDIDATES,
+      chestSp: (floor) => nodeSpReward(lv, floor, 0, Math.random) + 5,
+      attrNames: settings.attributeNames as Record<AttributeId, string>,
+      hp: { maxHp: cfg.maxHp, maxHp2: cfg.maxHp2 },
+      attackPower: BOSS_ATTACK_BY_LEVEL[lv - 1],
+      archivedName: archived,
+    });
+    await get().saveBattleState({
+      ...battleState,
+      maxStratumLevel: get().highestClearedStratum(),
+      parkedStratum: alreadyParked ? battleState.parkedStratum : (stratum ?? undefined),
+      parkedShadow: alreadyParked ? battleState.parkedShadow : (shadow ?? undefined),
+      status: 'idle',
+    });
+    await get().saveShadow(boss);
+    await get().saveStratum(rv);
+  },
+
+  endRevisit: async () => {
+    const bs = get().battleState;
+    if (!bs) return;
+    const parked = bs.parkedStratum;
+    const parkedShadow = bs.parkedShadow;
+    if (parked) {
+      await db.strata.clear();
+      await db.strata.put(parked);
+      set({ stratum: parked });
+    } else {
+      await db.strata.clear();
+      set({ stratum: null });
+    }
+    await db.shadows.clear();
+    if (parkedShadow) {
+      await db.shadows.put(parkedShadow);
+      set({ shadow: parkedShadow });
+    } else {
+      set({ shadow: null });
+    }
+    const next = { ...bs, status: 'idle' as const };
+    delete next.parkedStratum;
+    delete next.parkedShadow;
+    await get().saveBattleState(next);
+  },
+
+  // ── 满月心魔（第 6 轮 · PRD §11.6）──────────────────────────────
+  ensureMoonShadow: async () => {
+    let bs = get().battleState;
+    if (!bs || bs.finalBossStage !== 'defeated') return;
+    const now = new Date();
+    const today = toLocalDateKey(now);
+    let ms = bs.moonShadow;
+    // 满月那天没进战场（没判定过）→ 过了那天就作废，不回补
+    if (ms && ms.date < today && ms.eligible === undefined && (ms.status === 'generating' || ms.status === 'ready')) {
+      ms = { ...ms, status: 'skipped', eligible: false, shadow: undefined };
+      bs = { ...bs, moonShadow: ms };
+      await get().saveBattleState(bs);
+    }
+    // 生成好了、那一环还在等（中途去「回头看看」了）→ 回来就装
+    if (ms && ms.status === 'ready' && ms.eligible === true && get().stratum?.moonBossPending) {
+      await installMoonGuard(get, ms);
+      return;
+    }
+    const job = await import('@/utils/moonJob');
+    // 还在生成、但没有任务在跑（App 被杀过）：当天的接着跑；隔了天的不再等 AI，直接离线模板收尾
+    if (ms && ms.status === 'generating' && !job.moonJobRunning(ms.slot)) {
+      void job.startMoonJob(ms.slot, { stale: ms.date < today });
+    }
+    const slot = fullMoonSlotOnDay(now);
+    if (slot === null || ms?.slot === slot) return;
+    const month = monthKeyOf(now);
+    // 今天已经进过战场才走到这里（App 跨夜一直开着）：这个月忽略
+    if (bs.lastChallengeDate === today) {
+      await get().saveBattleState({ ...bs, moonShadow: { slot, month, date: today, status: 'skipped', eligible: false } });
+      return;
+    }
+    await get().saveBattleState({ ...bs, moonShadow: { slot, month, date: today, status: 'generating' } });
+    void job.startMoonJob(slot);
+  },
+
+  moonCheckOnEntry: async () => {
+    const bs = get().battleState;
+    const ms = bs?.moonShadow;
+    if (!bs || !ms || ms.eligible !== undefined) return;
+    if (ms.status !== 'generating' && ms.status !== 'ready') return;
+    if (ms.date !== toLocalDateKey()) return;
+    const st = get().stratum;
+    // 「一环还没走过」= 回廊环、不是重游、没踏进第 1 层、没有清过的节点
+    const fresh = !!st && !!st.abyssRing && !st.revisit && st.status === 'climbing' && !st.currentNodeId && st.nodes.every(n => !n.cleared);
+    if (!st || !fresh) {
+      await get().saveBattleState({ ...bs, moonShadow: { ...ms, status: 'skipped', eligible: false, shadow: undefined } });
+      return;
+    }
+    if (ms.status === 'ready' && ms.shadow) {
+      await installMoonGuard(get, ms);
+    } else {
+      // 还在显形：顶层先锁着，生成完再换进来
+      await get().saveStratum({ ...st, moonBossPending: true });
+      await get().saveBattleState({ ...get().battleState!, moonShadow: { ...ms, eligible: true } });
+    }
+  },
+
+  completeMoonShadow: async (slot, data, offline) => {
+    const bs = get().battleState;
+    const ms = bs?.moonShadow;
+    if (!bs || !ms || ms.slot !== slot || ms.status !== 'generating') return;
+    const shadow = buildMoonShadow(data, {
+      id: uuidv4(),
+      slot,
+      month: ms.month,
+      baseHp: SHADOW_LEVEL_CONFIG[4].maxHp,
+      defeatedMoons: bs.moonDefeats ?? 0,
+      now: new Date(),
+    });
+    const ready: MoonShadowState = { ...ms, status: 'ready', shadow, name: shadow.name, offline };
+    await get().saveBattleState({ ...bs, moonShadow: ready });
+    if (ms.eligible === true && get().stratum?.abyssRing && get().stratum?.moonBossPending) await installMoonGuard(get, ready);
+  },
+
+  enterAbyss: async () => {
+    // 满月心魔：先确保本月的已经建好（新开的这一环可能就是要装它的那一环）
+    await get().ensureMoonShadow();
+    const { stratum, shadow, settings, battleState } = get();
+    // 从「当前环」与「历史最深环」里取大：Lv6 顶阙会顶掉 stratum（塔与区层是单例），
+    // 只看 stratum.abyssRing 会让打完伪神的回廊玩家从第 1 环重开
+    const ring = Math.max(stratum?.abyssRing ?? 0, battleState?.abyssHighestRing ?? 0) + 1;
+    const baseFloor = stratum ? stratum.baseFloor + stratum.floors : 0;
+    // 深渊周常（第 6 轮）：进环那一刻定下本周规则，整环有效
+    const weekKey = weekKeyOf(new Date());
+    const rule = abyssWeeklyRule(weekKey);
+    const { stratum: ringStratum, guard } = buildAbyssRing({
+      ring,
+      stratumId: uuidv4(),
+      guardId: uuidv4(),
+      baseFloor,
+      now: new Date(),
+      eventPoolIds: TOWER_EVENT_IDS,
+      memoryEcho: memoryEchoCandidates(get().activities).length >= MEMORY_ECHO_MIN_CANDIDATES,
+      chestSp: (floor) => nodeSpReward(5, floor, 0, Math.random) + 5,
+      lastWeakAttribute: shadow?.weakAttribute,
+      attrNames: settings.attributeNames as Record<AttributeId, string>,
+      rule: rule.id,
+      ruleWeakAttribute: abyssWeeklyWeakAttribute(weekKey),
+    });
+    await get().saveShadow(guard);
+    await get().saveStratum(ringStratum);
+    const bs = get().battleState;
+    if (bs) {
+      const abyssWeekly = bs.abyssWeekly && bs.abyssWeekly.weekKey === weekKey ? bs.abyssWeekly : { weekKey, ruleId: rule.id, bestRing: 0 };
+      await get().saveBattleState({ ...bs, status: 'idle', abyssWeekly });
+    }
+    // 满月当天新开的这一环：判定一次要不要把顶层换成月度心魔
+    await get().moonCheckOnEntry();
+  },
+
+  removeRandomShadowAffix: async () => {
+    const { shadow } = get();
+    if (!shadow || !(shadow.affixes?.length)) return null;
+    const idx = Math.floor(Math.random() * shadow.affixes.length);
+    const removed = shadow.affixes[idx];
+    const affixes = shadow.affixes.filter((_, i) => i !== idx);
+    let { maxHp, maxHp2, currentHp, currentHp2 } = shadow;
+    if (removed === 'stubborn') {
+      // 顽固词缀曾把血池 ×1.3——移除时回落并夹住当前值
+      maxHp = Math.round(maxHp / AFFIX_HP_MULT);
+      currentHp = Math.min(currentHp, maxHp);
+      if (maxHp2 !== undefined) {
+        maxHp2 = Math.round(maxHp2 / AFFIX_HP_MULT);
+        if (currentHp2 !== undefined) currentHp2 = Math.min(currentHp2, maxHp2);
+      }
+    }
+    await get().saveShadow({ ...shadow, affixes, maxHp, maxHp2, currentHp, currentHp2 });
+    return removed;
+  },
+
+  grantEventLoot: async (kind) => {
+    const { stratum, battleState } = get();
+    if (!battleState) return '';
+    const arsenal: BattleArsenal = battleState.arsenal ?? { relics: [], myths: [], oaths: [], chains: [] };
+    const ctx = {
+      stratumLevel: stratum?.level ?? 1,
+      floorRatio: 0.5,
+      ownedChainKeys: arsenal.chains.map(c => c.key),
+      ownedOathKinds: arsenal.oaths.map(o => o.kind),
+      rng: Math.random,
+      makeId: uuidv4,
+      today: toLocalDateKey(),
+    };
+    if (kind === 'relicWaning') {
+      const relic = rollRelic(ctx, 'waning');
+      await get().saveBattleState({ ...battleState, arsenal: { ...arsenal, relics: [...arsenal.relics, relic] } });
+      return lootLabel({ kind: 'relic', relic });
+    }
+    const myth = rollMyth(ctx);
+    await get().saveBattleState({ ...battleState, arsenal: { ...arsenal, myths: [...arsenal.myths, myth] } });
+    return lootLabel({ kind: 'myth', myth });
+  },
+
+  salvageRelic: async (relicId) => {
+    const bs = get().battleState;
+    const arsenal = bs?.arsenal;
+    if (!bs || !arsenal) return 0;
+    const relic = arsenal.relics.find(r => r.id === relicId);
+    if (!relic) return 0;
+    const sp = RELIC_SALVAGE_SP[relic.quality];
+    await get().saveBattleState({
+      ...bs,
+      sp: bs.sp + sp,
+      arsenal: { ...arsenal, relics: arsenal.relics.filter(r => r.id !== relicId) },
+    });
+    return sp;
+  },
+
+  toggleEquipRelic: async (relicId) => {
+    const { battleState: bs, stratum } = get();
+    const arsenal = bs?.arsenal;
+    if (!bs || !arsenal) return false;
+    const relic = arsenal.relics.find(r => r.id === relicId);
+    if (!relic) return false;
+    if (!relic.equipped) {
+      const slots = RELIC_SLOTS_BY_STRATUM[Math.min(4, Math.max(0, (stratum?.level ?? 1) - 1))];
+      const equippedCount = arsenal.relics.filter(r => r.equipped).length;
+      if (equippedCount >= slots) return false;
+    }
+    await get().saveBattleState({
+      ...bs,
+      arsenal: {
+        ...arsenal,
+        relics: arsenal.relics.map(r => (r.id === relicId ? { ...r, equipped: !r.equipped } : r)),
+      },
+    });
+    return true;
+  },
+
+  socketMyth: async (attr, skillLevel, stoneId) => {
+    const { persona, battleState: bs } = get();
+    const arsenal = bs?.arsenal;
+    if (!persona || !arsenal) return '数据未就绪';
+    const stone = arsenal.myths.find(m => m.id === stoneId);
+    if (!stone) return '迷思石不存在';
+    const equippedElsewhere = Object.values(persona.skills).flat().some(s => s.socket?.stoneId === stoneId);
+    if (equippedElsewhere) return '这枚迷思已镶嵌在其他技能上';
+    const skills = persona.skills[attr];
+    const idx = skills.findIndex(s => s.level === skillLevel);
+    if (idx < 0) return '技能不存在';
+    const target = skills[idx];
+    if (target.oath) return '誓约技不可镶嵌迷思';
+    if (target.socket) return '该技能已有迷思（先拆下）';
+    if (MYTH_POOL[stone.kind].damageOnly && target.type !== 'damage' && target.type !== 'crit') {
+      return '「淬毒之牙」只能镶入伤害/暴击技能';
+    }
+    const nextSkills = { ...persona.skills, [attr]: skills.map((s, i) => (i === idx ? { ...s, socket: { stoneId, kind: stone.kind, value: stone.value } } : s)) };
+    await get().savePersona({ ...persona, skills: nextSkills });
+    return null;
+  },
+
+  unsocketMyth: async (attr, skillLevel) => {
+    const { persona } = get();
+    if (!persona) return;
+    const skills = persona.skills[attr];
+    // R18 觉醒烧录（permanent）不可卸除
+    const nextSkills = { ...persona.skills, [attr]: skills.map(s => (s.level === skillLevel && !s.socket?.permanent ? { ...s, socket: undefined } : s)) };
+    await get().savePersona({ ...persona, skills: nextSkills });
+  },
+
+  // ── R18 面具羁绊：战斗胜利后按本场召唤过的面具累加出战场次 ──
+  recordMaskBattles: async (masks) => {
+    const bs = get().battleState;
+    if (!bs || masks.length === 0) return;
+    const next = { ...(bs.maskBattles ?? {}) } as Partial<Record<AttributeId, number>>;
+    for (const m of masks) next[m] = (next[m] ?? 0) + 1;
+    await get().saveBattleState({ ...bs, maskBattles: next });
+  },
+
+  // ── R18 技能觉醒：满星 + 消耗一颗迷思 → 词条烧录永久 + 改名 + 星级清零进下一轮 ──
+  awakenSkill: async (attr, skillLevel, stoneId, newName) => {
+    const { persona, battleState: bs } = get();
+    const arsenal = bs?.arsenal;
+    if (!persona || !bs || !arsenal) return '数据未就绪';
+    const skills = persona.skills[attr];
+    const idx = skills.findIndex(s => s.level === skillLevel);
+    if (idx < 0) return '技能不存在';
+    const target = skills[idx];
+    if (target.unlocked === false) return '技能尚未解锁';
+    if (masteryStars(target.mastery ?? 0, target.level) < 3) return '熟练度未满星——继续使用它吧';
+    if (target.oath) return '誓约技不可觉醒';
+    if (target.socket && !target.socket.permanent) return '技能镶有迷思——先拆下（或直接用它觉醒）';
+    const stone = arsenal.myths.find(m => m.id === stoneId);
+    if (!stone) return '迷思石不存在';
+    const equippedElsewhere = Object.values(persona.skills).flat().some(s => s.socket?.stoneId === stoneId && !s.socket.permanent);
+    if (equippedElsewhere) return '这枚迷思已镶嵌在其他技能上';
+    if (MYTH_POOL[stone.kind].damageOnly && target.type !== 'damage' && target.type !== 'crit') {
+      return '「淬毒之牙」只能烧录进伤害/暴击技能';
+    }
+    const name = (newName ?? '').trim() || `${target.name}·觉醒`;
+    const nextSkills = {
+      ...persona.skills,
+      [attr]: skills.map((s, i) => (i === idx ? {
+        ...s,
+        name,
+        mastery: 0,
+        awakenRound: (s.awakenRound ?? 0) + 1,
+        socket: { stoneId: stone.id, kind: stone.kind, value: stone.value, permanent: true },
+      } : s)),
+    };
+    // 石头消耗：从背包移除（烧进技能里了）
+    const nextArsenal = { ...arsenal, myths: arsenal.myths.filter(m => m.id !== stoneId) };
+    await get().savePersona({ ...persona, skills: nextSkills });
+    await get().saveBattleState({ ...get().battleState!, arsenal: nextArsenal });
+    return null;
+  },
+
+  equipOathStone: async (attr, skillLevel, stoneId) => {
+    const { persona, battleState: bs } = get();
+    const arsenal = bs?.arsenal;
+    if (!persona || !bs || !arsenal) return '数据未就绪';
+    const stone = arsenal.oaths.find(o => o.id === stoneId);
+    if (!stone) return '誓约石不存在';
+    if (stone.equippedAttr) return '这枚誓约已被装备';
+    const skills = persona.skills[attr];
+    if (skills.some(s => s.oath)) return '每位 Persona 只能缔结一份誓约';
+    const idx = skills.findIndex(s => s.level === skillLevel);
+    if (idx < 0) return '技能槽不存在';
+    if (skills[idx].socket) return '该技能镶有迷思——先拆下再置换';
+    const personaName = persona.attributePersonas?.[attr]?.name ?? persona.name;
+    let oathSkill = buildOathSkill(stone.kind, stoneId, skills[idx], personaName);
+    // 命名缓存命中：重复装备不再调 AI
+    const cached = stone.namedCache?.[attr];
+    if (cached) oathSkill = { ...oathSkill, name: cached.name, description: cached.description };
+    const nextSkills = { ...persona.skills, [attr]: skills.map((s, i) => (i === idx ? oathSkill : s)) };
+    await get().savePersona({ ...persona, skills: nextSkills });
+    await get().saveBattleState({
+      ...get().battleState!,
+      arsenal: { ...arsenal, oaths: arsenal.oaths.map(o => (o.id === stoneId ? { ...o, equippedAttr: attr } : o)) },
+    });
+    return null;
+  },
+
+  unequipOathStone: async (attr) => {
+    const { persona, battleState: bs } = get();
+    if (!persona) return;
+    const skills = persona.skills[attr];
+    const oathSkill = skills.find(s => s.oath);
+    if (!oathSkill?.oath) return;
+    const stoneId = oathSkill.oath.stoneId;
+    // 完整可逆：原技能快照恢复（保留置换期间攒下的熟练度不回写——快照即当时状态）
+    const nextSkills = { ...persona.skills, [attr]: skills.map(s => (s.oath ? s.oath.original : s)) };
+    await get().savePersona({ ...persona, skills: nextSkills });
+    const arsenal = bs?.arsenal;
+    if (bs && arsenal) {
+      await get().saveBattleState({
+        ...get().battleState!,
+        arsenal: { ...arsenal, oaths: arsenal.oaths.map(o => (o.id === stoneId ? { ...o, equippedAttr: undefined } : o)) },
+      });
+    }
+  },
+
+  renameOathSkill: async (attr, name, description) => {
+    const { persona, battleState: bs } = get();
+    if (!persona) return;
+    const skills = persona.skills[attr];
+    const oathSkill = skills.find(s => s.oath);
+    if (!oathSkill?.oath) return;
+    const nextSkills = { ...persona.skills, [attr]: skills.map(s => (s.oath ? { ...s, name, description } : s)) };
+    await get().savePersona({ ...persona, skills: nextSkills });
+    // 缓存到石头：重复装备不再调 AI
+    const arsenal = bs?.arsenal;
+    if (bs && arsenal) {
+      await get().saveBattleState({
+        ...get().battleState!,
+        arsenal: {
+          ...arsenal,
+          oaths: arsenal.oaths.map(o => (o.id === oathSkill.oath!.stoneId
+            ? { ...o, namedCache: { ...o.namedCache, [attr]: { name, description } } }
+            : o)),
+        },
+      });
+    }
+  },
+
+  setActiveChain: async (key) => {
+    const bs = get().battleState;
+    const arsenal = bs?.arsenal;
+    if (!bs || !arsenal) return;
+    if (key !== null && !arsenal.chains.some(c => c.key === key)) return;
+    await get().saveBattleState({ ...bs, arsenal: { ...arsenal, activeChainKey: key ?? undefined } });
+  },
+
+  recordSkillUses: async (uses) => {
+    const { persona } = get();
+    if (!persona || uses.length === 0) return;
+    const counts = new Map<string, number>();
+    for (const u of uses) counts.set(`${u.attr}:${u.level}`, (counts.get(`${u.attr}:${u.level}`) ?? 0) + 1);
+    const nextSkills = { ...persona.skills };
+    for (const attr of Object.keys(nextSkills) as AttributeId[]) {
+      nextSkills[attr] = nextSkills[attr].map(s => {
+        const inc = counts.get(`${attr}:${s.level}`) ?? 0;
+        return inc > 0 ? { ...s, mastery: (s.mastery ?? 0) + inc } : s;
+      });
+    }
+    await get().savePersona({ ...persona, skills: nextSkills });
+    await get().refreshSkillUnlocks();
+  },
+
+  refreshSkillUnlocks: async () => {
+    const { persona, attributes } = get();
+    if (!persona || attributes.length === 0) return;
+    const levelOf = (attr: AttributeId) => {
+      const a = attributes.find(x => x.id === attr);
+      return a && a.unlocked !== false ? (a.level ?? 1) : 0;
+    };
+    let changed = false;
+    const nextSkills = { ...persona.skills };
+    for (const attr of Object.keys(nextSkills) as AttributeId[]) {
+      const attrLevel = levelOf(attr);
+      const sorted = [...nextSkills[attr]].sort((a, b) => a.level - b.level);
+      const byLevel = new Map(sorted.map(s => [s.level, s]));
+      nextSkills[attr] = nextSkills[attr].map(s => {
+        let next = s;
+        if (next.mastery === undefined) { next = { ...next, mastery: 0 }; changed = true; }
+        if (next.unlocked === undefined) {
+          // 存量迁移：按当时属性等级置位——已解锁的不回锁（拍板）
+          next = { ...next, unlocked: attrLevel >= next.level };
+          changed = true;
+        } else if (!next.unlocked) {
+          // 双条件解锁：属性等级 ≥ N 且 技能 N−1 满星
+          const prev = byLevel.get(next.level - 1);
+          const prevFull = next.level === 1 || (prev ? masteryStars(prev.mastery ?? 0, prev.level) === 3 : false);
+          if (attrLevel >= next.level && prevFull) {
+            next = { ...next, unlocked: true };
+            changed = true;
+          }
+        }
+        return next;
+      });
+    }
+    if (changed) await get().savePersona({ ...persona, skills: nextSkills });
+  },
+
+  // ── 同伴 / Confidant ─────────────────────────────────────────
+
+  loadConfidants: async () => {
+    const [loaded, events] = await Promise.all([
+      db.confidants.orderBy('createdAt').toArray(),
+      db.confidantEvents.orderBy('createdAt').reverse().toArray(),
+    ]);
+    // v2.7.0.6：在线同伴换用 ONLINE_INTIMACY_THRESHOLDS。老档案一次性按等级内进度比例换算点数，等级不掉
+    const migrated: Confidant[] = [];
+    const confidants = loaded.map(c => {
+      if (c.source !== 'online' || c.intimacyCurve === ONLINE_INTIMACY_CURVE) return c;
+      const next = {
+        ...c,
+        intimacyPoints: remapIntimacyPoints(c.intimacyPoints, c.intimacy, INTIMACY_THRESHOLDS, ONLINE_INTIMACY_THRESHOLDS),
+        intimacyCurve: ONLINE_INTIMACY_CURVE,
+      };
+      migrated.push(next);
+      return next;
+    });
+    if (migrated.length) await db.confidants.bulkPut(migrated);
+    set({ confidants, confidantEvents: events });
+  },
+
+  addConfidant: async (params) => {
+    // 串行化并发创建请求，否则两次 addConfidant 可能同时读到"未占用"再各自写入，绕过唯一性检查
+    const run = async () => {
+      const { name, description, match, source = 'offline', linkedCloudUserId, linkedEmail, initialLevel, skillAttribute } = params;
+      const { user, settings } = get();
+      if (!user) throw new Error('尚未创建档案');
+      // 去重：在线同伴每个 linkedCloudUserId 至多一张卡（含归档）
+      // 读最新 Dexie 表 + 最新内存快照（两次 await 之间可能刚被前一个 lock hold 改过）
+      const allInDb = await db.confidants.toArray();
+      if (source === 'online' && linkedCloudUserId) {
+        const dbHit = allInDb.find(c => c.source === 'online' && c.linkedCloudUserId === linkedCloudUserId);
+        if (dbHit) {
+          await get().loadConfidants();
+          throw new Error('同伴卡已存在（每位在线好友只能有一张 COOP 卡）');
+        }
+      }
+      if (allInDb.some(c => !c.archivedAt && c.arcanaId === match.arcanaId)) {
+        throw new Error('该阿卡纳已被另一位同伴占用');
+      }
+      const now = new Date();
+      // 用户选择的等级优先；否则使用 AI 建议
+      const chosenLv = typeof initialLevel === 'number'
+        ? Math.max(1, Math.min(MAX_INTIMACY, Math.floor(initialLevel)))
+        : Math.max(1, match.initialIntimacy);
+      const basePts = levelBasePoints(chosenLv, thresholdsFor({ source }));
+      const buffs = buffsForLevel(match.arcanaId, chosenLv, settings.attributeNames, skillAttribute);
+      const confidant: Confidant = {
+        id: uuidv4(),
+        userId: user.id,
+        source,
+        linkedCloudUserId,
+        linkedEmail,
+        name: name.trim() || '（未命名同伴）',
+        arcanaId: match.arcanaId,
+        orientation: match.orientation,
+        description: description.trim(),
+        aiInterpretation: match.interpretation,
+        aiAdvice: match.advice,
+        intimacy: chosenLv,
+        intimacyPoints: basePts,
+        ...(source === 'online' ? { intimacyCurve: ONLINE_INTIMACY_CURVE } : {}),
+        skillAttribute,
+        buffs,
+        decayEnabled: false,
+        lastInteractionAt: now,
+        createdAt: now,
+      };
+      const event: ConfidantEvent = {
+        id: uuidv4(),
+        confidantId: confidant.id,
+        date: toLocalDateKey(now),
+        type: 'created',
+        narrative: match.interpretation.slice(0, 80),
+        createdAt: now,
+      };
+      await db.confidants.add(confidant);
+      await db.confidantEvents.add(event);
+      await get().loadConfidants();
+      return confidant;
+    };
+    const next = _addConfidantLock.then(run, run); // 上一个失败也要继续后续请求
+    _addConfidantLock = next.catch(() => { /* 不把 reject 挂到锁上 */ });
+    return next;
+  },
+
+  updateConfidant: async (id, patch) => {
+    const existing = await db.confidants.get(id);
+    if (!existing) return;
+    await db.confidants.put({ ...existing, ...patch });
+    await get().loadConfidants();
+  },
+
+  bumpConfidantIntimacy: async (id, delta, eventType = 'intimacy_up', narrative, extra) => {
+    const { settings } = get();
+    const now = new Date();
+    /**
+     * 带固定 eventId 的加点（COOP 结算 / 一起进步 / 祈愿）：查事件和写点数放进同一个事务，两路并发也只加一次。
+     * 以前是先查内存里的事件列表、再写点数、最后写事件——第二路在第一路写完点数、还没写事件的那一瞬读到新点数，
+     * 就会再加一次；事件主键冲突只拦下事件，点数已经加上去了。
+     */
+    const result = await db.transaction('rw', db.confidants, db.confidantEvents, async () => {
+      if (extra?.eventId && (await db.confidantEvents.get(extra.eventId))) return 'dup' as const;
+      const current = await db.confidants.get(id);
+      if (!current) return null;
+      const oldLv = current.intimacy;
+      const newPoints = Math.max(0, current.intimacyPoints + delta);
+      const newLv = pointsToLevel(newPoints, thresholdsFor(current));
+      const leveledUp = newLv > oldLv;
+      const buffs = leveledUp ? buffsForLevel(current.arcanaId, newLv, settings.attributeNames, current.skillAttribute) : current.buffs;
+      // 每次升级赠送 1 次"星移"次数（Lv 跳跃两级则赠送两次）
+      const starShiftGained = leveledUp ? (newLv - oldLv) : 0;
+      const newCharges = Math.max(0, (current.starShiftCharges ?? 0) + starShiftGained);
+      await db.confidants.put({
+        ...current,
+        intimacy: newLv,
+        intimacyPoints: newPoints,
+        buffs,
+        starShiftCharges: newCharges,
+        lastInteractionAt: now,
+        // COOP 远端事件应用时把 lastInteractionDate 也同步到当天，让"今日已互动"判定生效
+        ...(extra?.lastInteractionDate ? { lastInteractionDate: extra.lastInteractionDate } : {}),
+      });
+      // 事件记录 —— eventId 可由调用方覆盖（COOP 远端事件需要保持双方 id 一致以便去重）
+      const eventId = extra?.eventId || uuidv4();
+      const eventDate = extra?.eventDate || toLocalDateKey(now);
+      const events: ConfidantEvent[] = [];
+      events.push({
+        id: eventId,
+        confidantId: id,
+        date: eventDate,
+        type: delta >= 0 ? eventType : 'intimacy_down',
+        delta,
+        narrative,
+        userInput: extra?.userInput,
+        advice: extra?.advice,
+        createdAt: now,
+      });
+      if (leveledUp) {
+        events.push({
+          id: uuidv4(),
+          confidantId: id,
+          date: toLocalDateKey(now),
+          type: 'level_up',
+          toLevel: newLv,
+          narrative: `亲密度到达 Lv.${newLv}`,
+          createdAt: new Date(now.getTime() + 1),
+        });
+        // 对比新增 buffs
+        const newKinds = new Set(current.buffs.map(b => b.kind));
+        const unlocked = buffs.filter(b => !newKinds.has(b.kind));
+        for (const b of unlocked) {
+          events.push({
+            id: uuidv4(),
+            confidantId: id,
+            date: toLocalDateKey(now),
+            type: 'buff_unlocked',
+            narrative: `解锁「${b.title}」：${b.description}`,
+            createdAt: new Date(now.getTime() + 2),
+          });
+        }
+      }
+      await db.confidantEvents.bulkAdd(events);
+      return { leveledUp, newLv, starShiftGained, eventId };
+    });
+    if (result === 'dup') {
+      // 这笔已经发过（另一路先到了）：点数不动，把现状报回去
+      const cur = await db.confidants.get(id);
+      return { leveledUp: false, newIntimacy: cur?.intimacy ?? 0, starShiftGained: 0, eventId: extra?.eventId ?? '' };
+    }
+    if (!result) return { leveledUp: false, newIntimacy: 0, starShiftGained: 0, eventId: '' };
+    await get().loadConfidants();
+    return { leveledUp: result.leveledUp, newIntimacy: result.newLv, starShiftGained: result.starShiftGained, eventId: result.eventId };
+  },
+
+  recordConfidantInteraction: async ({ id, description, delta, narrative, advice, createActivity, activityAttribute, activityPoints }) => {
+    const current = await db.confidants.get(id);
+    if (!current) return { leveledUp: false, newIntimacy: 0 };
+    const today = toLocalDateKey();
+    if (current.lastInteractionDate === today) {
+      throw new Error('今天已经和 Ta 解读过了，明天再来吧');
+    }
+    // 先把 lastInteractionDate 写进去（与 bumpConfidantIntimacy 的 loadConfidants 合并）
+    await db.confidants.put({ ...current, lastInteractionDate: today });
+    // 再 bump 亲密度：narrative=AI 解读、advice=相处建议、userInput=用户原话分别存储
+    const res = await get().bumpConfidantIntimacy(
+      id, delta, 'conversation', narrative,
+      { userInput: description.trim(), advice, lastInteractionDate: today },
+    );
+
+    // 在线 COOP：把这条事件广播给对方，让 Ta 的本地共享同一条 event_id + intimacy 同步
+    if (current.source === 'online' && current.linkedCloudUserId) {
+      void (async () => {
+        try {
+          const { pb, getUserId } = await import('@/services/pocketbase');
+          if (!pb || !pb.authStore.isValid) {
+            console.warn('[velvet-store] coop broadcast skipped: not logged in');
+            return;
+          }
+          const me = getUserId();
+          if (!me) {
+            console.warn('[velvet-store] coop broadcast skipped: no user id');
+            return;
+          }
+          // 用现有的 event_logged 类型 + payload.kind = 'coop_event' 区分，
+          // 这样不需要在 PB select 字段里新增枚举值就能跑
+          const payload = {
+            kind: 'coop_event',
+            event_id: res.eventId,
+            date: today,
+            event_type: 'conversation',
+            delta,
+            narrative,
+            advice,
+            user_input: description.trim(),
+          };
+          const created = await pb.collection('notifications').create({
+            user: current.linkedCloudUserId,
+            type: 'event_logged',
+            from: me,
+            payload,
+            read: false,
+          });
+          console.info('[velvet-store] coop event broadcast OK, notif id =', created.id);
+        } catch (err) {
+          // PB 把字段级校验细节藏在 err.data 里，明确打出来
+          const rich = err as { status?: number; message?: string; data?: { data?: unknown; message?: string } };
+          console.error(
+            '[velvet-store] broadcast coop event FAILED:',
+            'status=', rich.status,
+            'msg=', rich.message,
+            'fieldErrors=', JSON.stringify(rich.data?.data ?? rich.data, null, 2),
+          );
+        }
+      })();
+    }
+    // 可选：同步到 activities；可附带对某属性的加点（≤ 3 点）
+    if (createActivity) {
+      const now = new Date();
+      const label = `[同伴] ${current.name}：${description}`;
+      const pts: Record<AttributeId, number> = { knowledge: 0, guts: 0, dexterity: 0, kindness: 0, charm: 0 };
+      if (activityAttribute && typeof activityPoints === 'number' && activityPoints > 0) {
+        pts[activityAttribute] = Math.min(3, Math.max(0, Math.floor(activityPoints)));
+      }
+      const hasPoints = Object.values(pts).some(v => v > 0);
+      if (hasPoints) {
+        // 走 addActivity 走正常的加点/升级管线，但带上 confidant 分类与 confidantId
+        // addActivity 目前不接受 confidantId 参数，这里直接手工写一条活动并走属性更新 —— 与既有 shadow_defeat 类别写入活动的模式保持一致
+        // 为了严谨，也直接更新属性等级。
+        const attrs = await db.attributes.toArray();
+        const attrMap = new Map(attrs.map(a => [a.id, a]));
+        for (const [attrId, p] of Object.entries(pts)) {
+          if (p <= 0) continue;
+          const attr = attrMap.get(attrId as AttributeId);
+          if (!attr) continue;
+          const newPoints = attr.points + p;
+          const newLevel = levelForPoints(newPoints, thresholdsOf(get().settings, attr));
+          await db.attributes.update(attrId, { points: newPoints, level: newLevel });
+          if (newLevel > attr.level) {
+            // 触发升级通知
+            setTimeout(() => set({
+              levelUpNotification: {
+                id: attrId,
+                displayName: get().settings.attributeNames[attrId as AttributeNamesKey],
+                level: newLevel,
+              }
+            }), 600);
+          }
+        }
+      }
+      const activity: Activity = {
+        id: uuidv4(),
+        userId: get().user?.id ?? current.userId,
+        date: now,
+        description: label,
+        pointsAwarded: pts,
+        method: 'local',
+        category: 'confidant',
+        confidantId: id,
+        important: hasPoints,
+      };
+      await db.activities.add(activity);
+      await get().loadData();
+    }
+    return res;
+  },
+
+  consumeStarShift: async (id, payload) => {
+    const current = await db.confidants.get(id);
+    if (!current) return;
+    if ((current.starShiftCharges ?? 0) <= 0) throw new Error('没有可用的星移次数');
+    const now = new Date();
+    await db.confidants.put({
+      ...current,
+      description: payload.description,
+      aiInterpretation: payload.interpretation,
+      aiAdvice: payload.advice,
+      orientation: payload.orientation,
+      starShiftCharges: (current.starShiftCharges ?? 0) - 1,
+      lastInteractionAt: now,
+    });
+    await db.confidantEvents.add({
+      id: uuidv4(),
+      confidantId: id,
+      date: toLocalDateKey(now),
+      type: 'star_shift',
+      narrative: payload.summary
+        ? `以当前状态重新落墨 —— ${payload.summary}`
+        : '以当前状态重新落墨',
+      createdAt: now,
+    });
+    await get().loadConfidants();
+  },
+
+  archiveConfidant: async (id) => {
+    const current = await db.confidants.get(id);
+    if (!current) return;
+    const now = new Date();
+    await db.confidants.put({ ...current, archivedAt: now });
+    // 60 秒内如果刚刚有过一条"归档/恢复"事件（说明是误触/快速撤回的另一半），
+    // 合并删除旧事件，整个来回不留痕
+    const recentWindow = now.getTime() - 60 * 1000;
+    const recent = await db.confidantEvents
+      .where('confidantId').equals(id)
+      .filter(e =>
+        (e.type === 'archived' || e.type === 'unarchived' as unknown as string) &&
+        new Date(e.createdAt).getTime() >= recentWindow,
+      )
+      .toArray();
+    if (recent.length > 0) {
+      // 刚才的动作与这次形成闭环，静默删除旧事件即可
+      await db.confidantEvents.bulkDelete(recent.map(e => e.id));
+    } else {
+      await db.confidantEvents.add({
+        id: uuidv4(),
+        confidantId: id,
+        date: toLocalDateKey(now),
+        type: 'archived',
+        narrative: '你将这段关系暂时收进了抽屉',
+        createdAt: now,
+      });
+    }
+    await get().loadConfidants();
+  },
+
+  unarchiveConfidant: async (id) => {
+    const current = await db.confidants.get(id);
+    if (!current) return;
+    const now = new Date();
+    // 在线同伴：如果它对应的 bond 已经 severed，主动恢复时打上 dismissed flag，
+    // 否则下次 loadSocial 的 reflectSeveredBonds 会立刻把它再归档回去
+    let extraPatch: Partial<Confidant> = {};
+    if (current.source === 'online' && current.linkedCloudUserId) {
+      try {
+        const { useCloudSocialStore } = await import('@/store/cloudSocial');
+        const bonds = useCloudSocialStore.getState().coopBonds;
+        const bond = bonds.find(
+          b => b.userAId === current.linkedCloudUserId || b.userBId === current.linkedCloudUserId,
+        );
+        if (bond && (bond.status === 'severed' || bond.status === 'expired' || bond.status === 'rejected')) {
+          extraPatch = { bondSeverDismissed: true };
+        }
+      } catch (err) {
+        console.warn('[velvet-store] check bond status on unarchive failed', err);
+      }
+    }
+    await db.confidants.put({ ...current, ...extraPatch, archivedAt: undefined });
+    // 60 秒内刚归档过 → 把那条"archived"事件一并删掉，来回不留痕
+    const recentWindow = now.getTime() - 60 * 1000;
+    const recent = await db.confidantEvents
+      .where('confidantId').equals(id)
+      .filter(e => e.type === 'archived' && new Date(e.createdAt).getTime() >= recentWindow)
+      .toArray();
+    if (recent.length > 0) {
+      await db.confidantEvents.bulkDelete(recent.map(e => e.id));
+    }
+    // 注意：不新增"unarchived"事件；"归档→恢复"是一次状态切换，不留痕
+    await get().loadConfidants();
+  },
+
+  deleteConfidant: async (id) => {
+    const current = await db.confidants.get(id);
+    // 在线同伴：先 **await** 把 PB bond 标 severed，
+    // 让对方不会重新物化再回来。
+    //
+    // 之前是 fire-and-forget：本地直接删 → 若 sever 请求失败（网断 / PB 拒绝），
+    // 对方的 bond 仍然是 linked；下一轮 loadSocial 的 materializeCoopBonds
+    // 看到 "linked 但本地没有对应 card" → 以新的 uuid 重建一张卡 → 用户感觉 "鬼复"。
+    //
+    // 现在：sever 失败 → 抛给 UI，本地不删，用户看到"删除失败，稍后重试"。
+    if (current && current.source === 'online' && current.linkedCloudUserId) {
+      const { useCloudSocialStore } = await import('@/store/cloudSocial');
+      const { severCoopBond } = await import('@/services/coopBonds');
+      const bonds = useCloudSocialStore.getState().coopBonds;
+      const bond = bonds.find(
+        b => b.status === 'linked'
+          && (b.userAId === current.linkedCloudUserId || b.userBId === current.linkedCloudUserId),
+      );
+      if (bond) {
+        try {
+          const updated = await severCoopBond(bond.id);
+          useCloudSocialStore.getState().updateCoopBond(bond.id, updated);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : '网络错误';
+          throw new Error(`解除 COOP 失败，请稍后重试（${msg}）`);
+        }
+      }
+    }
+    await db.confidants.delete(id);
+    const evs = await db.confidantEvents.where('confidantId').equals(id).toArray();
+    if (evs.length) await db.confidantEvents.bulkDelete(evs.map(e => e.id));
+    await get().loadConfidants();
+  },
+
+  useConfidantBattleItem: async (id, kind) => {
+    const current = await db.confidants.get(id);
+    if (!current) return null;
+    const today = toLocalDateKey();
+    // 2 天内使用过则冷却中
+    if (isItemOnCooldown(current.itemUsedDate, today)) return null;
+    const buff = (current.buffs ?? []).find(b => b.kind === kind);
+    if (!buff) return null;
+    const now = new Date();
+    await db.confidants.put({ ...current, itemUsedDate: today, lastInteractionAt: now });
+    await db.confidantEvents.add({
+      id: uuidv4(),
+      confidantId: id,
+      date: today,
+      type: 'item_used',
+      narrative: `${current.name} 在战斗中施以援手：${buff.title}`,
+      createdAt: now,
+    });
+    await get().loadConfidants();
+    return buff;
+  },
+
+  getAvailableConfidantItems: (kind) => {
+    const today = toLocalDateKey();
+    const { confidants } = get();
+    const out: Array<{
+      confidantId: string;
+      confidantName: string;
+      arcanaId: string;
+      buff: ConfidantBuff;
+    }> = [];
+    for (const c of confidants) {
+      if (c.archivedAt) continue;
+      if (isItemOnCooldown(c.itemUsedDate, today)) continue;
+      const b = (c.buffs ?? []).find(x => x.kind === kind);
+      if (b) out.push({ confidantId: c.id, confidantName: c.name, arcanaId: c.arcanaId, buff: b });
+    }
+    return out;
+  },
+
+  runConfidantDailyMaintenance: async () => {
+    const today = toLocalDateKey();
+    const all = await db.confidants.toArray();
+    const now = new Date();
+    const events: ConfidantEvent[] = [];
+    let changed = false;
+
+    // 在线 COOP 的"逆流"必须双方都开 —— 拉取 cloud bonds 一次
+    const { useCloudSocialStore } = await import('@/store/cloudSocial');
+    // 如果已登录但 bonds 尚未加载（initializeApp 与 App.tsx 的 loadSocial 时序竞态），
+    // 先等一次 loadSocial 完成，避免把在线同伴错误地"暂不衰减"。
+    try {
+      const { useCloudStore } = await import('@/store/cloud');
+      const isLogged = useCloudStore.getState().cloudUser !== null;
+      const hasOnlineConfidant = all.some(c => !c.archivedAt && c.source === 'online' && c.linkedCloudUserId);
+      const bondsEmpty = useCloudSocialStore.getState().coopBonds.length === 0;
+      if (isLogged && hasOnlineConfidant && bondsEmpty) {
+        const { loadSocial } = await import('@/services/social');
+        // 不带 force：App 那一轮正在跑就搭它（等它跑完即可），不必在它后面再排一轮拖慢启动
+        await loadSocial();
+      }
+    } catch { /* 网络失败不阻塞维护：后续分支会对每个在线同伴 fallback 跳过 */ }
+    const allBonds = useCloudSocialStore.getState().coopBonds;
+
+    for (const c of all) {
+      if (c.archivedAt) continue;
+      if (!c.decayEnabled) continue;
+
+      // 在线同伴：必须找到对应 bond 且双方都开启 decay
+      if (c.source === 'online' && c.linkedCloudUserId) {
+        const bond = allBonds.find(
+          b => b.status === 'linked'
+            && (b.userAId === c.linkedCloudUserId || b.userBId === c.linkedCloudUserId),
+        );
+        if (!bond) continue;          // 没找到 bond → 暂不衰减
+        if (!(bond.decayA === true && bond.decayB === true)) continue; // 双方未达成一致
+      }
+      // 最后互动日期
+      const last = c.lastInteractionAt ? new Date(c.lastInteractionAt) : new Date(c.createdAt);
+      const lastKey = toLocalDateKey(last);
+      // 连续 3 天（含）以上无互动才衰减；每天最多 -1
+      const diffDays = Math.floor((new Date(today + 'T00:00:00').getTime() - new Date(lastKey + 'T00:00:00').getTime()) / 86400000);
+      if (diffDays < 3) continue;
+      // 今天已经扣过
+      const already = await db.confidantEvents
+        .where('confidantId').equals(c.id)
+        .filter(e => e.type === 'decay' && e.date === today)
+        .first();
+      if (already) continue;
+      // 写之前重读：上面 await loadSocial() 期间社交结算可能已经给这位同伴加过点，拿循环开头的旧对象写回会把那份吞掉
+      const fresh = (await db.confidants.get(c.id)) ?? c;
+      const newPoints = Math.max(0, fresh.intimacyPoints - 1);
+      const newLv = pointsToLevel(newPoints, thresholdsFor(fresh));
+      const buffs = newLv < fresh.intimacy ? buffsForLevel(fresh.arcanaId, newLv, get().settings.attributeNames) : fresh.buffs;
+      await db.confidants.put({
+        ...fresh,
+        intimacyPoints: newPoints,
+        intimacy: newLv,
+        buffs,
+      });
+      events.push({
+        id: uuidv4(),
+        confidantId: c.id,
+        date: today,
+        type: 'decay',
+        delta: -1,
+        narrative: `已有 ${diffDays} 天未与 ${c.name} 互动，羁绊悄然褪色`,
+        createdAt: now,
+      });
+      changed = true;
+    }
+    if (events.length) await db.confidantEvents.bulkAdd(events);
+    if (changed) await get().loadConfidants();
+  },
+
+  // ── 谏言 / Counsel ───────────────────────────────────────────
+
+  loadCounsel: async () => {
+    const [sessions, archives] = await Promise.all([
+      db.counselSessions.toArray(),
+      db.counselArchives.orderBy('createdAt').reverse().toArray(),
+    ]);
+    // 理论上只保留 1 条（最后一次）
+    const session = sessions
+      .slice()
+      .sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime())[0] ?? null;
+    set({ counselSession: session, counselArchives: archives });
+    await get().expireCounselIfNeeded();
+  },
+
+  getCounselCooldown: () => {
+    const COOLDOWN_DAYS = 3;
+    const { counselSession, counselArchives, settings } = get();
+    const times: number[] = [];
+    // 主真源：Settings.lastCounselStartedAt —— 不会被归档删除 / 手动清档影响
+    if (settings.lastCounselStartedAt) {
+      const t = new Date(settings.lastCounselStartedAt).getTime();
+      if (!isNaN(t)) times.push(t);
+    }
+    // 次要来源（向前兼容 + 兜底）：当前 session 的 startedAt，最新归档的 sessionStartedAt
+    if (counselSession?.startedAt) {
+      const t = new Date(counselSession.startedAt).getTime();
+      if (!isNaN(t)) times.push(t);
+    }
+    const latestArchive = counselArchives[0];
+    if (latestArchive?.sessionStartedAt) {
+      const t = new Date(latestArchive.sessionStartedAt).getTime();
+      if (!isNaN(t)) times.push(t);
+    }
+    if (times.length === 0) return { locked: false };
+    const latest = Math.max(...times);
+    const nextAvailable = latest + COOLDOWN_DAYS * 86400000;
+    const now = Date.now();
+    if (now >= nextAvailable) return { locked: false };
+    const nextAvailableAt = new Date(nextAvailable);
+    return {
+      locked: true,
+      nextAvailableAt,
+      nextAvailableDate: toLocalDateKey(nextAvailableAt),
+      daysLeft: Math.ceil((nextAvailable - now) / 86400000),
+    };
+  },
+
+  hasActiveCounsel: () => {
+    const { counselSession } = get();
+    if (!counselSession) return false;
+    if (counselSession.expired) return false;
+    if (Date.now() > new Date(counselSession.expiresAt).getTime()) return false;
+    return true;
+  },
+
+  startCounselSession: async (mentionedConfidantIds = []) => {
+    const cd = get().getCounselCooldown();
+    if (cd.locked) {
+      throw new Error(`谏言冷却中，下次可用：${cd.nextAvailableDate}`);
+    }
+    // 清掉旧 session（冷却已过，旧会话可以丢弃）
+    await db.counselSessions.clear();
+    const now = new Date();
+    // 预设 @ 的同伴：回合号置为 1 —— 开场问候和第 1 回合的 prompt 都能感知到 Ta；10 回合内自动过期
+    const initialLastTurn: Record<string, number> = {};
+    for (const id of mentionedConfidantIds) initialLastTurn[id] = 1;
+    const session: CounselSession = {
+      id: uuidv4(),
+      startedDate: toLocalDateKey(now),
+      startedAt: now,
+      expiresAt: new Date(now.getTime() + 60 * 60 * 1000), // 1 小时
+      mentionedConfidantIds: [...mentionedConfidantIds],
+      mentionLastTurn: initialLastTurn,
+      messages: [],
+    };
+    await db.counselSessions.put(session);
+    // 同步写入 Settings.lastCounselStartedAt 作为冷却真源
+    await get().updateSettings({ lastCounselStartedAt: now.toISOString() });
+    set({ counselSession: session });
+    return session;
+  },
+
+  appendCounselMessage: async (msg) => {
+    const { counselSession } = get();
+    if (!counselSession) throw new Error('谏言会话尚未开启');
+    if (counselSession.expired || Date.now() > new Date(counselSession.expiresAt).getTime()) {
+      throw new Error('谏言窗口已过期');
+    }
+    const mergedMentions = msg.mentions && msg.mentions.length
+      ? Array.from(new Set([...counselSession.mentionedConfidantIds, ...msg.mentions]))
+      : counselSession.mentionedConfidantIds;
+
+    const newMessages = [...counselSession.messages, msg];
+    // 只有"带 @ 的用户消息"才会刷新 mentionLastTurn：回合号 = 追加后的用户消息总数
+    let mentionLastTurn = counselSession.mentionLastTurn ?? {};
+    if (msg.role === 'user' && msg.mentions && msg.mentions.length > 0) {
+      const newUserTurn = newMessages.filter(m => m.role === 'user').length;
+      mentionLastTurn = { ...mentionLastTurn };
+      for (const id of msg.mentions) {
+        mentionLastTurn[id] = newUserTurn;
+      }
+    }
+
+    const updated: CounselSession = {
+      ...counselSession,
+      messages: newMessages,
+      mentionedConfidantIds: mergedMentions,
+      mentionLastTurn,
+    };
+    await db.counselSessions.put(updated);
+    set({ counselSession: updated });
+  },
+
+  updateCounselMessage: async (id, patch) => {
+    const { counselSession } = get();
+    if (!counselSession) return;
+    const messages = counselSession.messages.map(m => m.id === id ? { ...m, ...patch } : m);
+    const updated: CounselSession = { ...counselSession, messages };
+    await db.counselSessions.put(updated);
+    set({ counselSession: updated });
+  },
+
+  expireCounselIfNeeded: async () => {
+    const { counselSession } = get();
+    if (!counselSession) return;
+    // 残留的 expired 旧行（老版本留下的）→ 直接清掉
+    if (counselSession.expired) {
+      await db.counselSessions.delete(counselSession.id);
+      set({ counselSession: null });
+      return;
+    }
+    const now = Date.now();
+    if (now <= new Date(counselSession.expiresAt).getTime()) return;
+    // 过期：**彻底删除整条会话**，聊天原文不进任何存档 / 备份。
+    // 冷却状态由 settings.lastCounselStartedAt 负责保留，不依赖这条行。
+    await db.counselSessions.delete(counselSession.id);
+    set({ counselSession: null });
+  },
+
+  archiveCounselSession: async (signal) => {
+    const { counselSession, settings } = get();
+    if (!counselSession) return null;
+    if (counselSession.messages.length === 0) {
+      // 没内容直接删除，不生成归档
+      await db.counselSessions.delete(counselSession.id);
+      set({ counselSession: null });
+      return null;
+    }
+    const summary = await summarizeCounsel(settings, counselSession.messages, signal);
+    const lastMsg = counselSession.messages[counselSession.messages.length - 1];
+    const archive: CounselArchive = {
+      id: uuidv4(),
+      summary,
+      mentionedConfidantIds: [...counselSession.mentionedConfidantIds],
+      messageCount: counselSession.messages.length,
+      sessionStartedAt: new Date(counselSession.startedAt),
+      sessionEndedAt: new Date(lastMsg?.timestamp ?? counselSession.startedAt),
+      createdAt: new Date(),
+    };
+    await db.counselArchives.add(archive);
+    await db.counselSessions.delete(counselSession.id);
+    set(state => ({
+      counselSession: null,
+      counselArchives: [archive, ...state.counselArchives],
+    }));
+    return archive;
+  },
+
+  deleteCounselArchive: async (id) => {
+    await db.counselArchives.delete(id);
+    set(state => ({
+      counselArchives: state.counselArchives.filter(a => a.id !== id),
+    }));
+  },
+
+  buildCounselContext: () => {
+    const { settings, counselSession, counselArchives, confidants, confidantEvents } = get();
+    // 上一次 & 上上次归档摘要 —— 让残响有"上次我们聊过什么"的记忆
+    const previousArchives = counselArchives.slice(0, 2).map(a => ({
+      summary: a.summary,
+      createdAt: new Date(a.createdAt),
+      mentionedIds: [...a.mentionedConfidantIds],
+    }));
+    if (!counselSession) {
+      return {
+        settings,
+        messages: [],
+        mentionedConfidants: [],
+        recentEvents: [],
+        previousArchives,
+      };
+    }
+    // 10 回合 CD：currentUserTurn - lastTurn < 10 才算"仍在上下文"
+    const MENTION_CD_TURNS = 10;
+    const currentUserTurn = counselSession.messages.filter(m => m.role === 'user').length;
+    const lastTurnMap = counselSession.mentionLastTurn ?? {};
+    const activeIds = counselSession.mentionedConfidantIds.filter(id => {
+      const lt = lastTurnMap[id];
+      if (typeof lt !== 'number') return false;
+      return currentUserTurn - lt < MENTION_CD_TURNS;
+    });
+
+    const ids = new Set(activeIds);
+    const mentioned: CounselConfidantBrief[] = [];
+    for (const id of activeIds) {
+      const c = confidants.find(x => x.id === id);
+      if (!c) continue;
+      const card = TAROT_BY_ID[c.arcanaId];
+      mentioned.push({
+        id: c.id,
+        name: c.name,
+        arcanaName: card?.name ?? c.arcanaId,
+        orientation: c.orientation,
+        intimacy: c.intimacy,
+        description: c.description,
+        aiInterpretation: c.aiInterpretation,
+      });
+    }
+    // 近 15 条相关 confidantEvents（若当前没有活跃 @，则退化为全局最近 15 条）
+    const relevant = ids.size > 0
+      ? confidantEvents.filter(e => ids.has(e.confidantId))
+      : confidantEvents;
+    const recentEvents: CounselRecentEvent[] = relevant.slice(0, 15).map(e => {
+      const cname = confidants.find(c => c.id === e.confidantId)?.name ?? '同伴';
+      const text = e.userInput || e.narrative || e.advice || '';
+      return { confidantName: cname, date: e.date, type: e.type, text };
+    });
+    return {
+      settings,
+      messages: counselSession.messages,
+      mentionedConfidants: mentioned,
+      recentEvents,
+      previousArchives,
+    };
+  },
+}));
+
+// 自定义服务商的名字 / 协议 / 取 Key 入口跟着设置走（第 14 批）：getProviderConfig('custom') 和没带 protocol 的请求头都读这份
+syncCustomProvider(useAppStore.getState().settings);
+useAppStore.subscribe((s, prev) => { if (s.settings !== prev.settings) syncCustomProvider(s.settings); });

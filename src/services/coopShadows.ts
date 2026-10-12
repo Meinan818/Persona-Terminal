@@ -1,0 +1,906 @@
+/**
+ * 羁绊之影 · 联机暗影狩猎服务层
+ *
+ * 负责：
+ *   - 按月相降临规则自动 spawn（或手动触发）
+ *   - 列表 / 读取 / 攻击 / 结算
+ *   - 配合 loadSocial 消费 coop_shadow_* 通知
+ *
+ * 关键不变量：
+ *   - 每对 COOP 同一时刻最多 1 个 active coop_shadow
+ *   - 每个 user × 每个 coop_shadow × 每个本地日最多 1 次 attack
+ *     （PB 唯一索引 (shadow_id, attacker, day) 硬性拦截）
+ *   - 共鸣印记 resonance_until / resonance_by 以最后一次 update 为准
+ *     （二人同秒攻击的 race 只影响一次加成，不影响正确性）
+ *
+ * Phase 1：客户端驱动所有业务逻辑；反作弊靠 PB access rules + unique index 兜底。
+ */
+
+import type { RecordModel } from 'pocketbase';
+import { pb, getUserId } from './pocketbase';
+import {
+  archetypeById,
+  pickArchetypeForBond,
+} from '@/constants/coopShadowPool';
+import type {
+  AttributeId,
+  CoopAttack,
+  CoopBond,
+  CoopMemorialStamp,
+  CoopShadow,
+  CoopShadowStatus,
+  SharedBuffs,
+} from '@/types';
+import { isMoonPhaseNight, moonPhaseSlot } from '@/utils/moonPhase';
+
+// ── 参数区 ────────────────────────────────────────────────
+
+/** 总攻击的 COMBO 门槛（战斗面板与服务同一份，第 6 轮合一） */
+export const ALL_OUT_COMBO = 5;
+
+/** 羁绊之影存活天数 —— 超时自动撤退 */
+export const SHADOW_LIFETIME_DAYS = 10;
+
+/** 两次降临之间的冷却（防止每天一只） */
+const SPAWN_COOLDOWN_DAYS = 14;
+
+/** COOP 缔结后多少天才能降临第一次 —— 给新 COOP 一个缓冲期 */
+const BOND_WARMUP_DAYS = 7;
+
+/** 共鸣印记的有效期 */
+const RESONANCE_WINDOW_HOURS = 12;
+
+/** 弱点属性加成 */
+const WEAKNESS_DMG_MULTIPLIER = 1.3;
+
+/** 共鸣接力加成 */
+const RESONANCE_DMG_MULTIPLIER = 1.5;
+
+/** 奖励常量（直接吃死 user 的需求） */
+export const REWARD_ATTR_CAP = 5;       // 属性奖励硬顶
+export const REWARD_INTIMACY_CAP = 4;   // 亲密度硬顶
+export const REWARD_SP_VICTORY = 10;    // 胜利 SP
+export const REWARD_SP_FINISHER = 2;    // 终结者追加 SP
+export const REWARD_SP_RETREAT = 3;     // 撤退慰问 SP
+/** 连胜三只起亲密度 +5（第 6 轮） */
+export const REWARD_INTIMACY_STREAK = 5;
+/** 总攻击的 COMBO 倍率封顶（第 6 轮） */
+export const ALL_OUT_COMBO_CAP = 10;
+
+// ── 奖励成长（第 6 轮 · PRD §11.9）─────────────────────────────
+
+/**
+ * 这对 COOP 连着封印了几只（含 currentId 这一只）：按降临时间顺着数，撤退归零。
+ * 不改表——历史就是 coop_shadows 本身。
+ */
+export function bondStreak(history: CoopShadow[], bondId: string, currentId: string): number {
+  const list = history.filter(s => s.bondId === bondId).sort((a, b) => a.spawnedAt.getTime() - b.spawnedAt.getTime());
+  let streak = 0;
+  let sawCurrent = false;
+  for (const s of list) {
+    if (s.id === currentId) { streak += 1; sawCurrent = true; break; }
+    if (s.status === 'defeated') streak += 1;
+    else if (s.status === 'retreated') streak = 0;
+  }
+  return sawCurrent ? streak : streak + 1;
+}
+
+export interface CoopVictoryReward {
+  attr: number;
+  intimacy: number;
+  sp: number;
+  spBase: number;
+  spStreak: number;
+  spBond: number;
+  spFinisher: number;
+  streak: number;
+  isFinisher: boolean;
+}
+
+/**
+ * 胜利奖励：SP = 10 + 5 × min(连胜 − 1, 4)（这两项合计封顶 30）+ floor(羁绊等级 / 2)（封顶 5）+ 终结者 2；
+ * 连胜 ≥ 3 亲密度 +5，否则 +4；属性 +5 不变。结算与结算屏共用这一份，数字不会对不上。
+ */
+export function coopVictoryReward(opts: { streak: number; bondLevel: number; isFinisher: boolean }): CoopVictoryReward {
+  const streak = Math.max(1, Math.floor(opts.streak));
+  const spStreak = 5 * Math.min(streak - 1, 4);
+  const spBond = Math.min(5, Math.floor(Math.max(0, opts.bondLevel) / 2));
+  const spFinisher = opts.isFinisher ? REWARD_SP_FINISHER : 0;
+  return {
+    attr: REWARD_ATTR_CAP,
+    intimacy: streak >= 3 ? REWARD_INTIMACY_STREAK : REWARD_INTIMACY_CAP,
+    spBase: REWARD_SP_VICTORY,
+    spStreak,
+    spBond,
+    spFinisher,
+    sp: REWARD_SP_VICTORY + spStreak + spBond + spFinisher,
+    streak,
+    isFinisher: opts.isFinisher,
+  };
+}
+
+/** 总攻击伤害 = (我方等级和 + 对方等级和) × min(COMBO, 10) */
+export function allOutDamage(myTotalLevels: number, partnerTotalLevels: number, combo: number): number {
+  return Math.max(1, Math.floor((Math.max(0, myTotalLevels) + Math.max(0, partnerTotalLevels)) * Math.min(Math.max(0, combo), ALL_OUT_COMBO_CAP)));
+}
+
+// ── Mapper ────────────────────────────────────────────────
+
+function mapCoopShadow(r: RecordModel): CoopShadow {
+  const memorial = r.memorial_stamp as CoopMemorialStamp | null | undefined;
+  return {
+    id: r.id,
+    bondId: r.bond_id as string,
+    userAId: r.user_a as string,
+    userBId: r.user_b as string,
+    shadowId: r.shadow_id as string,
+    nameOverride: (r.name_override as string | undefined) || undefined,
+    spawnedAt: new Date(r.spawned_at as string),
+    expiresAt: new Date(r.expires_at as string),
+    hpMax: r.hp_max as number,
+    hpCurrent: r.hp_current as number,
+    status: r.status as CoopShadowStatus,
+    weaknessAttribute: r.weakness_attribute as AttributeId,
+    resonanceUntil: r.resonance_until ? new Date(r.resonance_until as string) : undefined,
+    resonanceBy: (r.resonance_by as string | undefined) || undefined,
+    comboCount: typeof r.combo_count === 'number' ? (r.combo_count as number) : 0,
+    allOutByA: Boolean(r.all_out_by_a),
+    allOutByB: Boolean(r.all_out_by_b),
+    identifiedByA: Boolean(r.identified_by_a),
+    identifiedByB: Boolean(r.identified_by_b),
+    sharedBuffs: (r.shared_buffs as SharedBuffs | null | undefined) || {},
+    defeatedAt: r.defeated_at ? new Date(r.defeated_at as string) : undefined,
+    memorialStamp: memorial || undefined,
+  };
+}
+
+/**
+ * 按双方 LV 总和阶梯决定 Boss HP。
+ *
+ * 数值回算逻辑（方便后续调）：
+ *   常规命中（弱点 + 共鸣，无暴击，单次 ≈ 50 × 1.3 × 1.5 ≈ 98 伤害）
+ *   10 天窗口双方共 ~20 次常规攻击 → 总伤害约 1250
+ *   HP 设在"打 6–10 天能结束"的区间
+ */
+export function computeShadowHpMax(totalSumLevels: number): number {
+  if (totalSumLevels <= 15) return 200;
+  if (totalSumLevels <= 20) return 300;
+  if (totalSumLevels <= 30) return 450;
+  return 650;
+}
+
+function mapCoopAttack(r: RecordModel): CoopAttack {
+  return {
+    id: r.id,
+    shadowId: r.shadow_id as string,
+    attackerId: r.attacker as string,
+    day: r.day as string,
+    personaId: r.persona_id as string,
+    personaName: r.persona_name as string,
+    skillKind: r.skill_kind as CoopAttack['skillKind'],
+    skillName: r.skill_name as string,
+    damageRaw: r.damage_raw as number,
+    damageFinal: r.damage_final as number,
+    resonanceBonus: Boolean(r.resonance_bonus),
+    weaknessBonus: Boolean(r.weakness_bonus),
+    createdAt: new Date(r.created as string),
+  };
+}
+
+// ── 查询 ───────────────────────────────────────────────────
+
+/** 拉取当前登录用户相关的所有 coop_shadows（含 active / defeated / retreated）*/
+export const listCoopShadows = async (): Promise<CoopShadow[]> => {
+  if (!pb || !pb.authStore.isValid) return [];
+  const me = getUserId();
+  if (!me) return [];
+  const records = await pb.collection('coop_shadows').getFullList({
+    filter: `user_a = "${me}" || user_b = "${me}"`,
+    sort: '-spawned_at',
+    requestKey: null,
+  });
+  return records.map(mapCoopShadow);
+};
+
+/** 拉一只 shadow 的全部攻击事件（按时间倒序） */
+export const listAttacksFor = async (shadowId: string): Promise<CoopAttack[]> => {
+  if (!pb || !pb.authStore.isValid) return [];
+  const records = await pb.collection('coop_attacks').getFullList({
+    filter: `shadow_id = "${shadowId}"`,
+    sort: '-created',
+    requestKey: null,
+  });
+  return records.map(mapCoopAttack);
+};
+
+/**
+ * 血量的事实源是出手日志，不是 hp_current。
+ * 两端各自拿缓存里的 hp_current 减完整值写回，谁后写谁覆盖：对方那一下就被抹掉、血条还会回涨。
+ * 日志是只追加的，按它求和永远一致——写回和读取都从这里算。
+ */
+export const hpFromAttackLog = (hpMax: number, attacks: CoopAttack[]): number =>
+  Math.max(0, hpMax - attacks.reduce((sum, a) => sum + Math.max(0, a.damageFinal || 0), 0));
+
+const fetchFreshShadow = async (id: string): Promise<CoopShadow> =>
+  mapCoopShadow(await pb!.collection('coop_shadows').getOne(id, { requestKey: null }));
+
+/** 出手前的门槛：以服务器上的最新记录为准，不信本机缓存（对方可能已经击杀，或它已经撤退） */
+function assertStillBattling(fresh: CoopShadow, now: Date): void {
+  if (fresh.status === 'defeated') throw new Error('这只羁绊之影已经被封印了，刷新看看结算');
+  if (fresh.status === 'retreated' || now.getTime() >= fresh.expiresAt.getTime()) throw new Error('这只羁绊之影已经撤退了');
+  if (fresh.status !== 'active') throw new Error('这只羁绊之影已经不在战斗中');
+}
+
+/**
+ * 读侧纠偏：进行中的影按出手日志重算血量。
+ * 算出来还有血 → 只改本地显示；算到归零而记录还是 active（对方击杀的那一下被本机的写回抹掉了）→
+ * 再取一次最新记录，仍是 active 就补记击败，终结者 = 日志里最后出手的人。
+ */
+export const reconcileActiveShadow = async (shadow: CoopShadow): Promise<CoopShadow> => {
+  if (!pb || !pb.authStore.isValid || shadow.status !== 'active') return shadow;
+  const attacks = await listAttacksFor(shadow.id);
+  const hp = hpFromAttackLog(shadow.hpMax, attacks);
+  if (hp === shadow.hpCurrent) return shadow;
+  if (hp > 0) return { ...shadow, hpCurrent: hp };
+  const fresh = await fetchFreshShadow(shadow.id);
+  if (fresh.status !== 'active') return fresh;
+  const now = new Date();
+  const finisher = attacks[0]?.attackerId ?? fresh.userAId; // -created 排序：第一条最新
+  const updated = await pb.collection('coop_shadows').update(fresh.id, {
+    hp_current: 0,
+    status: 'defeated',
+    defeated_at: now.toISOString(),
+    memorial_stamp: buildMemorialStamp(fresh, now, finisher),
+  });
+  return mapCoopShadow(updated);
+};
+
+// ── 降临 ───────────────────────────────────────────────────
+
+/**
+ * 判断"这个时间点是否应该给这个 bond 降临一只羁绊之影"。
+ *
+ * 规则：
+ *   - 当天必须是月相之夜（isMoonPhaseNight）
+ *   - bond 必须 linked 且已过 BOND_WARMUP_DAYS
+ *   - bond 没有 active coop_shadow
+ *   - 距离最近一次 coop_shadow（任意状态）≥ SPAWN_COOLDOWN_DAYS
+ */
+function shouldSpawn(
+  bond: CoopBond,
+  existingShadows: CoopShadow[],
+  now: Date,
+): boolean {
+  if (bond.status !== 'linked') return false;
+  const bondShadows = existingShadows.filter(s => s.bondId === bond.id);
+  const hasActive = bondShadows.some(s => s.status === 'active');
+  if (hasActive) return false;
+
+  // 月相之夜 + cooldown + warmup
+  if (!isMoonPhaseNight(now)) return false;
+  if (bond.createdAt) {
+    const ageMs = now.getTime() - bond.createdAt.getTime();
+    if (ageMs < BOND_WARMUP_DAYS * 86400 * 1000) return false;
+  }
+  if (bondShadows.length > 0) {
+    const latest = bondShadows[0]; // sort -spawned_at
+    const elapsed = now.getTime() - latest.spawnedAt.getTime();
+    if (elapsed < SPAWN_COOLDOWN_DAYS * 86400 * 1000) return false;
+  }
+  return true;
+}
+
+/**
+ * 一对 COOP 在一个月夜里的那只影的记录 id（15 位小写字母数字，PB 允许创建时自带 id）。
+ *
+ * 用户上报「SHADOW RETREATED 偶现重复弹两次」的根因：同一个月夜降临了不止一只。
+ * 冷启动时 App 与同伴衰减维护会各发一次同步、两台设备也可能同时同步，每一路都读到
+ * 「还没有进行中的影」就各建一只；页面只露出其中一只，另一只没人打，十天后照样撤退、
+ * 照样弹结算屏——打没打都会弹。现在同一对、同一个月夜算出同一个 id，
+ * 第二个人再建会被 PB 的主键唯一性挡回，转而读已有的那只。
+ */
+export function shadowSlotId(bondId: string, slot: number): string {
+  const src = `${bondId}:${slot}`;
+  let out = '';
+  for (let seed = 0; out.length < 15; seed++) {
+    // FNV-1a（32 位），换种子拼够 15 位
+    let h = (0x811c9dc5 ^ Math.imul(seed + 1, 0x9e3779b1)) >>> 0;
+    for (let i = 0; i < src.length; i++) {
+      h ^= src.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    out += h.toString(36).padStart(7, '0');
+  }
+  return out.slice(0, 15);
+}
+
+/**
+ * 降临一只新羁绊之影并创建 PB 记录。
+ * 失败抛错；上层（social pipeline）会 catch + 下次 loadSocial 重试。
+ * 这个月夜对方（或本机另一路同步）已经建过 → 返回已有的那只，created = false，不再通知对方。
+ *
+ * hp_max 由双方属性等级之和分档（见 computeShadowHpMax）；spawn 时不一定能拿到对方的属性，
+ * 用 bond.otherProfile.totalLv + 我方的 totalLv。
+ */
+export const spawnCoopShadow = async (
+  bond: CoopBond,
+  mySumLevels: number,
+): Promise<{ shadow: CoopShadow; created: boolean }> => {
+  if (!pb || !pb.authStore.isValid) throw new Error('未登录');
+  const me = getUserId();
+  if (!me) throw new Error('用户信息缺失');
+
+  const archetype = pickArchetypeForBond(bond.id);
+  const partnerSumLevels = bond.otherProfile?.totalLv ?? 10; // 兜底
+  const hpMax = computeShadowHpMax(mySumLevels + partnerSumLevels);
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + SHADOW_LIFETIME_DAYS * 86400 * 1000);
+  // 同一个 archetype 从两个候选名里随机抽一个 —— 同对 COOP 每次降临可能是不同名字
+  const pickedName = archetype.names[Math.floor(Math.random() * archetype.names.length)];
+
+  const fields = {
+    bond_id: bond.id,
+    user_a: bond.userAId,
+    user_b: bond.userBId,
+    shadow_id: archetype.id,
+    name_override: pickedName,
+    spawned_at: now.toISOString(),
+    expires_at: expiresAt.toISOString(),
+    hp_max: hpMax,
+    hp_current: hpMax,
+    status: 'active',
+    weakness_attribute: archetype.weakness,
+    combo_count: 0,
+    all_out_by_a: false,
+    all_out_by_b: false,
+    identified_by_a: false,
+    identified_by_b: false,
+  };
+  // 同一对 COOP、同一个月夜只有一只：id 定死，两边同时建也撞成同一条
+  const slotId = shadowSlotId(bond.id, moonPhaseSlot(now));
+  let created: RecordModel;
+  try {
+    created = await pb.collection('coop_shadows').create({ id: slotId, ...fields });
+  } catch (err) {
+    // 这个 id 已经有了 = 对方 / 本机另一路同步抢先建了：用那只，不再重复通知
+    try {
+      const existing = await pb.collection('coop_shadows').getOne(slotId, { requestKey: null });
+      return { shadow: mapCoopShadow(existing), created: false };
+    } catch {
+      // 读不到：不是撞 id，是别的原因（比如服务器不收自带 id）→ 退回不带 id 建
+      created = await pb.collection('coop_shadows').create(fields);
+    }
+  }
+
+  // 通知对方 Boss 降临
+  const partnerId = bond.userAId === me ? bond.userBId : bond.userAId;
+  try {
+    await pb.collection('notifications').create({
+      user: partnerId,
+      type: 'coop_shadow_spawned',
+      from: me,
+      payload: { shadow_id: created.id, archetype_id: archetype.id },
+      read: false,
+    });
+  } catch (err) {
+    console.warn('[velvet-coopShadows] spawn notification failed', err);
+  }
+
+  return { shadow: mapCoopShadow(created), created: true };
+};
+
+/**
+ * 同一对 COOP、同一个月夜只认一只影。修复之前（见 shadowSlotId）已经重复降临的，
+ * 在这里挑一只当真：打过的优先（已击败 > 有伤害 / 连击 / 总攻击 > 已识破），
+ * 都没动过就认最早降临的那只（同时刻再比 id，两台设备挑得一样）；其余整只忽略——
+ * 不显示、不撤退、不结算、不弹结算屏。保持原有顺序。
+ */
+export function dedupeShadows(list: CoopShadow[]): CoopShadow[] {
+  const progress = (s: CoopShadow): number =>
+    s.status === 'defeated' ? 3
+      : (s.hpCurrent < s.hpMax || s.comboCount > 0 || s.allOutByA || s.allOutByB) ? 2
+        : (s.identifiedByA || s.identifiedByB) ? 1
+          : 0;
+  const better = (a: CoopShadow, b: CoopShadow): boolean => {
+    const pa = progress(a), pb2 = progress(b);
+    if (pa !== pb2) return pa > pb2;
+    const ta = a.spawnedAt.getTime(), tb = b.spawnedAt.getTime();
+    if (ta !== tb) return ta < tb;
+    return a.id < b.id;
+  };
+  const pick = new Map<string, CoopShadow>();
+  for (const s of list) {
+    const key = `${s.bondId}:${moonPhaseSlot(s.spawnedAt)}`;
+    const cur = pick.get(key);
+    if (!cur || better(s, cur)) pick.set(key, s);
+  }
+  const keep = new Set([...pick.values()].map(s => s.id));
+  return list.filter(s => keep.has(s.id));
+}
+
+/**
+ * 为所有 linked 的 bond 逐一检查是否需要降临。
+ * 通常在 loadSocial 的 coop pipeline 里调用。
+ */
+export const maybeSpawnForBonds = async (
+  bonds: CoopBond[],
+  existingShadows: CoopShadow[],
+  mySumLevels: number,
+): Promise<CoopShadow[]> => {
+  const now = new Date();
+  const newShadows: CoopShadow[] = [];
+  for (const bond of bonds) {
+    if (!shouldSpawn(bond, existingShadows, now)) continue;
+    try {
+      const { shadow } = await spawnCoopShadow(bond, mySumLevels);
+      newShadows.push(shadow);
+    } catch (err) {
+      console.warn('[velvet-coopShadows] spawn failed for bond', bond.id, err);
+    }
+  }
+  return newShadows;
+};
+
+// ── 识破 ───────────────────────────────────────────────────
+
+/**
+ * 登记一次"识破"。
+ * - 如果自己已经识破过了 → 幂等（静默返回当前记录）
+ * - 识破后同时发通知给对方（让对方的红点更新）
+ * - 双方都识破后，攻击路径才会真正可用（由前端面板判定）
+ */
+export const identifyShadow = async (shadow: CoopShadow): Promise<CoopShadow> => {
+  if (!pb || !pb.authStore.isValid) throw new Error('未登录');
+  const me = getUserId();
+  if (!me) throw new Error('用户信息缺失');
+  if (shadow.status !== 'active') throw new Error('这只羁绊之影已经不在战斗中');
+
+  const iAmA = shadow.userAId === me;
+  const alreadyIdentified = iAmA ? shadow.identifiedByA : shadow.identifiedByB;
+  if (alreadyIdentified) return shadow;
+
+  const patch = { [iAmA ? 'identified_by_a' : 'identified_by_b']: true };
+  const updated = await pb.collection('coop_shadows').update(shadow.id, patch);
+  const next = mapCoopShadow(updated);
+
+  // 通知对方 —— 借 coop_shadow_spawned 类型、payload.event='identify' 区分（通知面板按 event 显示「识破了」）。
+  // 独立 type 要服务器 notifications.type 先加选项，没加之前发了会被拒，所以先不换。
+  const partnerId = shadow.userAId === me ? shadow.userBId : shadow.userAId;
+  try {
+    await pb.collection('notifications').create({
+      user: partnerId,
+      type: 'coop_shadow_spawned', // 复用 —— 对方看到的语义是"有新动作"
+      from: me,
+      payload: { shadow_id: shadow.id, event: 'identify' },
+      read: false,
+    });
+  } catch (err) {
+    console.warn('[velvet-coopShadows] identify notification failed', err);
+  }
+
+  return next;
+};
+
+// ── 攻击 ───────────────────────────────────────────────────
+
+export interface AttackInput {
+  shadow: CoopShadow;
+  personaId: string;
+  personaName: string;
+  skillKind: CoopAttack['skillKind'];
+  skillName: string;
+  skillAttribute: AttributeId;
+  damageRaw: number;
+  /** 这对 COOP 的降临史（算连胜用；击杀时冻进纪念图章） */
+  history?: CoopShadow[];
+}
+
+export interface AttackResult {
+  attack: CoopAttack;
+  updatedShadow: CoopShadow;
+  /** 本次攻击是否命中弱点 */
+  weaknessBonus: boolean;
+  /** 本次攻击是否吃到共鸣接力加成 */
+  resonanceBonus: boolean;
+  /** crit 类技能本次是否触发暴击（×2） */
+  critTriggered: boolean;
+  /** 是 buff / debuff 类 —— 本次不造成伤害，只修改 sharedBuffs */
+  isBuffCast: boolean;
+  /** 击杀者 = true（hp<=0 且是这次攻击造成的） */
+  defeatedNow: boolean;
+}
+
+/** attack_up / vulnerability 倍率 */
+const BUFF_ATTACK_UP_MULT = 1.2;
+const BUFF_VULNERABILITY_MULT = 1.15;
+/** 每次 buff 技能延长的回合数，封顶 */
+const BUFF_DURATION_INC = 3;
+const BUFF_DURATION_CAP = 6;
+
+function isDamagingKind(kind: CoopAttack['skillKind']): boolean {
+  // damage / crit / charge / attack_boost 走伤害路径
+  // heal 在联机模式里没有血条可回，也不转成伤害 —— 直接在 UI 侧隐藏，不让用户点
+  return (
+    kind === 'damage'
+    || kind === 'crit'
+    || kind === 'charge'
+    || kind === 'attack_boost'
+  );
+}
+
+function isUtilityKind(kind: CoopAttack['skillKind']): boolean {
+  // buff / debuff → 施加共享 buff；不造成伤害
+  return kind === 'buff' || kind === 'debuff';
+}
+
+/** 同 kind 不叠加数值，只延长回合数（封顶 BUFF_DURATION_CAP） */
+function extendBuff(prev: SharedBuffs, kind: 'attack_up' | 'vulnerability'): SharedBuffs {
+  const existing = prev[kind]?.remainingTurns ?? 0;
+  return { ...prev, [kind]: { remainingTurns: Math.min(BUFF_DURATION_CAP, existing + BUFF_DURATION_INC) } };
+}
+
+/** 每次伤害类攻击结束后 —— 所有 buff 剩余回合 -1；≤0 则移除 */
+function tickBuffs(prev: SharedBuffs): SharedBuffs {
+  const next: SharedBuffs = {};
+  if (prev.attack_up && prev.attack_up.remainingTurns - 1 > 0) {
+    next.attack_up = { remainingTurns: prev.attack_up.remainingTurns - 1 };
+  }
+  if (prev.vulnerability && prev.vulnerability.remainingTurns - 1 > 0) {
+    next.vulnerability = { remainingTurns: prev.vulnerability.remainingTurns - 1 };
+  }
+  return next;
+}
+
+/**
+ * 对 Boss 发起一次攻击。负责：
+ *   1. 计算最终伤害（弱点 × 共鸣加成）
+ *   2. 写 coop_attacks 一条（会被 PB 唯一索引拦截每日重复）
+ *   3. 更新 coop_shadows：hp_current / resonance_until / resonance_by / status
+ *   4. 通知对方（coop_shadow_attacked 或 coop_shadow_defeated）
+ *
+ * 失败抛错；上层展示 toast + 不回滚本地 battleState（因为攻击记录是否落盘未知）。
+ */
+export const attackCoopShadow = async (input: AttackInput): Promise<AttackResult> => {
+  if (!pb || !pb.authStore.isValid) throw new Error('未登录');
+  const me = getUserId();
+  if (!me) throw new Error('用户信息缺失');
+
+  const { damageRaw, skillAttribute, skillKind } = input;
+  const now = new Date();
+  // 以服务器上的最新记录为准：本机缓存可能还停在对方出手之前，甚至它已经被击败 / 撤退
+  const shadow = await fetchFreshShadow(input.shadow.id);
+  assertStillBattling(shadow, now);
+  // 血量按日志算（见 hpFromAttackLog）：先把日志拉下来，写回时用「日志总伤害 + 这一下」
+  const priorLog = await listAttacksFor(shadow.id);
+  const day = toLocalDateKey(now);
+  const isUtility = isUtilityKind(skillKind);
+  const isDamaging = isDamagingKind(skillKind);
+
+  // 1) 计算最终伤害 / buff 效果
+  const weaknessBonus = isDamaging && skillAttribute === shadow.weaknessAttribute;
+  const resonanceActive = !!(
+    isDamaging
+    && shadow.resonanceUntil
+    && shadow.resonanceUntil.getTime() > now.getTime()
+    && shadow.resonanceBy
+    && shadow.resonanceBy !== me
+  );
+  // crit 技能：50% 翻倍
+  const critTriggered = skillKind === 'crit' && Math.random() < 0.5;
+  // 读当前共享 buff
+  const curBuffs = shadow.sharedBuffs ?? {};
+  const attackUpActive = (curBuffs.attack_up?.remainingTurns ?? 0) > 0;
+  const vulnerabilityActive = (curBuffs.vulnerability?.remainingTurns ?? 0) > 0;
+
+  let damageFinal = 0;
+  if (isDamaging) {
+    let multiplier = 1;
+    if (weaknessBonus)       multiplier *= WEAKNESS_DMG_MULTIPLIER;
+    if (resonanceActive)     multiplier *= RESONANCE_DMG_MULTIPLIER;
+    if (critTriggered)       multiplier *= 2;
+    if (attackUpActive)      multiplier *= BUFF_ATTACK_UP_MULT;
+    if (vulnerabilityActive) multiplier *= BUFF_VULNERABILITY_MULT;
+    damageFinal = Math.round(damageRaw * multiplier);
+  }
+
+  // 2) 写 coop_attacks（buff/debuff 也要写，只是 damage_final = 0，对方日志可见）
+  let attackRec: RecordModel;
+  try {
+    attackRec = await pb.collection('coop_attacks').create({
+      shadow_id: shadow.id,
+      attacker: me,
+      day,
+      persona_id: input.personaId,
+      persona_name: input.personaName,
+      skill_kind: skillKind,
+      skill_name: input.skillName,
+      damage_raw: isDamaging ? damageRaw : 0,
+      damage_final: damageFinal,
+      resonance_bonus: resonanceActive,
+      weakness_bonus: weaknessBonus,
+      counter_damage: 0,  // 联机模式玩家没有 HP —— 反击伤害作废
+    });
+  } catch (err) {
+    const errWithStatus = err as { status?: number; message?: string };
+    if (errWithStatus?.status === 400 && errWithStatus.message?.includes('unique')) {
+      throw new Error('今天你已经对这只羁绊之影出过手了，明天再来');
+    }
+    throw err;
+  }
+
+  // 3) 计算 shared_buffs 的下一步状态
+  let nextBuffs: SharedBuffs = curBuffs;
+  if (isUtility) {
+    // buff → 加 attack_up；debuff → 加 vulnerability；同 kind 只延长、不叠加
+    if (skillKind === 'buff')    nextBuffs = extendBuff(nextBuffs, 'attack_up');
+    if (skillKind === 'debuff')  nextBuffs = extendBuff(nextBuffs, 'vulnerability');
+  } else if (isDamaging) {
+    // 伤害类：所有 buff 剩余回合 -1
+    nextBuffs = tickBuffs(nextBuffs);
+  }
+
+  // 4) 更新 coop_shadows
+  const hpAfter = Math.max(0, hpFromAttackLog(shadow.hpMax, priorLog) - damageFinal);
+  const defeatedNow = isDamaging && hpAfter === 0;
+  const comboAfter = weaknessBonus ? shadow.comboCount + 1 : shadow.comboCount;
+  const patch: Record<string, unknown> = {
+    hp_current: hpAfter,
+    combo_count: comboAfter,
+    shared_buffs: nextBuffs,
+  };
+  // 只有伤害类攻击才更新 resonance 印记（utility 不影响节律）
+  if (isDamaging) {
+    patch.resonance_until = new Date(now.getTime() + RESONANCE_WINDOW_HOURS * 3600 * 1000).toISOString();
+    patch.resonance_by = me;
+  }
+  if (defeatedNow) {
+    patch.status = 'defeated';
+    patch.defeated_at = now.toISOString();
+    // 写入纪念图章（双方 loadSocial 时都能读到）：连胜与终结者在这一刻冻住
+    patch.memorial_stamp = buildMemorialStamp(shadow, now, me, bondStreak(input.history ?? [], shadow.bondId, shadow.id));
+  }
+  let updatedRec: RecordModel;
+  try {
+    updatedRec = await pb.collection('coop_shadows').update(shadow.id, patch);
+  } catch (err) {
+    // 两步写不是原子的：第二步没成，把第一步的出手记录撤掉，否则今天的次数被占了却没扣血
+    try { await pb.collection('coop_attacks').delete(attackRec.id); } catch { /* 撤不掉就留着，日志求和仍是对的 */ }
+    throw err;
+  }
+  const updatedShadow = mapCoopShadow(updatedRec);
+
+  // 4) 通知对方
+  const partnerId = shadow.userAId === me ? shadow.userBId : shadow.userAId;
+  try {
+    await pb.collection('notifications').create({
+      user: partnerId,
+      type: defeatedNow ? 'coop_shadow_defeated' : 'coop_shadow_attacked',
+      from: me,
+      payload: {
+        shadow_id: shadow.id,
+        damage: damageFinal,
+        resonance_bonus: resonanceActive,
+        weakness_bonus: weaknessBonus,
+        persona_name: input.personaName,
+        skill_name: input.skillName,
+        hp_remaining: hpAfter,
+      },
+      read: false,
+    });
+  } catch (err) {
+    console.warn('[velvet-coopShadows] attack notification failed', err);
+  }
+
+  return {
+    attack: mapCoopAttack(attackRec),
+    updatedShadow,
+    weaknessBonus,
+    resonanceBonus: resonanceActive,
+    critTriggered,
+    isBuffCast: isUtility,
+    defeatedNow,
+  };
+};
+
+// ── 撤退 ───────────────────────────────────────────────────
+
+/**
+ * 把已过期但还是 active 的 shadow 转成 retreated。
+ * 两个客户端都会 try 写一次；PB 没事务，以最后写入为准。
+ */
+export const retreatExpiredShadow = async (shadow: CoopShadow): Promise<CoopShadow> => {
+  if (!pb || !pb.authStore.isValid) throw new Error('未登录');
+  if (shadow.status !== 'active') return shadow;
+  const now = new Date();
+  if (now.getTime() < shadow.expiresAt.getTime()) return shadow;
+  // 写之前再取一次：对方可能刚在最后一刻击杀了它，盲写会把 defeated 翻成 retreated
+  const fresh = await fetchFreshShadow(shadow.id);
+  if (fresh.status !== 'active') return fresh;
+  const updated = await pb.collection('coop_shadows').update(shadow.id, {
+    status: 'retreated',
+  });
+  // 第 6 轮：撤退通知以前从没发过——翻成 retreated 的这一端告诉对方一声（两端都翻了就各收一条）
+  const me = getUserId();
+  if (me) {
+    const partnerId = shadow.userAId === me ? shadow.userBId : shadow.userAId;
+    try {
+      await pb.collection('notifications').create({
+        user: partnerId,
+        type: 'coop_shadow_retreated',
+        from: me,
+        payload: { shadow_id: shadow.id },
+        read: false,
+      });
+    } catch (err) {
+      console.warn('[velvet-coopShadows] retreat notification failed', err);
+    }
+  }
+  return mapCoopShadow(updated);
+};
+
+// ── 总攻击（All-Out） ─────────────────────────────────────
+
+export interface AllOutAttackInput {
+  shadow: CoopShadow;
+  personaId: string;
+  personaName: string;
+  /** 攻击者本地的属性 level 之和 */
+  myTotalLevels: number;
+  /** 对方的属性 level 之和（名片快照；拿不到就按我方算） */
+  partnerTotalLevels: number;
+  /** 这对 COOP 的降临史（算连胜用） */
+  history?: CoopShadow[];
+}
+
+export interface AllOutAttackResult {
+  attack: CoopAttack;
+  updatedShadow: CoopShadow;
+  defeatedNow: boolean;
+}
+
+/**
+ * 释放总攻击（All-Out）。
+ *
+ * 前提：
+ *   - shadow.comboCount ≥ 5
+ *   - 我还没用过（allOutByA / allOutByB 对应我的）
+ *   - shadow.status = 'active'
+ *
+ * 规则（第 6 轮重做）：
+ *   - 伤害 = (我方等级和 + 对方等级和) × min(COMBO, 10)——两个人的力量叠在一起，COMBO 越高越重
+ *   - 不吃共鸣、不吃弱点加成（已经是一次大招）；不重置 COMBO
+ *   - **不占用当日回合数** —— coop_attacks 用 day='allout' 绕开唯一索引
+ *   - 用完就把 all_out_by_{a|b} 翻成 true（一位玩家对一只 Boss 只能一次）
+ */
+export const allOutAttack = async (input: AllOutAttackInput): Promise<AllOutAttackResult> => {
+  if (!pb || !pb.authStore.isValid) throw new Error('未登录');
+  const me = getUserId();
+  if (!me) throw new Error('用户信息缺失');
+
+  const { myTotalLevels, partnerTotalLevels } = input;
+  const now = new Date();
+  const shadow = await fetchFreshShadow(input.shadow.id);
+  assertStillBattling(shadow, now);
+  if (shadow.comboCount < ALL_OUT_COMBO) throw new Error(`COMBO 未到 ${ALL_OUT_COMBO}，还不能释放总攻击`);
+  const priorLog = await listAttacksFor(shadow.id);
+
+  const iAmA = shadow.userAId === me;
+  const alreadyUsed = iAmA ? shadow.allOutByA : shadow.allOutByB;
+  if (alreadyUsed) throw new Error('你已经对这只羁绊之影释放过总攻击了');
+
+  const damage = allOutDamage(myTotalLevels, partnerTotalLevels, shadow.comboCount);
+
+  // 1) 写 coop_attacks —— day='allout' 是 magic value，绕开每日唯一索引
+  let attackRec: RecordModel;
+  try {
+    attackRec = await pb.collection('coop_attacks').create({
+      shadow_id: shadow.id,
+      attacker: me,
+      day: 'allout',
+      persona_id: input.personaId,
+      persona_name: input.personaName,
+      skill_kind: 'attack_boost',
+      skill_name: '总攻击 · ALL-OUT',
+      damage_raw: damage,
+      damage_final: damage,
+      resonance_bonus: false,
+      weakness_bonus: false,
+      counter_damage: 0,  // 总攻击不吃反击
+    });
+  } catch (err) {
+    throw err;
+  }
+
+  // 2) 更新 coop_shadows（血量按日志算）
+  const hpAfter = Math.max(0, hpFromAttackLog(shadow.hpMax, priorLog) - damage);
+  const defeatedNow = hpAfter === 0;
+  const patch: Record<string, unknown> = {
+    hp_current: hpAfter,
+    [iAmA ? 'all_out_by_a' : 'all_out_by_b']: true,
+    // 不动 resonance / combo —— 总攻击不影响节律
+  };
+  if (defeatedNow) {
+    patch.status = 'defeated';
+    patch.defeated_at = now.toISOString();
+    patch.memorial_stamp = buildMemorialStamp(shadow, now, me, bondStreak(input.history ?? [], shadow.bondId, shadow.id));
+  }
+  let updatedRec: RecordModel;
+  try {
+    updatedRec = await pb.collection('coop_shadows').update(shadow.id, patch);
+  } catch (err) {
+    // 第二步没成就撤掉第一步：否则 'allout' 那条占着，all_out_by 却没翻，按钮常亮、每点一次都报冲突
+    try { await pb.collection('coop_attacks').delete(attackRec.id); } catch { /* 同上 */ }
+    throw err;
+  }
+  const updatedShadow = mapCoopShadow(updatedRec);
+
+  // 3) 通知对方
+  const partnerId = shadow.userAId === me ? shadow.userBId : shadow.userAId;
+  try {
+    await pb.collection('notifications').create({
+      user: partnerId,
+      type: defeatedNow ? 'coop_shadow_defeated' : 'coop_shadow_attacked',
+      from: me,
+      payload: {
+        shadow_id: shadow.id,
+        damage,
+        resonance_bonus: false,
+        weakness_bonus: false,
+        persona_name: input.personaName,
+        skill_name: '总攻击 · ALL-OUT',
+        all_out: true,
+        hp_remaining: hpAfter,
+      },
+      read: false,
+    });
+  } catch (err) {
+    console.warn('[velvet-coopShadows] allout notification failed', err);
+  }
+
+  return {
+    attack: mapCoopAttack(attackRec),
+    updatedShadow,
+    defeatedNow,
+  };
+};
+
+// ── 纪念图章 ───────────────────────────────────────────────
+
+/**
+ * 构造 memorial stamp —— 仅供 "attackCoopShadow 击杀瞬间" 使用，
+ * 写入 coop_shadows.memorial_stamp；对方通过 loadSocial 读到。
+ */
+function buildMemorialStamp(
+  shadow: CoopShadow,
+  defeatedAt: Date,
+  finisherId: string,
+  /** 修复路径（reconcileActiveShadow）拿不到降临史：不填，结算时按本机历史现算 */
+  streak?: number,
+): CoopMemorialStamp {
+  const archetype = archetypeById(shadow.shadowId);
+  return {
+    shadowId: shadow.shadowId,
+    shadowName: shadow.nameOverride || archetype?.names?.[0] || '羁绊之影',
+    weaknessAttribute: shadow.weaknessAttribute,
+    defeatedAt: defeatedAt.toISOString(),
+    // winners 的 nickname 由对方客户端在读 memorial 时补全（这里只放 id）
+    winners: [
+      { userId: shadow.userAId, nickname: '' },
+      { userId: shadow.userBId, nickname: '' },
+    ],
+    // myDamage / totalDamage 由 claimVictoryReward 时各自填入本地副本
+    totalDamage: shadow.hpMax,
+    // 第 6 轮：连胜与最后一击在击杀这一刻冻住，两端结算看同一份
+    ...(streak !== undefined ? { streak } : {}),
+    finisherId,
+  };
+}
+
+// ── helper ────────────────────────────────────────────────
+
+function toLocalDateKey(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}

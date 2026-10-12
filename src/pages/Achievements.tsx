@@ -1,0 +1,1849 @@
+import { motion, AnimatePresence } from 'motion/react';
+import { CodexTab } from '@/components/codex/CodexTab';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useLiveQuery } from 'dexie-react-hooks';
+import { db } from '@/db';
+import { useAppStore } from '@/store';
+import { useShallow } from 'zustand/react/shallow';
+import { Achievement, AttributeId } from '@/types';
+import { triggerNavFeedback } from '@/utils/feedback';
+import { PageTitle } from '@/components/PageTitle';
+import { BackButton } from '@/components/BackButton';
+import { ModalPortal } from '@/components/ModalPortal';
+import { useUiChannel } from '@/ui/useUiChannel';
+import { P4Flower, P4Sparkle, P4ArcRings, P4SkyCircle, P4_HEADER_BLEED } from '@/ui/p4Kit';
+import { P3R, P3RPage, GhostWords, P3PageHeader, P3EmptySlab, slantClip } from '@/components/p3r/kit';
+import { P5R, P5_TITLE_FONT, P5SubBar, P5Star, P5Dots, P5Slab, P5RPage } from '@/components/p5r/kit';
+import { calcMaxStreak, daysSinceFirstRecord, streakDates } from '@/utils/streak';
+import { HIDDEN_ACHIEVEMENT_IDS, SEALED_ACHIEVEMENT_IDS, SKILL_BONUS_MULT_CAP } from '@/constants';
+
+/** P4 绶带横幅裁切（p4-achievements-reference-v2）：两端内凹的奖带形 */
+const P4_RIBBON_CLIP = 'polygon(0% 0%, 100% 0%, calc(100% - 14px) 50%, 100% 100%, 0% 100%, 14px 50%)';
+
+type ConditionType = Achievement['condition']['type'];
+
+/* ─────────────────────────────────────────────
+   Shared helpers
+───────────────────────────────────────────── */
+
+/* ─────────────────────────────────────────────
+   Shared form modal (achievements)
+───────────────────────────────────────────── */
+const AchievementFormFields = ({
+  editForm,
+  setEditForm,
+  isCustom,
+  attributeNames,
+  maxLevel,
+}: {
+  editForm: {
+    title: string;
+    description: string;
+    icon: string;
+    condition: {
+      type: ConditionType;
+      value: number;
+      keywords: string[];
+      attribute: AttributeId;
+      currentProgress: number;
+    };
+  };
+  setEditForm: React.Dispatch<React.SetStateAction<typeof editForm>>;
+  isCustom: boolean;
+  attributeNames: Record<string, string>;
+  maxLevel: number;
+}) => {
+  const buildCondition = (type: ConditionType, current: typeof editForm.condition) => {
+    if (type === 'attribute_level') return { ...current, type, attribute: current.attribute || 'knowledge', value: Math.min(current.value, maxLevel) };
+    if (type === 'keyword_match') return { ...current, type, keywords: current.keywords || [] };
+    return { ...current, type };
+  };
+
+  const isAttrLevel = isCustom && editForm.condition.type === 'attribute_level';
+
+  return (
+    <div className="space-y-4">
+      <input
+        type="text"
+        value={editForm.title}
+        onChange={(e) => setEditForm(prev => ({ ...prev, title: e.target.value }))}
+        placeholder="成就标题"
+        className="w-full px-3 py-2 border border-gray-200 dark:border-gray-600 rounded-xl bg-gray-50 dark:bg-gray-700 dark:text-white focus:outline-none focus:ring-2 focus:ring-primary/30"
+      />
+      <textarea
+        value={editForm.description}
+        onChange={(e) => setEditForm(prev => ({ ...prev, description: e.target.value }))}
+        placeholder="成就描述"
+        rows={3}
+        className="w-full px-3 py-2 border border-gray-200 dark:border-gray-600 rounded-xl bg-gray-50 dark:bg-gray-700 dark:text-white resize-none focus:outline-none focus:ring-2 focus:ring-primary/30"
+      />
+      <input
+        type="text"
+        value={editForm.icon}
+        onChange={(e) => setEditForm(prev => ({ ...prev, icon: e.target.value }))}
+        placeholder="图标 (emoji)"
+        className="w-full px-3 py-2 border border-gray-200 dark:border-gray-600 rounded-xl bg-gray-50 dark:bg-gray-700 dark:text-white focus:outline-none focus:ring-2 focus:ring-primary/30"
+      />
+
+      {isCustom && (
+        <div className="grid grid-cols-2 gap-3">
+          <select
+            value={editForm.condition.type}
+            onChange={(e) => {
+              const nextType = e.target.value as ConditionType;
+              setEditForm(prev => ({ ...prev, condition: buildCondition(nextType, prev.condition) }));
+            }}
+            className="px-3 py-2 border border-gray-200 dark:border-gray-600 rounded-xl bg-gray-50 dark:bg-gray-700 dark:text-white"
+          >
+            <option value="total_points">总点数</option>
+            <option value="consecutive_days">连续天数</option>
+            <option value="attribute_level">属性等级</option>
+            <option value="keyword_match">关键字匹配</option>
+            <option value="todo_completions">完成任务次数</option>
+          </select>
+
+          {isAttrLevel ? (
+            /* ── 属性等级：加减号步进器 ── */
+            <div className="flex items-center gap-0 border border-gray-200 dark:border-gray-600 rounded-xl overflow-hidden bg-gray-50 dark:bg-gray-700">
+              <button
+                type="button"
+                onClick={() => setEditForm(prev => ({
+                  ...prev,
+                  condition: { ...prev.condition, value: Math.max(1, prev.condition.value - 1) }
+                }))}
+                disabled={editForm.condition.value <= 1}
+                className="px-3 py-2 text-lg font-bold text-gray-500 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600 disabled:opacity-30 transition-colors select-none"
+              >−</button>
+              <span className="flex-1 text-center text-sm font-semibold dark:text-white tabular-nums">
+                Lv.{editForm.condition.value}
+              </span>
+              <button
+                type="button"
+                onClick={() => setEditForm(prev => ({
+                  ...prev,
+                  condition: { ...prev.condition, value: Math.min(maxLevel, prev.condition.value + 1) }
+                }))}
+                disabled={editForm.condition.value >= maxLevel}
+                className="px-3 py-2 text-lg font-bold text-gray-500 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600 disabled:opacity-30 transition-colors select-none"
+              >+</button>
+            </div>
+          ) : (
+            <input
+              type="number"
+              value={editForm.condition.value}
+              onChange={(e) => setEditForm(prev => ({
+                ...prev,
+                condition: { ...prev.condition, value: parseInt(e.target.value) || 1 }
+              }))}
+              min="1"
+              placeholder="条件值"
+              className="px-3 py-2 border border-gray-200 dark:border-gray-600 rounded-xl bg-gray-50 dark:bg-gray-700 dark:text-white"
+            />
+          )}
+
+          <p className="text-xs text-red-500 dark:text-red-400 col-span-2">成就条件值必须大于0</p>
+        </div>
+      )}
+
+      {isCustom && editForm.condition.type === 'attribute_level' && (
+        <div className="space-y-2">
+          <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">选择属性</label>
+          <select
+            value={editForm.condition.attribute}
+            onChange={(e) => setEditForm(prev => ({
+              ...prev, condition: { ...prev.condition, attribute: e.target.value as AttributeId }
+            }))}
+            className="w-full px-3 py-2 border border-gray-200 dark:border-gray-600 rounded-xl bg-gray-50 dark:bg-gray-700 dark:text-white"
+          >
+            {Object.entries(attributeNames).map(([key, name]) => (
+              <option key={key} value={key}>{name}</option>
+            ))}
+          </select>
+        </div>
+      )}
+
+      {isCustom && editForm.condition.type === 'keyword_match' && (
+        <div className="space-y-2">
+          <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">关键字（用逗号分隔）</label>
+          <input
+            type="text"
+            value={editForm.condition.keywords?.join(', ') || ''}
+            onChange={(e) => setEditForm(prev => ({
+              ...prev,
+              condition: {
+                ...prev.condition,
+                keywords: e.target.value.split(',').map(k => k.trim()).filter(Boolean)
+              }
+            }))}
+            placeholder="例如：阅读,学习,看书"
+            className="w-full px-3 py-2 border border-gray-200 dark:border-gray-600 rounded-xl bg-gray-50 dark:bg-gray-700 dark:text-white"
+          />
+        </div>
+      )}
+    </div>
+  );
+};
+
+/* ─────────────────────────────────────────────
+   Skills sub-page (embedded)
+───────────────────────────────────────────── */
+const SkillsTab = () => {
+  const { skills, attributes, settings, unlockSkill, updateCustomSkill, deleteCustomSkill, addCustomSkill, toggleSkillUnlock } = useAppStore(useShallow(s => ({ skills: s.skills, attributes: s.attributes, settings: s.settings, unlockSkill: s.unlockSkill, updateCustomSkill: s.updateCustomSkill, deleteCustomSkill: s.deleteCustomSkill, addCustomSkill: s.addCustomSkill, toggleSkillUnlock: s.toggleSkillUnlock })));
+
+  const [filterStatus, setFilterStatus] = useState<'all' | 'locked' | 'unlocked'>(() => {
+    try {
+      const saved = window.localStorage.getItem('pg_skills_filter');
+      return saved === 'locked' || saved === 'unlocked' ? saved : 'all';
+    } catch { return 'all'; }
+  });
+  const filterCycle: Array<'all' | 'locked' | 'unlocked'> = ['all', 'locked', 'unlocked'];
+  const filterLabels: Record<'all' | 'locked' | 'unlocked', string> = { all: '全部', locked: '未解锁', unlocked: '已解锁' };
+
+  const [editingSkill, setEditingSkill] = useState<string | null>(null);
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [editForm, setEditForm] = useState({
+    name: '',
+    requiredAttribute: 'knowledge' as AttributeId,
+    requiredLevel: 2,
+    bonusMultiplier: 1.2
+  });
+  const [formError, setFormError] = useState<string | null>(null);
+  const [confirmDialog, setConfirmDialog] = useState<{ open: boolean; skillId: string | null }>({ open: false, skillId: null });
+
+  useEffect(() => {
+    try { window.localStorage.setItem('pg_skills_filter', filterStatus); } catch { /* 存储不可用 */ }
+  }, [filterStatus]);
+
+  const generateSkillEffect = (attrId: AttributeId, multiplier: number): string => {
+    const attrName = settings.attributeNames[attrId] || attrId;
+    const pct = Math.round((multiplier - 1) * 100);
+    return `${attrName}积累额外提升 ${pct}%`;
+  };
+
+  const isCustomSkill = (skill: typeof skills[0]) => skill.id.startsWith('custom_');
+  const isBlessingSkill = (skill: typeof skills[0]) => skill.id.startsWith('blessing_');
+  const canUnlock = (skill: typeof skills[0]) => {
+    const attr = attributes.find(a => a.id === skill.requiredAttribute);
+    return attr && attr.level >= skill.requiredLevel && !skill.unlocked;
+  };
+
+  const handleUnlock = async (skillId: string) => {
+    const skill = skills.find(s => s.id === skillId);
+    if (skill && canUnlock(skill)) await unlockSkill(skillId);
+  };
+
+  const handleEdit = (skill: typeof skills[0]) => {
+    if (!isCustomSkill(skill) && skill.unlocked) return;
+    setEditingSkill(skill.id);
+    setEditForm({
+      name: skill.name,
+      requiredAttribute: skill.requiredAttribute,
+      requiredLevel: skill.requiredLevel,
+      bonusMultiplier: skill.bonusMultiplier || 1.2
+    });
+  };
+
+  const handleSaveEdit = async () => {
+    if (!editingSkill) return;
+    const target = skills.find(s => s.id === editingSkill);
+    if (!target) return;
+    const nextMultiplier = Math.min(3, Math.max(1, Number(editForm.bonusMultiplier) || 1));
+    if (isCustomSkill(target) && editForm.requiredLevel <= 1) {
+      setFormError('技能开启等级不能为1级，请设置2级或以上');
+      return;
+    }
+    setFormError(null);
+    const autoDesc = generateSkillEffect(editForm.requiredAttribute, nextMultiplier);
+    const updates = { name: editForm.name, description: autoDesc, requiredAttribute: editForm.requiredAttribute, requiredLevel: editForm.requiredLevel, bonusMultiplier: nextMultiplier };
+    if (isCustomSkill(target)) {
+      await updateCustomSkill(editingSkill, updates);
+    } else if (!target.unlocked) {
+      await updateCustomSkill(editingSkill, { name: updates.name, description: autoDesc });
+    }
+    setEditingSkill(null);
+  };
+
+  const handleAddSkill = async () => {
+    if (editForm.requiredLevel <= 1) {
+      setFormError('技能开启等级不能为1级，请设置2级或以上');
+      return;
+    }
+    setFormError(null);
+    const nextMultiplier = Math.min(3, Math.max(1, Number(editForm.bonusMultiplier) || 1));
+    const autoDesc = generateSkillEffect(editForm.requiredAttribute, nextMultiplier);
+    await addCustomSkill({
+      id: `custom_${Date.now()}`,
+      name: editForm.name,
+      description: autoDesc,
+      requiredAttribute: editForm.requiredAttribute,
+      requiredLevel: editForm.requiredLevel,
+      bonusMultiplier: nextMultiplier
+    });
+    setShowAddForm(false);
+    setEditForm({ name: '', requiredAttribute: 'knowledge', requiredLevel: 2, bonusMultiplier: 1.2 });
+  };
+
+  const handleDelete = (skillId: string) => {
+    setConfirmDialog({ open: true, skillId });
+  };
+
+  const filteredSkills = skills.filter(skill => {
+    if (filterStatus === 'locked') return !skill.unlocked;
+    if (filterStatus === 'unlocked') return skill.unlocked;
+    return true;
+  });
+
+  // Group by attribute
+  const byAttr = filteredSkills.reduce((acc, skill) => {
+    if (!acc[skill.requiredAttribute]) acc[skill.requiredAttribute] = [];
+    acc[skill.requiredAttribute].push(skill);
+    return acc;
+  }, {} as Record<string, typeof skills>);
+
+  const skillsChannel = useUiChannel();
+  const p3 = skillsChannel === 'p3';
+
+  return (
+    <div className="space-y-4">
+      {/* Controls（p3：白斜块 + 亮青斜块，与成就页筛选行同款） */}
+      <div className="flex items-center gap-2 justify-end">
+        <motion.button
+          whileTap={{ scale: 0.95 }}
+          onClick={() => {
+            const nextIndex = (filterCycle.indexOf(filterStatus) + 1) % filterCycle.length;
+            setFilterStatus(filterCycle[nextIndex]);
+          }}
+          className={p3 ? 'px-4 py-2 text-[14px] font-black' : 'px-3 py-1.5 rounded-lg text-sm font-medium bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-200'}
+          style={p3 ? { clipPath: slantClip(8), background: P3R.panel, color: P3R.ink, boxShadow: '0 6px 14px rgba(38,96,140,0.08)' } : undefined}
+        >
+          {filterLabels[filterStatus]}
+        </motion.button>
+        <motion.button
+          whileTap={{ scale: 0.95 }}
+          onClick={() => {
+            setShowAddForm(true);
+            setEditForm({ name: '', requiredAttribute: 'knowledge', requiredLevel: 2, bonusMultiplier: 1.2 });
+          }}
+          className={p3 ? 'px-4 py-2 text-[14px] font-black text-white' : 'px-4 py-1.5 bg-primary text-white rounded-lg text-sm font-medium'}
+          style={p3 ? { clipPath: slantClip(8), background: P3R.cyan } : undefined}
+        >
+          添加技能
+        </motion.button>
+      </div>
+
+      {/* Skill groups by attribute */}
+      {Object.entries(byAttr).map(([attrId, attrSkills]) => {
+        const attrName = settings.attributeNames[attrId as keyof typeof settings.attributeNames] || attrId;
+        // 第 13 轮：本属性已解锁技能的合计倍数（与 store.applySkillBonus 同口径：连乘后封顶 ×3）
+        const rawMult = attrSkills.filter(s => s.unlocked && s.bonusMultiplier).reduce((m, s) => m * (s.bonusMultiplier as number), 1);
+        const capped = rawMult > SKILL_BONUS_MULT_CAP;
+        const totalMult = Math.min(SKILL_BONUS_MULT_CAP, rawMult);
+        return (
+          <div
+            key={attrId}
+            className={p3 ? 'relative overflow-hidden' : 'rounded-2xl bg-white dark:bg-gray-900 border border-gray-100 dark:border-gray-800 shadow-sm overflow-hidden'}
+            style={p3 ? { clipPath: slantClip(14), background: P3R.panel, boxShadow: '0 10px 24px rgba(38,96,140,0.08)' } : undefined}
+          >
+            <div className={`px-5 py-3 flex items-center gap-2 ${p3 ? '' : 'border-b border-gray-100 dark:border-gray-800'}`}>
+              {p3 && <span aria-hidden className="h-[15px] w-[11px]" style={{ background: P3R.blue, clipPath: 'polygon(32% 0, 100% 0, 68% 100%, 0 100%)' }} />}
+              <span className={p3 ? 'text-[16px] font-black' : 'text-base font-bold text-gray-800 dark:text-white'} style={p3 ? { color: P3R.ink } : undefined}>{attrName}</span>
+              <span
+                className={p3 ? 'text-[12px] font-black italic tabular-nums' : 'text-xs bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 px-2 py-0.5 rounded-full'}
+                style={p3 ? { color: P3R.blue } : undefined}
+              >
+                {attrSkills.filter(s => s.unlocked).length}/{attrSkills.length} 已解锁
+              </span>
+              {totalMult > 1 && (
+                <span
+                  className={p3 ? 'ml-auto text-[11px] font-black italic tabular-nums' : `ml-auto text-[11px] font-bold tabular-nums px-2 py-0.5 rounded-full ${capped ? 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300' : 'bg-violet-100 dark:bg-violet-900/30 text-violet-700 dark:text-violet-300'}`}
+                  style={p3 ? { color: capped ? 'var(--p3r-blessing-ink, #c07f00)' : P3R.blueDeep } : undefined}
+                  title={capped ? `技能连乘已超过上限，按 ×${SKILL_BONUS_MULT_CAP.toFixed(1)} 生效` : '本属性已解锁技能的合计加成'}
+                >
+                  {capped ? `已达上限 ×${SKILL_BONUS_MULT_CAP.toFixed(1)}` : `合计 ×${totalMult.toFixed(2).replace(/0$/, '')}`}
+                </span>
+              )}
+            </div>
+            <div className="p-3 space-y-2">
+              {attrSkills
+                .sort((a, b) => a.requiredLevel - b.requiredLevel)
+                .map((skill, idx) => {
+                   const canUnlockSkill = canUnlock(skill);
+                  const isCustom = isCustomSkill(skill);
+                  const isBlessing = isBlessingSkill(skill);
+                  return (
+                    <motion.div
+                      key={skill.id}
+                      initial={{ opacity: 0, y: 6 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={{ delay: idx * 0.04 }}
+                      className={p3 ? 'relative flex items-start gap-3 px-4 py-3' : `p5-ach rounded-xl px-4 py-3 relative flex items-start gap-3 ${
+                        isBlessing
+                          ? skill.unlocked
+                            ? 'bg-gradient-to-r from-amber-500/10 to-yellow-500/5 border border-amber-200/60 dark:border-amber-700/40'
+                            : 'bg-gray-50 dark:bg-gray-800/60 border border-gray-100 dark:border-gray-700/60'
+                          : skill.unlocked
+                          ? 'bg-gradient-to-r from-violet-500/10 to-pink-500/10 border border-violet-200/60 dark:border-violet-700/40'
+                          : canUnlockSkill
+                          ? 'bg-primary/5 border border-primary/30 dark:border-primary/20'
+                          : 'bg-gray-50 dark:bg-gray-800/60 border border-gray-100 dark:border-gray-700/60'
+                      }`}
+                      style={p3 ? {
+                        clipPath: 'polygon(8px 0, 100% 0, calc(100% - 8px) 100%, 0 100%)',
+                        background: isBlessing
+                          ? skill.unlocked ? 'var(--p3r-claim, #fff4d6)' : 'var(--p3r-skill-locked, #f2f7fb)'
+                          : skill.unlocked ? 'rgba(var(--p3r-cyan-rgb, 53,209,232), 0.16)' : canUnlockSkill ? 'var(--p3r-skill-ready, rgba(27,87,255,0.08))' : 'var(--p3r-skill-locked, #f2f7fb)',
+                      } : undefined}
+                    >
+                      {/* Status icon（p3：斜切小块） */}
+                      <div
+                        className={p3 ? 'flex-shrink-0 mt-0.5 w-7 h-7 flex items-center justify-center text-sm font-black text-white' : `flex-shrink-0 mt-0.5 w-7 h-7 rounded-full flex items-center justify-center text-sm ${
+                          isBlessing
+                            ? skill.unlocked ? 'bg-amber-500 text-white' : 'bg-gray-200 dark:bg-gray-700 text-gray-400 dark:text-gray-500'
+                            : skill.unlocked ? 'bg-violet-500 text-white' : canUnlockSkill ? 'bg-primary text-white' : 'bg-gray-200 dark:bg-gray-700 text-gray-400 dark:text-gray-500'
+                        }`}
+                        style={p3 ? {
+                          clipPath: 'polygon(5px 0, 100% 0, calc(100% - 5px) 100%, 0 100%)',
+                          background: isBlessing
+                            ? skill.unlocked ? '#f5a623' : 'var(--p3r-skill-badge, #b9c6d4)'
+                            : skill.unlocked ? P3R.cyan : canUnlockSkill ? P3R.blue : 'var(--p3r-skill-badge, #b9c6d4)',
+                        } : undefined}
+                      >
+                        {isBlessing ? (skill.unlocked ? '✦' : '✧') : skill.unlocked ? '✓' : canUnlockSkill ? '!' : `${skill.requiredLevel}`}
+                      </div>
+
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span
+                            className={p3 ? 'font-black text-sm' : `font-semibold text-sm ${
+                              isBlessing
+                                ? skill.unlocked ? 'text-amber-700 dark:text-amber-300' : 'text-gray-700 dark:text-gray-300'
+                                : skill.unlocked ? 'text-violet-700 dark:text-violet-300' : canUnlockSkill ? 'text-primary' : 'text-gray-700 dark:text-gray-300'
+                            }`}
+                            style={p3 ? { color: isBlessing ? (skill.unlocked ? 'var(--p3r-blessing-ink, #c07f00)' : P3R.inkSoft) : skill.unlocked ? P3R.blueDeep : canUnlockSkill ? P3R.blue : P3R.ink } : undefined}
+                          >
+                            {skill.name}
+                          </span>
+                          {isBlessing && (
+                            <span className="text-[10px] text-amber-600 dark:text-amber-400 bg-amber-100 dark:bg-amber-900/30 px-1.5 py-0.5 rounded-full font-medium">
+                              赐福
+                            </span>
+                          )}
+                          {!isBlessing && !skill.unlocked && (
+                            <span className="text-[10px] text-gray-400 dark:text-gray-500 bg-gray-100 dark:bg-gray-700 px-1.5 py-0.5 rounded-full">
+                              需 Lv.{skill.requiredLevel}
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{skill.description}</p>
+                      </div>
+
+                      {/* Action buttons */}
+                      <div className="flex items-center gap-1 flex-shrink-0">
+                        {/* Blessing: toggle switch + delete */}
+                        {isBlessing && (
+                          <>
+                            <button
+                              onClick={() => toggleSkillUnlock(skill.id)}
+                              className={`w-10 h-6 rounded-full transition-colors relative flex-shrink-0 ${
+                                skill.unlocked ? 'bg-amber-500' : 'bg-gray-300 dark:bg-gray-600'
+                              }`}
+                            >
+                              <div
+                                className="absolute top-0.5 w-5 h-5 bg-white rounded-full shadow-sm transition-transform"
+                                style={{ transform: skill.unlocked ? 'translateX(18px)' : 'translateX(2px)' }}
+                              />
+                            </button>
+                            <motion.button
+                              whileTap={{ scale: 0.9 }}
+                              onClick={() => handleDelete(skill.id)}
+                              className="w-7 h-7 rounded-full bg-red-50 dark:bg-red-900/20 flex items-center justify-center text-red-400 hover:bg-red-100 dark:hover:bg-red-900/40 transition-colors"
+                            >
+                              <svg viewBox="0 0 16 16" className="w-3.5 h-3.5" fill="currentColor">
+                                <path d="M5 2h6l1 1H3L5 2zm-2 2h10l-1 9H4L3 4zm3 2v6h1V6H6zm3 0v6h1V6H9z" />
+                              </svg>
+                            </motion.button>
+                          </>
+                        )}
+                        {/* Normal / Custom skills */}
+                        {!isBlessing && canUnlockSkill && (
+                          <motion.button
+                            whileTap={{ scale: 0.95 }}
+                            onClick={() => handleUnlock(skill.id)}
+                            className="px-2.5 py-1 bg-primary text-white text-xs rounded-lg font-medium"
+                          >
+                            解锁
+                          </motion.button>
+                        )}
+                        {!isBlessing && (!skill.unlocked || isCustom) && (
+                          <motion.button
+                            whileTap={{ scale: 0.9 }}
+                            onClick={() => handleEdit(skill)}
+                            className="w-7 h-7 rounded-full bg-gray-100 dark:bg-gray-700 flex items-center justify-center text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"
+                          >
+                            <svg viewBox="0 0 16 16" className="w-3.5 h-3.5" fill="currentColor">
+                              <path d="M11.5 2.5a1.5 1.5 0 012.121 2.121L5.561 12.682l-2.829.707.707-2.829L11.5 2.5z" />
+                            </svg>
+                          </motion.button>
+                        )}
+                        {!isBlessing && isCustom && !skill.unlocked && (
+                          <motion.button
+                            whileTap={{ scale: 0.9 }}
+                            onClick={() => handleDelete(skill.id)}
+                            className="w-7 h-7 rounded-full bg-red-50 dark:bg-red-900/20 flex items-center justify-center text-red-400 hover:bg-red-100 dark:hover:bg-red-900/40 transition-colors"
+                          >
+                            <svg viewBox="0 0 16 16" className="w-3.5 h-3.5" fill="currentColor">
+                              <path d="M5 2h6l1 1H3L5 2zm-2 2h10l-1 9H4L3 4zm3 2v6h1V6H6zm3 0v6h1V6H9z" />
+                            </svg>
+                          </motion.button>
+                        )}
+                      </div>
+                    </motion.div>
+                  );
+                })}
+            </div>
+          </div>
+        );
+      })}
+
+      {filteredSkills.length === 0 && (
+        <div className="text-center py-12 text-gray-400 dark:text-gray-500 text-sm">
+          暂无技能
+        </div>
+      )}
+
+      {/* 技能表单 / 删除确认：portal 到 body —— 页内渲染会被 PageShell 的
+          stacking context 压在底部导航之下（见 components/ModalPortal.tsx）。
+          带上页根的 .p5-reskin：那套毯式规则认祖先类，不带就掉出作用域 */}
+      <ModalPortal className={skillsChannel === 'p5' ? 'p5-reskin' : ''}>
+      {/* Add / Edit modal */}
+      <AnimatePresence>
+        {(showAddForm || editingSkill) && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
+            onClick={(e) => { if (e.target === e.currentTarget) { setEditingSkill(null); setShowAddForm(false); } }}
+          >
+            <motion.div
+              initial={{ scale: 0.92, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.92, opacity: 0 }}
+              className="bg-white dark:bg-gray-900 rounded-2xl p-6 max-w-md w-full shadow-2xl max-h-[85vh] overflow-y-auto"
+            >
+              <h3 className="text-lg font-bold mb-5 text-gray-900 dark:text-white">
+                {editingSkill ? '编辑技能' : '添加技能'}
+              </h3>
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-sm font-medium mb-1.5 text-gray-700 dark:text-gray-300">技能名称</label>
+                  <input
+                    type="text"
+                    value={editForm.name}
+                    onChange={(e) => setEditForm(prev => ({ ...prev, name: e.target.value }))}
+                    placeholder="技能名称"
+                    className="w-full px-3 py-2 border border-gray-200 dark:border-gray-600 rounded-xl bg-gray-50 dark:bg-gray-800 dark:text-white focus:outline-none focus:ring-2 focus:ring-primary/30"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium mb-1.5 text-gray-700 dark:text-gray-300">技能效果（自动生成）</label>
+                  <div className="px-3 py-2 border border-gray-200 dark:border-gray-600 rounded-xl bg-gray-50 dark:bg-gray-700/50 text-sm text-gray-500 dark:text-gray-400 min-h-[42px]">
+                    {generateSkillEffect(editForm.requiredAttribute, Math.min(3, Math.max(1, Number(editForm.bonusMultiplier) || 1)))}
+                  </div>
+                </div>
+                {(!editingSkill || isCustomSkill(skills.find(s => s.id === editingSkill)!)) && (
+                  <>
+                    <div>
+                      <label className="block text-sm font-medium mb-1.5 text-gray-700 dark:text-gray-300">需求属性</label>
+                      <select
+                        value={editForm.requiredAttribute}
+                        onChange={(e) => setEditForm(prev => ({ ...prev, requiredAttribute: e.target.value as AttributeId }))}
+                        className="w-full px-3 py-2 border border-gray-200 dark:border-gray-600 rounded-xl bg-gray-50 dark:bg-gray-800 dark:text-white"
+                      >
+                        {Object.entries(settings.attributeNames).map(([key, name]) => (
+                          <option key={key} value={key}>{name}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-1.5 text-gray-700 dark:text-gray-300">
+                        需求等级（2–{settings.levelThresholds.length}）
+                      </label>
+                      <div className="flex items-center gap-0 border border-gray-200 dark:border-gray-600 rounded-xl overflow-hidden bg-gray-50 dark:bg-gray-800">
+                        <button
+                          type="button"
+                          onClick={() => setEditForm(prev => ({ ...prev, requiredLevel: Math.max(2, prev.requiredLevel - 1) }))}
+                          disabled={editForm.requiredLevel <= 2}
+                          className="px-4 py-2.5 text-lg font-bold text-gray-500 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600 disabled:opacity-30 transition-colors select-none"
+                        >−</button>
+                        <span className="flex-1 text-center text-sm font-semibold dark:text-white tabular-nums">
+                          Lv.{editForm.requiredLevel}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setEditForm(prev => ({ ...prev, requiredLevel: Math.min(settings.levelThresholds.length, prev.requiredLevel + 1) }))}
+                          disabled={editForm.requiredLevel >= settings.levelThresholds.length}
+                          className="px-4 py-2.5 text-lg font-bold text-gray-500 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600 disabled:opacity-30 transition-colors select-none"
+                        >+</button>
+                      </div>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-1.5 text-gray-700 dark:text-gray-300">额外加成倍数（1.0–3.0）</label>
+                      <input
+                        type="number"
+                        value={editForm.bonusMultiplier}
+                        onChange={(e) => {
+                          const next = parseFloat(e.target.value);
+                          setEditForm(prev => ({ ...prev, bonusMultiplier: Number.isFinite(next) ? Math.min(3, Math.max(1, next)) : 1 }));
+                        }}
+                        min="1" max="3" step="0.1"
+                        className="w-full px-3 py-2 border border-gray-200 dark:border-gray-600 rounded-xl bg-gray-50 dark:bg-gray-800 dark:text-white"
+                      />
+                    </div>
+                  </>
+                )}
+              </div>
+              {formError && (
+                <div className="mt-4 px-3 py-2 rounded-xl bg-red-50 dark:bg-red-900/20 text-sm text-red-600 dark:text-red-400">
+                  {formError}
+                </div>
+              )}
+              <div className="flex gap-3 mt-4">
+                <button
+                  onClick={editingSkill ? handleSaveEdit : handleAddSkill}
+                  className="flex-1 bg-primary text-white py-2.5 rounded-xl font-medium"
+                >
+                  {editingSkill ? '保存' : '添加'}
+                </button>
+                <button
+                  onClick={() => { setEditingSkill(null); setShowAddForm(false); setFormError(null); }}
+                  className="flex-1 bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 py-2.5 rounded-xl font-medium"
+                >
+                  取消
+                </button>
+              </div>
+              {editingSkill && skills.find(s => s.id === editingSkill)?.id.startsWith('custom_') && (
+                <button
+                  onClick={() => handleDelete(editingSkill)}
+                  className="w-full mt-3 bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 py-2.5 rounded-xl font-medium"
+                >
+                  删除技能
+                </button>
+              )}
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* 内置删除确认弹窗 */}
+      <AnimatePresence>
+        {confirmDialog.open && (
+          <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
+          >
+            <motion.div
+              initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }}
+              className="bg-white dark:bg-gray-900 rounded-2xl p-6 max-w-xs w-full shadow-2xl"
+            >
+              <div className="text-center mb-5">
+                <div className="text-3xl mb-2">⚠️</div>
+                <h3 className="font-bold text-gray-900 dark:text-white text-base">确认删除</h3>
+                <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">确定要删除这个技能吗？此操作不可恢复。</p>
+              </div>
+              <div className="flex gap-3">
+                <button
+                  onClick={async () => {
+                    if (confirmDialog.skillId) await deleteCustomSkill(confirmDialog.skillId);
+                    setConfirmDialog({ open: false, skillId: null });
+                    setEditingSkill(null);
+                  }}
+                  className="flex-1 bg-red-500 text-white py-2.5 rounded-xl font-medium"
+                >
+                  删除
+                </button>
+                <button
+                  onClick={() => setConfirmDialog({ open: false, skillId: null })}
+                  className="flex-1 bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 py-2.5 rounded-xl font-medium"
+                >
+                  取消
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+      </ModalPortal>
+    </div>
+  );
+};
+
+/* ─────────────────────────────────────────────
+   Achievements sub-page (embedded)
+───────────────────────────────────────────── */
+const AchievementsTab = () => {
+  const isP4 = useUiChannel() === 'p4';
+  const {
+    achievements,
+    activities,
+    attributes,
+    settings,
+    todoCompletions,
+    battleState,
+    weeklyGoals,
+    confidants,
+    updateCustomAchievement,
+    deleteCustomAchievement,
+    addCustomAchievement,
+    unlockAchievement
+  } = useAppStore(useShallow(s => ({ achievements: s.achievements, activities: s.activities, attributes: s.attributes, settings: s.settings, todoCompletions: s.todoCompletions, battleState: s.battleState, weeklyGoals: s.weeklyGoals, confidants: s.confidants, updateCustomAchievement: s.updateCustomAchievement, deleteCustomAchievement: s.deleteCustomAchievement, addCustomAchievement: s.addCustomAchievement, unlockAchievement: s.unlockAchievement })));
+
+  const [filterStatus, setFilterStatus] = useState<'all' | 'locked' | 'unlocked'>(() => {
+    try {
+      const saved = window.localStorage.getItem('pg_achievements_filter');
+      return saved === 'locked' || saved === 'unlocked' ? saved : 'all';
+    } catch { return 'all'; }
+  });
+  const filterCycle: Array<'all' | 'locked' | 'unlocked'> = ['all', 'locked', 'unlocked'];
+  const filterLabels: Record<'all' | 'locked' | 'unlocked', string> = { all: '全部', locked: '未完成', unlocked: '已完成' };
+
+  const [editingAchievement, setEditingAchievement] = useState<string | null>(null);
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [pressedId, setPressedId] = useState<string | null>(null);
+  const pressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+
+  const defaultEditForm = {
+    title: '',
+    description: '',
+    icon: '',
+    condition: {
+      type: 'total_points' as ConditionType,
+      value: 10,
+      keywords: [] as string[],
+      attribute: 'knowledge' as AttributeId,
+      currentProgress: 0
+    }
+  };
+  const [editForm, setEditForm] = useState(defaultEditForm);
+
+  useEffect(() => {
+    try { window.localStorage.setItem('pg_achievements_filter', filterStatus); } catch { /* 存储不可用 */ }
+  }, [filterStatus]);
+
+  // 委托板（第 6 轮）：领取次数直接数表
+  const questsClaimed = useLiveQuery(() => db.quests.filter(q => !!q.claimedAt).count(), []) ?? 0;
+  const getProgress = (achievement: typeof achievements[0]) => {
+    switch (achievement.condition.type) {
+      case 'quests_claimed':
+        return Math.min(questsClaimed, achievement.condition.value);
+      case 'consecutive_days':
+        // 与 store 的解锁判定同一口径：补记不计、按日历日比（之前这里自己算，夏令时一到就断链）
+        return Math.min(calcMaxStreak(streakDates(activities)), achievement.condition.value);
+      case 'days_since_first_record':
+        return Math.min(daysSinceFirstRecord(streakDates(activities)), achievement.condition.value);
+      case 'total_points':
+        return Math.min(attributes.reduce((sum, a) => sum + a.points, 0), achievement.condition.value);
+      case 'attribute_level': {
+        const attr = attributes.find(a => a.id === achievement.condition.attribute);
+        return attr ? Math.min(attr.level, achievement.condition.value) : 0;
+      }
+      case 'keyword_match':
+        return Math.min(achievement.condition.currentProgress || 0, achievement.condition.value);
+      case 'all_attributes_max':
+        return Math.min(attributes.filter(a => a.level >= achievement.condition.value).length, attributes.length);
+      case 'todo_completions':
+        return Math.min(todoCompletions.reduce((sum, item) => sum + item.count, 0), achievement.condition.value);
+      case 'shadow_defeats':
+        return Math.min(battleState?.defeatedShadowLog?.length ?? 0, achievement.condition.value);
+      case 'battle_feat':
+        return achievement.condition.feat && (battleState?.battleFeats ?? []).includes(achievement.condition.feat) ? 1 : 0;
+      // 周目标 / 羁绊两类此前漏在这里 → 落 default 0，进度条永远 0/N、也永远不显示
+      // "已达成，点击解锁"（store.unlockAchievement 侧其实早就支持）。口径与 store 同源。
+      case 'weekly_goal_completions':
+        return Math.min(weeklyGoals.filter(g => g.completed).length, achievement.condition.value);
+      case 'confidants_at_level': {
+        const minLv = achievement.condition.minLevel ?? 1;
+        return Math.min(
+          confidants.filter(c => !c.archivedAt && c.intimacy >= minLv).length,
+          achievement.condition.value,
+        );
+      }
+      default:
+        return 0;
+    }
+  };
+
+  const isCustomAchievement = (a: typeof achievements[0]) => a.id.startsWith('custom_');
+  /** 终极 / 隐藏成就不给编辑（隐藏的一编辑就露名字了） */
+  const isSealed = (a: typeof achievements[0]) => SEALED_ACHIEVEMENT_IDS.has(a.id);
+  /** 隐藏成就没领之前：卡面只有问号，名字、条件、进度都不露，领取弹窗才揭晓 */
+  const faceOf = (a: typeof achievements[0]) =>
+    HIDDEN_ACHIEVEMENT_IDS.has(a.id) && !a.unlocked
+      ? { title: '？？？', description: '隐藏成就', icon: '❔', masked: true }
+      : { title: a.title, description: a.description, icon: a.icon, masked: false };
+
+  const handleEdit = (achievement: typeof achievements[0]) => {
+    if (achievement.unlocked && !isCustomAchievement(achievement)) return;
+    if (isSealed(achievement)) return;
+    setEditingAchievement(achievement.id);
+    setEditForm({
+      title: achievement.title,
+      description: achievement.description,
+      icon: achievement.icon,
+      condition: {
+        type: achievement.condition.type,
+        value: achievement.condition.value,
+        attribute: achievement.condition.attribute || 'knowledge',
+        keywords: achievement.condition.keywords || [],
+        currentProgress: achievement.condition.currentProgress || 0
+      }
+    });
+  };
+
+  const startPress = (achievement: typeof achievements[0]) => {
+    if (pressTimerRef.current) clearTimeout(pressTimerRef.current);
+    setPressedId(achievement.id);
+    pressTimerRef.current = setTimeout(() => { handleEdit(achievement); setPressedId(null); }, 520);
+  };
+  const cancelPress = () => {
+    if (pressTimerRef.current) { clearTimeout(pressTimerRef.current); pressTimerRef.current = null; }
+    setPressedId(null);
+  };
+
+  const handleSaveEdit = async () => {
+    if (!editingAchievement) return;
+    if (editForm.condition.value <= 0) { setFormError('成就条件值必须大于0'); return; }
+    setFormError(null);
+    const target = achievements.find(a => a.id === editingAchievement);
+    if (!target) return;
+    const updates = { title: editForm.title, description: editForm.description, icon: editForm.icon, condition: editForm.condition };
+    if (isCustomAchievement(target)) {
+      await updateCustomAchievement(editingAchievement, updates);
+    } else {
+      await updateCustomAchievement(editingAchievement, { title: updates.title, description: updates.description, icon: updates.icon });
+    }
+    setEditingAchievement(null);
+  };
+
+  const handleDelete = (id: string) => {
+    if (!id.startsWith('custom_')) return;
+    setConfirmDeleteId(id);
+  };
+
+  const handleAddAchievement = async () => {
+    if (!editForm.title || !editForm.description || !editForm.icon) { setFormError('请填写完整的成就信息'); return; }
+    if (editForm.condition.value <= 0) { setFormError('成就条件值必须大于0'); return; }
+    setFormError(null);
+    await addCustomAchievement({
+      id: `custom_${Date.now()}`,
+      title: editForm.title,
+      description: editForm.description,
+      icon: editForm.icon,
+      condition: editForm.condition
+    });
+    setShowAddForm(false);
+    setEditForm(defaultEditForm);
+  };
+
+  const filtered = useMemo(() => {
+    const f = achievements.filter(a => {
+      if (filterStatus === 'locked') return !a.unlocked;
+      if (filterStatus === 'unlocked') return a.unlocked;
+      return true;
+    });
+    if (filterStatus === 'all') {
+      return [...f].sort((a, b) => (a.unlocked ? 1 : 0) - (b.unlocked ? 1 : 0));
+    }
+    return f;
+  }, [achievements, filterStatus]);
+
+  // Group attribute_level achievements by attribute for card switching
+  const { attrGroups, otherAchievements } = useMemo(() => {
+    const groups: Record<string, typeof filtered> = {};
+    const others: typeof filtered = [];
+    let wildHeart: typeof filtered[0] | undefined;
+    const hidden: typeof filtered = [];
+    filtered.forEach(a => {
+      if (a.condition.type === 'attribute_level' && a.condition.attribute && !a.id.startsWith('custom_')) {
+        const attr = a.condition.attribute;
+        if (!groups[attr]) groups[attr] = [];
+        groups[attr].push(a);
+      } else if (a.id === 'wild_heart') {
+        wildHeart = a;
+      } else if (HIDDEN_ACHIEVEMENT_IDS.has(a.id)) {
+        hidden.push(a);
+      } else {
+        others.push(a);
+      }
+    });
+    // Sort each group by value ascending
+    Object.values(groups).forEach(g => g.sort((a, b) => a.condition.value - b.condition.value));
+    // 不羁之心为终极成就，始终置于列表末尾
+    if (wildHeart) others.push(wildHeart);
+    // 隐藏成就压在最末
+    others.push(...hidden);
+    return { attrGroups: groups, otherAchievements: others };
+  }, [filtered]);
+
+  // Track which index is shown per attribute group; default to highest unlocked
+  const [attrGroupIdx, setAttrGroupIdx] = useState<Record<string, number>>({});
+  const [attrGroupDir, setAttrGroupDir] = useState<Record<string, 1 | -1>>({});
+  const cardSwipeRef = useRef<Record<string, { x: number; y: number } | null>>({});
+  const attrGroupKeys = Object.keys(attrGroups);
+  // Initialize indices when groups change
+  useEffect(() => {
+    setAttrGroupIdx(prev => {
+      const next: Record<string, number> = {};
+      attrGroupKeys.forEach(attr => {
+        if (prev[attr] !== undefined && prev[attr] < (attrGroups[attr]?.length ?? 0)) {
+          next[attr] = prev[attr];
+        } else {
+          // 默认档位：优先停在「已达成但还没解锁」那张（否则用户看到的是已解锁的低档卡，
+          // 得自己横滑才发现还有一张能领 —— 这也是"成就完成了却解锁不了"的观感来源之一）；
+          // 没有可领的再退回最高已解锁档。
+          const group = attrGroups[attr] ?? [];
+          const claimable = group.findIndex(a => !a.unlocked && getProgress(a) >= a.condition.value);
+          let highest = 0;
+          group.forEach((a, i) => { if (a.unlocked) highest = i; });
+          next[attr] = claimable >= 0 ? claimable : highest;
+        }
+      });
+      return next;
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [attrGroupKeys.join(',')]);
+
+  const achChannel = useUiChannel();
+  const p3 = achChannel === 'p3';
+
+  // ── 表单 / 确认弹窗（p3 与默认形态共用；P3R 弹窗形态属 modals 批次）──
+  const achievementModalsJsx = (
+    // portal 到 body：页内渲染会被 PageShell 的 stacking context 压在底部导航之下。
+    // 同上，页根的 .p5-reskin 要跟着搬过去，否则红主题下退回原始白卡
+    <ModalPortal className={achChannel === 'p5' ? 'p5-reskin' : ''}>
+      {/* Add modal */}
+      <AnimatePresence>
+        {showAddForm && (
+          <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
+            onClick={(e) => { if (e.target === e.currentTarget) { setShowAddForm(false); setFormError(null); } }}
+          >
+            <motion.div
+              initial={{ scale: 0.92, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.92, opacity: 0 }}
+              className="bg-white dark:bg-gray-900 rounded-2xl p-6 max-w-md w-full shadow-2xl max-h-[85vh] overflow-y-auto"
+            >
+              <h3 className="text-lg font-bold mb-5 text-gray-900 dark:text-white">添加自定义成就</h3>
+              <AchievementFormFields
+                editForm={editForm}
+                setEditForm={setEditForm as any}
+                isCustom={true}
+                attributeNames={settings.attributeNames}
+                maxLevel={settings.levelThresholds.length}
+              />
+              {formError && (
+                <div className="mt-4 px-3 py-2 rounded-xl bg-red-50 dark:bg-red-900/20 text-sm text-red-600 dark:text-red-400">{formError}</div>
+              )}
+              <div className="flex gap-3 mt-4">
+                <button onClick={handleAddAchievement} className="flex-1 bg-primary text-white py-2.5 rounded-xl font-medium">添加</button>
+                <button onClick={() => { setShowAddForm(false); setEditForm(defaultEditForm); setFormError(null); }} className="flex-1 bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 py-2.5 rounded-xl font-medium">取消</button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Edit modal */}
+      <AnimatePresence>
+        {editingAchievement && (
+          <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
+            onClick={(e) => { if (e.target === e.currentTarget) { setEditingAchievement(null); setFormError(null); } }}
+          >
+            <motion.div
+              initial={{ scale: 0.92, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.92, opacity: 0 }}
+              className="bg-white dark:bg-gray-900 rounded-2xl p-6 max-w-md w-full shadow-2xl max-h-[85vh] overflow-y-auto"
+            >
+              <h3 className="text-lg font-bold mb-5 text-gray-900 dark:text-white">编辑成就</h3>
+              <AchievementFormFields
+                editForm={editForm}
+                setEditForm={setEditForm as any}
+                isCustom={!!editingAchievement?.startsWith('custom_')}
+                attributeNames={settings.attributeNames}
+                maxLevel={settings.levelThresholds.length}
+              />
+              {formError && (
+                <div className="mt-4 px-3 py-2 rounded-xl bg-red-50 dark:bg-red-900/20 text-sm text-red-600 dark:text-red-400">{formError}</div>
+              )}
+              <div className="flex gap-3 mt-4">
+                <button onClick={handleSaveEdit} className="flex-1 bg-primary text-white py-2.5 rounded-xl font-medium">保存</button>
+                <button onClick={() => { setEditingAchievement(null); setFormError(null); }} className="flex-1 bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 py-2.5 rounded-xl font-medium">取消</button>
+              </div>
+              {editingAchievement.startsWith('custom_') && (
+                <button
+                  onClick={() => handleDelete(editingAchievement)}
+                  className="w-full mt-3 bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 py-2.5 rounded-xl font-medium"
+                >
+                  删除成就
+                </button>
+              )}
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* 内置删除确认弹窗 */}
+      <AnimatePresence>
+        {confirmDeleteId && (
+          <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/60 flex items-center justify-center z-[60] p-4"
+          >
+            <motion.div
+              initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }}
+              className="bg-white dark:bg-gray-900 rounded-2xl p-6 max-w-xs w-full shadow-2xl"
+            >
+              <div className="text-center mb-5">
+                <div className="text-3xl mb-2">⚠️</div>
+                <h3 className="font-bold text-gray-900 dark:text-white text-base">确认删除</h3>
+                <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">确定要删除这个成就吗？此操作不可恢复。</p>
+              </div>
+              <div className="flex gap-3">
+                <button
+                  onClick={async () => {
+                    await deleteCustomAchievement(confirmDeleteId);
+                    setConfirmDeleteId(null);
+                    setEditingAchievement(null);
+                  }}
+                  className="flex-1 bg-red-500 text-white py-2.5 rounded-xl font-medium"
+                >
+                  删除
+                </button>
+                <button
+                  onClick={() => setConfirmDeleteId(null)}
+                  className="flex-1 bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 py-2.5 rounded-xl font-medium"
+                >
+                  取消
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </ModalPortal>
+  );
+
+  // ── P3R（蓝频道）形态：p3-achievements-reference-v2 列表卡（横排：图标斜块+名/描述/进度+右侧 n/m）──
+  if (p3) {
+    return (
+      <div className="space-y-4">
+        {/* 筛选行（设计稿：白斜块「全部」+ 亮青斜块「添加成就」，右对齐） */}
+        <div className="flex items-center justify-end gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              const nextIndex = (filterCycle.indexOf(filterStatus) + 1) % filterCycle.length;
+              setFilterStatus(filterCycle[nextIndex]);
+            }}
+            className="px-4 py-2 text-[14px] font-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1b57ff]"
+            style={{ clipPath: slantClip(8), background: P3R.panel, color: P3R.ink, boxShadow: '0 6px 14px rgba(38,96,140,0.08)' }}
+          >
+            {filterLabels[filterStatus]}
+          </button>
+          <button
+            type="button"
+            onClick={() => { setShowAddForm(true); setEditForm(defaultEditForm); }}
+            className="px-4 py-2 text-[14px] font-black text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1b57ff]"
+            style={{ clipPath: slantClip(8), background: P3R.cyan }}
+          >
+            添加成就
+          </button>
+        </div>
+
+        <div className="space-y-2.5">
+          {/* 属性等级成就（组内横滑切档，逻辑同默认形态） */}
+          {attrGroupKeys.map((attr, gi) => {
+            const group = attrGroups[attr];
+            if (!group || group.length === 0) return null;
+            const idx = attrGroupIdx[attr] ?? 0;
+            const achievement = group[idx];
+            if (!achievement) return null;
+            const progress = getProgress(achievement);
+            const percentage = (progress / achievement.condition.value) * 100;
+            const canUnlock = !achievement.unlocked && percentage >= 100;
+            const attrDisplayName = settings.attributeNames[attr as keyof typeof settings.attributeNames] ?? attr;
+            const unlocked = achievement.unlocked;
+            return (
+              <motion.div
+                key={`group-${attr}`}
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="relative"
+                style={{ clipPath: slantClip(14), background: unlocked ? P3R.blue : canUnlock ? 'var(--p3r-claim, #fff6dc)' : P3R.panel, boxShadow: '0 10px 24px rgba(38,96,140,0.08)' }}
+              >
+                <div
+                  className="flex items-center gap-3 py-3 pl-5 pr-4"
+                  style={{ touchAction: group.length > 1 ? 'pan-y' : undefined }}
+                  onPointerDown={(e) => {
+                    // 起点无条件记：组内只剩一张时（"未完成"筛选下每个属性只余最后一档必现）
+                    // 早退会让 onPointerUp 取不到起点直接 return，点击解锁彻底失效（用户上报）
+                    cardSwipeRef.current[attr] = { x: e.clientX, y: e.clientY };
+                    if (group.length <= 1) return; // 不可横滑就不抢指针，交回给普通点击
+                    try { (e.currentTarget as Element).setPointerCapture(e.pointerId); } catch { /* ignore */ }
+                  }}
+                  onPointerUp={(e) => {
+                    const start = cardSwipeRef.current[attr];
+                    if (!start) return;
+                    cardSwipeRef.current[attr] = null;
+                    const dx = e.clientX - start.x;
+                    const dy = e.clientY - start.y;
+                    if (group.length > 1 && Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > 35) {
+                      if (dx < 0) {
+                        setAttrGroupDir(prev => ({ ...prev, [attr]: 1 }));
+                        setAttrGroupIdx(prev => ({ ...prev, [attr]: (idx + 1) % group.length }));
+                      } else {
+                        setAttrGroupDir(prev => ({ ...prev, [attr]: -1 }));
+                        setAttrGroupIdx(prev => ({ ...prev, [attr]: (idx - 1 + group.length) % group.length }));
+                      }
+                    } else if (Math.hypot(dx, dy) < 8 && canUnlock) {
+                      unlockAchievement(achievement.id);
+                    }
+                  }}
+                  onPointerCancel={() => { cardSwipeRef.current[attr] = null; }}
+                >
+                  <span
+                    aria-hidden
+                    className="flex h-12 w-12 shrink-0 items-center justify-center text-[22px]"
+                    style={{ clipPath: slantClip(7), background: unlocked ? 'rgba(255,255,255,0.22)' : gi % 2 ? P3R.cyan : P3R.blue }}
+                  >
+                    {achievement.icon}
+                  </span>
+                  <AnimatePresence mode="wait" initial={false}>
+                    <motion.div
+                      key={`${attr}-${idx}`}
+                      initial={{ x: (attrGroupDir[attr] ?? 1) * 30, opacity: 0 }}
+                      animate={{ x: 0, opacity: 1 }}
+                      exit={{ x: (attrGroupDir[attr] ?? 1) * -30, opacity: 0 }}
+                      transition={{ duration: 0.18, ease: 'easeOut' }}
+                      className="min-w-0 flex-1"
+                    >
+                      <div className="text-[10px] font-bold tracking-wider" style={{ color: unlocked ? 'rgba(255,255,255,0.65)' : P3R.grey }}>{attrDisplayName}</div>
+                      <div className="truncate text-[16px] font-black" style={{ color: unlocked ? '#fff' : P3R.ink }}>{achievement.title}</div>
+                      <div className="truncate text-[11px] font-semibold" style={{ color: unlocked ? 'rgba(255,255,255,0.85)' : P3R.grey }}>{achievement.description}</div>
+                      {!unlocked && (
+                        <div className="mt-1.5 h-[4px] w-[85%] overflow-hidden" style={{ background: 'rgba(53,209,232,0.18)' }}>
+                          <motion.div
+                            className="h-full"
+                            style={{ background: canUnlock ? '#f5a623' : P3R.cyan }}
+                            initial={{ width: 0 }}
+                            animate={{ width: `${Math.min(100, percentage)}%` }}
+                            transition={{ duration: 0.7, ease: 'easeOut' }}
+                          />
+                        </div>
+                      )}
+                      {canUnlock && <div className="mt-1 text-[10px] font-bold" style={{ color: '#e08a00' }}>已达成，点击解锁 ✨</div>}
+                      {unlocked && achievement.unlockedDate && (
+                        <div className="mt-0.5 text-[10px] font-semibold" style={{ color: 'rgba(255,255,255,0.75)' }}>
+                          解锁于 {new Date(achievement.unlockedDate).toLocaleDateString('zh-CN')}
+                        </div>
+                      )}
+                    </motion.div>
+                  </AnimatePresence>
+                  <div className="shrink-0 pl-1 text-right">
+                    {unlocked ? (
+                      <span className="text-[20px] font-black text-white" aria-hidden>✓</span>
+                    ) : (
+                      <span className="text-[18px] font-black italic tabular-nums" style={{ color: canUnlock ? '#e08a00' : P3R.blue }}>
+                        {progress}<span className="mx-px opacity-50">/</span>{achievement.condition.value}
+                      </span>
+                    )}
+                  </div>
+                </div>
+                {/* 编辑铅笔 */}
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); handleEdit(achievement); }}
+                  className="absolute right-1.5 top-1.5 flex h-6 w-6 items-center justify-center focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1b57ff]"
+                  style={{ color: unlocked ? 'rgba(255,255,255,0.7)' : P3R.grey }}
+                  aria-label={`编辑成就 ${achievement.title}`}
+                >
+                  <svg viewBox="0 0 16 16" className="h-3 w-3" fill="currentColor">
+                    <path d="M11.5 2.5a1.5 1.5 0 012.121 2.121L5.561 12.682l-2.829.707.707-2.829L11.5 2.5z" />
+                  </svg>
+                </button>
+                {/* 组内档位指示 */}
+                {group.length > 1 && (
+                  <div className="flex justify-center gap-1.5 pb-2.5">
+                    {group.map((_, i) => (
+                      <button
+                        key={i}
+                        type="button"
+                        onClick={() => setAttrGroupIdx(prev => ({ ...prev, [attr]: i }))}
+                        aria-label={`切到第 ${i + 1} 档`}
+                        style={{
+                          width: i === idx ? 16 : 6,
+                          height: 5,
+                          background: i === idx ? (unlocked ? 'rgba(255,255,255,0.85)' : P3R.cyan) : (unlocked ? 'rgba(255,255,255,0.35)' : 'rgba(53,209,232,0.3)'),
+                          clipPath: slantClip(2),
+                          transition: 'all .2s',
+                        }}
+                      />
+                    ))}
+                  </div>
+                )}
+                <span aria-hidden className="absolute bottom-0 right-0 h-3.5 w-3.5" style={{ background: unlocked ? 'rgba(255,255,255,0.4)' : P3R.cyan, clipPath: 'polygon(100% 0, 100% 100%, 0 100%)' }} />
+              </motion.div>
+            );
+          })}
+
+          {/* 其他成就（长按编辑自定义、点击解锁，逻辑同默认形态） */}
+          {otherAchievements.map((achievement, i) => {
+            const progress = getProgress(achievement);
+            const percentage = (progress / achievement.condition.value) * 100;
+            const isCustom = isCustomAchievement(achievement);
+            const canUnlock = !achievement.unlocked && percentage >= 100;
+            const unlocked = achievement.unlocked;
+            const face = faceOf(achievement);
+            return (
+              <motion.div
+                key={achievement.id}
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                whileTap={{ scale: pressedId === achievement.id ? 0.97 : 1 }}
+                onMouseDown={() => { if (isCustom) startPress(achievement); }}
+                onMouseUp={cancelPress}
+                onMouseLeave={cancelPress}
+                onTouchStart={() => { if (isCustom) startPress(achievement); }}
+                onTouchEnd={cancelPress}
+                onTouchCancel={cancelPress}
+                onClick={() => { if (canUnlock) unlockAchievement(achievement.id); }}
+                className="relative cursor-pointer"
+                style={{ clipPath: slantClip(14), background: unlocked ? P3R.blue : canUnlock ? 'var(--p3r-claim, #fff6dc)' : P3R.panel, boxShadow: '0 10px 24px rgba(38,96,140,0.08)' }}
+              >
+                <div className="flex items-center gap-3 py-3.5 pl-5 pr-4">
+                  <span
+                    aria-hidden
+                    className="flex h-12 w-12 shrink-0 items-center justify-center text-[22px]"
+                    style={{ clipPath: slantClip(7), background: unlocked ? 'rgba(255,255,255,0.22)' : (attrGroupKeys.length + i) % 2 ? P3R.cyan : P3R.blue }}
+                  >
+                    {face.icon}
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-[16px] font-black" style={{ color: unlocked ? '#fff' : P3R.ink }}>{face.title}</div>
+                    <div className="truncate text-[11px] font-semibold" style={{ color: unlocked ? 'rgba(255,255,255,0.85)' : P3R.grey }}>{face.description}</div>
+                    {!unlocked && !face.masked && (
+                      <div className="mt-1.5 h-[4px] w-[85%] overflow-hidden" style={{ background: 'rgba(53,209,232,0.18)' }}>
+                        <motion.div
+                          className="h-full"
+                          style={{ background: canUnlock ? '#f5a623' : P3R.cyan }}
+                          initial={{ width: 0 }}
+                          animate={{ width: `${Math.min(100, percentage)}%` }}
+                          transition={{ duration: 0.7, ease: 'easeOut' }}
+                        />
+                      </div>
+                    )}
+                    {canUnlock && <div className="mt-1 text-[10px] font-bold" style={{ color: '#e08a00' }}>已达成，点击解锁 ✨</div>}
+                    {unlocked && achievement.unlockedDate && (
+                      <div className="mt-0.5 text-[10px] font-semibold" style={{ color: 'rgba(255,255,255,0.75)' }}>
+                        解锁于 {new Date(achievement.unlockedDate).toLocaleDateString('zh-CN')}
+                      </div>
+                    )}
+                  </div>
+                  <div className="shrink-0 pl-1 text-right">
+                    {unlocked ? (
+                      <span className="text-[20px] font-black text-white" aria-hidden>✓</span>
+                    ) : (
+                      <span className="text-[18px] font-black italic tabular-nums" style={{ color: canUnlock ? '#e08a00' : P3R.blue }}>
+                        {face.masked
+                          ? (canUnlock ? '！' : '？')
+                          : <>{progress}<span className="mx-px opacity-50">/</span>{achievement.condition.value}</>}
+                      </span>
+                    )}
+                  </div>
+                </div>
+                {/* 编辑 / 删除（自定义） */}
+                <div className="absolute right-1.5 top-1.5 flex gap-0.5">
+                  {!isSealed(achievement) && (
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); handleEdit(achievement); }}
+                      className="flex h-6 w-6 items-center justify-center focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1b57ff]"
+                      style={{ color: unlocked ? 'rgba(255,255,255,0.7)' : P3R.grey }}
+                      aria-label={`编辑成就 ${achievement.title}`}
+                    >
+                      <svg viewBox="0 0 16 16" className="h-3 w-3" fill="currentColor">
+                        <path d="M11.5 2.5a1.5 1.5 0 012.121 2.121L5.561 12.682l-2.829.707.707-2.829L11.5 2.5z" />
+                      </svg>
+                    </button>
+                  )}
+                  {isCustom && (
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); handleDelete(achievement.id); }}
+                      className="flex h-6 w-6 items-center justify-center focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#f0417f]"
+                      style={{ color: unlocked ? 'rgba(255,255,255,0.7)' : P3R.magenta }}
+                      aria-label={`删除成就 ${achievement.title}`}
+                    >
+                      <svg viewBox="0 0 16 16" className="h-3 w-3" fill="currentColor">
+                        <path d="M5 2h6l1 1H3L5 2zm-2 2h10l-1 9H4L3 4zm3 2v6h1V6H6zm3 0v6h1V6H9z" />
+                      </svg>
+                    </button>
+                  )}
+                </div>
+                <span aria-hidden className="absolute bottom-0 right-0 h-3.5 w-3.5" style={{ background: unlocked ? 'rgba(255,255,255,0.4)' : P3R.cyan, clipPath: 'polygon(100% 0, 100% 100%, 0 100%)' }} />
+              </motion.div>
+            );
+          })}
+        </div>
+
+        {filtered.length === 0 && <P3EmptySlab text="暂无可展示的成就" />}
+
+        {achievementModalsJsx}
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Controls：P4 = 黑胶囊筛选 + 橙胶囊添加（白花前缀） */}
+      <div className="flex items-center gap-2 justify-end">
+        <motion.button
+          whileTap={{ scale: 0.95 }}
+          onClick={() => {
+            const nextIndex = (filterCycle.indexOf(filterStatus) + 1) % filterCycle.length;
+            setFilterStatus(filterCycle[nextIndex]);
+          }}
+          className={
+            isP4
+              ? 'flex items-center gap-1.5 rounded-full bg-[#131313] px-3.5 py-1.5 text-sm font-black text-white'
+              : 'px-3 py-1.5 rounded-lg text-sm font-medium bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-200'
+          }
+        >
+          {isP4 && <P4Flower size={13} color="var(--ui-bg)" />}
+          {filterLabels[filterStatus]}
+        </motion.button>
+        <motion.button
+          whileTap={{ scale: 0.95 }}
+          onClick={() => { setShowAddForm(true); setEditForm(defaultEditForm); }}
+          className={
+            isP4
+              ? 'flex items-center gap-1.5 rounded-full px-4 py-1.5 text-sm font-black text-white'
+              : 'px-4 py-1.5 bg-primary text-white rounded-lg text-sm font-medium'
+          }
+          style={isP4 ? { background: 'var(--p4-orange, #f9a11b)', boxShadow: '0 2px 0 rgba(19,19,19,0.25)' } : undefined}
+        >
+          {isP4 && <P4Flower size={13} color="#ffffff" />}
+          添加成就
+        </motion.button>
+      </div>
+
+      {/* Achievement cards */}
+      <div className="grid grid-cols-1 wide:grid-cols-2 wide-lg:grid-cols-3 gap-3">
+        {/* ── Attribute level grouped cards ── */}
+        {attrGroupKeys.map(attr => {
+          const group = attrGroups[attr];
+          if (!group || group.length === 0) return null;
+          const idx = attrGroupIdx[attr] ?? 0;
+          const achievement = group[idx];
+          if (!achievement) return null;
+          const progress = getProgress(achievement);
+          const percentage = (progress / achievement.condition.value) * 100;
+          const canUnlock = !achievement.unlocked && percentage >= 100;
+          const attrDisplayName = settings.attributeNames[attr as keyof typeof settings.attributeNames] ?? attr;
+
+          return (
+            <motion.div
+              key={`group-${attr}`}
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              className={
+                isP4
+                  ? 'relative transition-all'
+                  : `p5-ach rounded-2xl border relative transition-all ${
+                      achievement.unlocked
+                        ? 'bg-gradient-to-br from-amber-400 to-orange-500 border-transparent text-white shadow-md shadow-amber-200/50 dark:shadow-amber-900/30'
+                        : canUnlock
+                        ? 'bg-amber-50 dark:bg-amber-900/20 border-amber-300 dark:border-amber-600'
+                        : 'bg-white dark:bg-gray-900 border-gray-100 dark:border-gray-800 shadow-sm'
+                    }`
+              }
+              style={
+                isP4
+                  ? {
+                      clipPath: P4_RIBBON_CLIP,
+                      background: achievement.unlocked
+                        ? 'linear-gradient(120deg, var(--p4-orange, #f9a11b), #ffc23f)'
+                        : canUnlock
+                          ? '#ffefb8'
+                          : 'var(--ui-paper)',
+                      color: '#131313',
+                    }
+                  : undefined
+              }
+            >
+              {/* Attribute label */}
+              <div className={`text-[10px] font-semibold text-center pt-3 pb-0.5 tracking-wider ${
+                achievement.unlocked ? 'text-white/60' : 'text-gray-400 dark:text-gray-500'
+              }`}>
+                {attrDisplayName}
+              </div>
+
+              {/* Edit button */}
+              <div className="absolute top-2.5 right-2.5 flex gap-1">
+                <motion.button
+                  whileTap={{ scale: 0.9 }}
+                  onClick={(e) => { e.stopPropagation(); handleEdit(achievement); }}
+                  className={`w-6 h-6 rounded-full flex items-center justify-center ${
+                    achievement.unlocked ? 'bg-white/20 text-white' : 'bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400'
+                  }`}
+                >
+                  <svg viewBox="0 0 16 16" className="w-3 h-3" fill="currentColor">
+                    <path d="M11.5 2.5a1.5 1.5 0 012.121 2.121L5.561 12.682l-2.829.707.707-2.829L11.5 2.5z" />
+                  </svg>
+                </motion.button>
+              </div>
+
+              {/* Card body — swipe left/right to switch within group */}
+              <div
+                className="px-3 pb-1 text-center overflow-hidden"
+                style={{ touchAction: group.length > 1 ? 'pan-y' : undefined }}
+                onPointerDown={(e) => {
+                  // 同 p3 分支：起点无条件记，否则单张组的点击解锁会被 onPointerUp 的 !start 吞掉
+                  cardSwipeRef.current[attr] = { x: e.clientX, y: e.clientY };
+                  if (group.length <= 1) return;
+                  try { (e.currentTarget as Element).setPointerCapture(e.pointerId); } catch { /* ignore */ }
+                }}
+                onPointerUp={(e) => {
+                  const start = cardSwipeRef.current[attr];
+                  if (!start) return;
+                  cardSwipeRef.current[attr] = null;
+                  const dx = e.clientX - start.x;
+                  const dy = e.clientY - start.y;
+                  if (group.length > 1 && Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > 35) {
+                    if (dx < 0) {
+                      setAttrGroupDir(prev => ({ ...prev, [attr]: 1 }));
+                      setAttrGroupIdx(prev => ({ ...prev, [attr]: (idx + 1) % group.length }));
+                    } else {
+                      setAttrGroupDir(prev => ({ ...prev, [attr]: -1 }));
+                      setAttrGroupIdx(prev => ({ ...prev, [attr]: (idx - 1 + group.length) % group.length }));
+                    }
+                  } else if (Math.hypot(dx, dy) < 8 && canUnlock) {
+                    unlockAchievement(achievement.id);
+                  }
+                }}
+                onPointerCancel={() => { cardSwipeRef.current[attr] = null; }}
+              >
+                <AnimatePresence mode="wait" initial={false}>
+                  <motion.div
+                    key={`${attr}-${idx}`}
+                    initial={{ x: (attrGroupDir[attr] ?? 1) * 30, opacity: 0 }}
+                    animate={{ x: 0, opacity: 1 }}
+                    exit={{ x: (attrGroupDir[attr] ?? 1) * -30, opacity: 0 }}
+                    transition={{ duration: 0.18, ease: 'easeOut' }}
+                    className="py-2"
+                  >
+                    {isP4 ? (
+                      <span className="mx-auto mb-1.5 flex h-12 w-12 items-center justify-center rounded-full text-2xl" style={{ background: '#fffbe8', border: '3px solid var(--p4-orange, #f9a11b)' }}>
+                        {achievement.icon}
+                      </span>
+                    ) : (
+                      <div className="text-2xl mb-1">{achievement.icon}</div>
+                    )}
+                    <h3
+                      className={`font-bold text-sm mb-0.5 ${isP4 ? 'text-[15px] font-black text-[#131313]' : achievement.unlocked ? 'text-white' : 'text-gray-800 dark:text-white'}`}
+                      style={isP4 ? { fontFamily: 'var(--p4-display-font, serif)' } : undefined}
+                    >
+                      {achievement.title}
+                    </h3>
+                    <p className={`text-xs mb-2 leading-snug ${achievement.unlocked ? 'text-white/90' : 'text-gray-500 dark:text-gray-400'}`}>
+                      {achievement.description}
+                    </p>
+
+                    {!achievement.unlocked && (
+                      <>
+                        <div className={`w-full rounded-full h-1.5 mb-1.5 overflow-hidden ${isP4 ? 'mx-auto max-w-[75%] bg-[#131313]/15' : 'bg-gray-100 dark:bg-gray-800'}`}>
+                          <motion.div
+                            className={`h-full rounded-full ${isP4 ? '' : canUnlock ? 'bg-amber-500' : 'bg-primary'}`}
+                            style={isP4 ? { background: 'var(--ui-danger)' } : undefined}
+                            initial={{ width: 0 }}
+                            animate={{ width: `${Math.min(100, percentage)}%` }}
+                            transition={{ duration: 0.7, ease: 'easeOut' }}
+                          />
+                        </div>
+                        <div className={`text-[10px] ${isP4 ? 'font-black text-[#131313]/70 tabular-nums' : canUnlock ? 'text-amber-600 dark:text-amber-400 font-semibold' : 'text-gray-400 dark:text-gray-500'}`}>
+                          {canUnlock ? '已达成，点击解锁 ✨' : `${progress} / ${achievement.condition.value}`}
+                        </div>
+                      </>
+                    )}
+
+                    {achievement.unlocked && achievement.unlockedDate && (
+                      <div className="text-[10px] text-white/75 mt-1">
+                        解锁于 {new Date(achievement.unlockedDate).toLocaleDateString('zh-CN')}
+                      </div>
+                    )}
+                  </motion.div>
+                </AnimatePresence>
+              </div>
+
+              {/* Dot indicators */}
+              {group.length > 1 && (
+                <div className="flex justify-center gap-1.5 pb-3">
+                  {group.map((_, i) => (
+                    <button
+                      key={i}
+                      onClick={() => setAttrGroupIdx(prev => ({ ...prev, [attr]: i }))}
+                      className="rounded-full transition-all"
+                      style={{
+                        width: i === idx ? 14 : 5,
+                        height: 5,
+                        background: i === idx
+                          ? (achievement.unlocked ? 'rgba(255,255,255,0.8)' : 'var(--color-primary)')
+                          : (achievement.unlocked ? 'rgba(255,255,255,0.3)' : 'rgba(156,163,175,0.3)'),
+                      }}
+                    />
+                  ))}
+                </div>
+              )}
+            </motion.div>
+          );
+        })}
+
+        {/* ── Other (non-attribute-level) achievements ── */}
+        {otherAchievements.map((achievement) => {
+          const progress = getProgress(achievement);
+          const percentage = (progress / achievement.condition.value) * 100;
+          const isCustom = isCustomAchievement(achievement);
+          const sealed = isSealed(achievement);
+          const canUnlock = !achievement.unlocked && percentage >= 100;
+          const face = faceOf(achievement);
+
+          return (
+            <motion.div
+              key={achievement.id}
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              whileTap={{ scale: pressedId === achievement.id ? 0.97 : 1 }}
+              onMouseDown={() => { if (isCustom) startPress(achievement); }}
+              onMouseUp={cancelPress}
+              onMouseLeave={cancelPress}
+              onTouchStart={() => { if (isCustom) startPress(achievement); }}
+              onTouchEnd={cancelPress}
+              onTouchCancel={cancelPress}
+              onClick={() => { if (canUnlock) unlockAchievement(achievement.id); }}
+              className={
+                isP4
+                  ? 'relative cursor-pointer p-3 transition-all'
+                  : `p5-ach rounded-2xl p-3 border cursor-pointer relative transition-all ${
+                      achievement.unlocked
+                        ? 'bg-gradient-to-br from-amber-400 to-orange-500 border-transparent text-white shadow-md shadow-amber-200/50 dark:shadow-amber-900/30'
+                        : canUnlock
+                        ? 'bg-amber-50 dark:bg-amber-900/20 border-amber-300 dark:border-amber-600'
+                        : 'bg-white dark:bg-gray-900 border-gray-100 dark:border-gray-800 shadow-sm'
+                    }`
+              }
+              style={
+                isP4
+                  ? {
+                      clipPath: P4_RIBBON_CLIP,
+                      background: achievement.unlocked
+                        ? 'linear-gradient(120deg, var(--p4-orange, #f9a11b), #ffc23f)'
+                        : canUnlock
+                          ? '#ffefb8'
+                          : 'var(--ui-paper)',
+                      color: '#131313',
+                    }
+                  : undefined
+              }
+            >
+              {/* Edit/Delete buttons */}
+              <div className="absolute top-2.5 right-2.5 flex gap-1">
+                {!sealed && (
+                  <motion.button
+                    whileTap={{ scale: 0.9 }}
+                    onClick={(e) => { e.stopPropagation(); handleEdit(achievement); }}
+                    className={`w-6 h-6 rounded-full flex items-center justify-center ${
+                      achievement.unlocked ? 'bg-white/20 text-white' : 'bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400'
+                    }`}
+                  >
+                    <svg viewBox="0 0 16 16" className="w-3 h-3" fill="currentColor">
+                      <path d="M11.5 2.5a1.5 1.5 0 012.121 2.121L5.561 12.682l-2.829.707.707-2.829L11.5 2.5z" />
+                    </svg>
+                  </motion.button>
+                )}
+                {isCustom && (
+                  <motion.button
+                    whileTap={{ scale: 0.9 }}
+                    onClick={(e) => { e.stopPropagation(); handleDelete(achievement.id); }}
+                    className={`w-6 h-6 rounded-full flex items-center justify-center ${
+                      achievement.unlocked ? 'bg-white/20 text-white' : 'bg-red-50 dark:bg-red-900/20 text-red-400'
+                    }`}
+                  >
+                    <svg viewBox="0 0 16 16" className="w-3 h-3" fill="currentColor">
+                      <path d="M5 2h6l1 1H3L5 2zm-2 2h10l-1 9H4L3 4zm3 2v6h1V6H6zm3 0v6h1V6H9z" />
+                    </svg>
+                  </motion.button>
+                )}
+              </div>
+
+              {isP4 ? (
+                <span className="mx-auto mb-1.5 flex h-12 w-12 items-center justify-center rounded-full text-2xl" style={{ background: '#fffbe8', border: '3px solid var(--p4-orange, #f9a11b)' }}>
+                  {face.icon}
+                </span>
+              ) : (
+                <div className="text-2xl mb-1 text-center">{face.icon}</div>
+              )}
+              <h3
+                className={`font-bold text-sm mb-0.5 text-center ${isP4 ? 'text-[15px] font-black text-[#131313]' : achievement.unlocked ? 'text-white' : 'text-gray-800 dark:text-white'}`}
+                style={isP4 ? { fontFamily: 'var(--p4-display-font, serif)' } : undefined}
+              >
+                {face.title}
+              </h3>
+              <p className={`text-xs mb-2 text-center leading-snug ${achievement.unlocked ? 'text-white/90' : 'text-gray-500 dark:text-gray-400'}`}>
+                {face.description}
+              </p>
+
+              {!achievement.unlocked && (
+                <>
+                  {!face.masked && <div className={`w-full rounded-full h-1.5 mb-1.5 overflow-hidden ${isP4 ? 'mx-auto max-w-[75%] bg-[#131313]/15' : 'bg-gray-100 dark:bg-gray-800'}`}>
+                    <motion.div
+                      className={`h-full rounded-full ${isP4 ? '' : canUnlock ? 'bg-amber-500' : 'bg-primary'}`}
+                      style={isP4 ? { background: 'var(--ui-danger)' } : undefined}
+                      initial={{ width: 0 }}
+                      animate={{ width: `${Math.min(100, percentage)}%` }}
+                      transition={{ duration: 0.7, ease: 'easeOut' }}
+                    />
+                  </div>}
+                  <div className={`text-[10px] text-center ${isP4 ? 'font-black text-[#131313]/70 tabular-nums' : canUnlock ? 'text-amber-600 dark:text-amber-400 font-semibold' : 'text-gray-400 dark:text-gray-500'}`}>
+                    {canUnlock ? '已达成，点击解锁 ✨' : face.masked ? '？？？' : `${progress} / ${achievement.condition.value}`}
+                  </div>
+                </>
+              )}
+
+              {achievement.unlocked && achievement.unlockedDate && (
+                <div className="text-[10px] text-center text-white/75 mt-1">
+                  解锁于 {new Date(achievement.unlockedDate).toLocaleDateString('zh-CN')}
+                </div>
+              )}
+            </motion.div>
+          );
+        })}
+      </div>
+
+      {filtered.length === 0 && (
+        <div className="text-center py-12 text-gray-400 dark:text-gray-500 text-sm">暂无成就</div>
+      )}
+
+      {achievementModalsJsx}
+    </div>
+  );
+};
+
+/* ─────────────────────────────────────────────
+   Main page: tabs
+───────────────────────────────────────────── */
+export const Achievements = () => {
+  const [activeTab, setActiveTab] = useState<'achievements' | 'skills' | 'codex'>('achievements');
+  const setCurrentPage = useAppStore(s => s.setCurrentPage);
+  const channel = useUiChannel();
+  const isP4 = channel === 'p4';
+  const p3 = channel === 'p3';
+
+  const tabs = [
+    { key: 'achievements', label: '成就' },
+    { key: 'skills', label: '技能' },
+    { key: 'codex', label: '图鉴' },   // 第 6 轮：塔罗 / 影子 / 岁时三册（用户拍板放这页，不单开）
+  ] as const;
+
+  const tabContent = (
+    <AnimatePresence mode="wait">
+      <motion.div
+        key={activeTab}
+        initial={{ opacity: 0, y: 8 }}
+        animate={{ opacity: 1, y: 0 }}
+        exit={{ opacity: 0, y: -8 }}
+        transition={{ duration: 0.18 }}
+      >
+        {activeTab === 'achievements' ? <AchievementsTab /> : activeTab === 'skills' ? <SkillsTab /> : <CodexTab />}
+      </motion.div>
+    </AnimatePresence>
+  );
+
+  // ── P3R（蓝频道）形态：p3-achievements-reference-v2 1:1 ──
+  if (p3) {
+    return (
+      <P3RPage>
+        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="relative space-y-5 pb-8">
+          <GhostWords words={['ARCHIVE']} className="left-[6px] top-[-14px] text-[60px]" />
+          <P3PageHeader ticks title="成就" onBack={() => setCurrentPage('menu')} className="relative pt-2" />
+
+          {/* 切换头（设计稿：选中 = 蓝斜块白字 + 右下洋红角；未选 = 白斜块黑字） */}
+          <div className="relative flex items-stretch">
+            {tabs.map(tab => {
+              const active = activeTab === tab.key;
+              return (
+                <button
+                  key={tab.key}
+                  type="button"
+                  onClick={() => { triggerNavFeedback(); setActiveTab(tab.key); }}
+                  className={`relative flex-1 py-3 text-center text-[20px] font-black tracking-wide ${active ? 'text-white' : ''} focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1b57ff]`}
+                  style={{
+                    clipPath: slantClip(14),
+                    background: active ? P3R.blue : P3R.panel,
+                    color: active ? '#fff' : P3R.ink,
+                    marginLeft: tab.key === 'achievements' ? 0 : -8,
+                    zIndex: active ? 2 : 1,
+                  }}
+                >
+                  {tab.label}
+                  {active && (
+                    <span aria-hidden className="absolute bottom-0 right-4 h-[9px] w-[22px]" style={{ background: P3R.magenta, clipPath: 'polygon(30% 0, 100% 0, 70% 100%, 0 100%)' }} />
+                  )}
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="relative">{tabContent}</div>
+
+          {/* 底部幽灵字 */}
+          <div aria-hidden className="relative h-14">
+            <GhostWords words={['ACHIEVEMENT']} className="left-[6px] top-[-2px] text-[44px]" />
+          </div>
+        </motion.div>
+      </P3RPage>
+    );
+  }
+  const p5 = channel === 'p5';
+
+  return (
+    <P5RPage active={p5}>
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      className={`space-y-4 ${p5 ? 'p5-reskin relative' : ''}`}
+    >
+      {p5 && (
+        <div aria-hidden className="pointer-events-none absolute -inset-x-4 -top-6 h-[190px]" style={{ zIndex: -1 }}>
+          <P5Slab color={P5R.red} seed={281} rot={-9} style={{ left: -60, top: -16, width: 210, height: 130 }} />
+          <P5Slab color={P5R.redDeep} seed={282} rot={11} style={{ right: -70, top: 30, width: 220, height: 140 }} />
+          <P5Star size={30} fill={P5R.red} ring2={P5R.paper} rot={-14} className="absolute" style={{ right: 40, top: 6 }} />
+          <P5Dots className="absolute" style={{ right: 0, top: 120, width: 76, height: 66 }} color="#4a4741" />
+        </div>
+      )}
+      {p5 ? (
+        /* P5（无稿延伸）：拼贴双词瓷砖切换头（成就/技能）+ AWARD 纸条 */
+        <div className="relative pt-1">
+          <div className="flex items-end gap-2.5">
+            <button
+              type="button"
+              onClick={() => setCurrentPage('menu')}
+              aria-label="返回"
+              className="relative mb-1 flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#c00008]"
+              style={{ background: P5R.paper, border: '2.5px solid #050505', boxShadow: '3px 3px 0 #000000', clipPath: 'polygon(2px 1px, calc(100% - 1px) 3px, calc(100% - 3px) calc(100% - 1px), 1px calc(100% - 3px))' }}
+            >
+              <span aria-hidden className="h-0 w-0 border-y-[7px] border-y-transparent border-r-[11px]" style={{ borderRightColor: '#050505' }} />
+            </button>
+            {tabs.map((tab, i) => (
+              <motion.button
+                key={tab.key}
+                onClick={() => { triggerNavFeedback(); setActiveTab(tab.key); }}
+                whileTap={{ scale: 0.95 }}
+                className="relative cursor-pointer"
+              >
+                <motion.span
+                  animate={{ fontSize: activeTab === tab.key ? '26px' : '17px', rotate: activeTab === tab.key ? (i === 0 ? -2.5 : 2) : (i === 0 ? 2 : -2) }}
+                  transition={{ type: 'spring', stiffness: 400, damping: 32 }}
+                  className="inline-block px-3 py-1.5 font-black leading-none"
+                  style={{
+                    background: activeTab === tab.key ? P5R.red : P5R.paper,
+                    color: activeTab === tab.key ? '#ffffff' : P5R.grey,
+                    border: '3px solid #050505',
+                    boxShadow: '0 0 0 2.5px #f0e9df, 5px 6px 0 #000000',
+                    // 黑体真 Black 字重（之前是圆体合成加粗，撑不起页头大字）
+                    fontFamily: P5_TITLE_FONT,
+                  }}
+                >
+                  {tab.label}
+                </motion.span>
+              </motion.button>
+            ))}
+          </div>
+          <div className="mt-2.5 pl-12">
+            <P5SubBar segs={[{ t: 'AWARD' }, { t: 'SHOW', c: P5R.red }]} star rot={-1.2} className="!px-2.5 !py-0.5" />
+          </div>
+        </div>
+      ) : isP4 ? (
+        <div className="relative -mx-4 min-h-[136px] px-4 pb-1 pt-1" style={P4_HEADER_BLEED}>
+          <P4ArcRings size={210} className="absolute -right-16 -top-24" />
+          <P4SkyCircle size={128} className="absolute -right-6 top-0" />
+          <P4Flower size={90} color="rgba(255,246,208,0.55)" className="absolute -left-6 -top-6" />
+          <P4Sparkle size={16} color="var(--ui-accent)" className="absolute right-[30%] top-16" />
+          <div className="relative flex items-end gap-2">
+            <BackButton onClick={() => setCurrentPage('menu')} className="mb-3 -ml-1" />
+            {tabs.map(tab => (
+              <motion.button
+                key={tab.key}
+                onClick={() => { triggerNavFeedback(); setActiveTab(tab.key); }}
+                whileTap={{ scale: 0.96 }}
+                className="relative"
+              >
+                <motion.span
+                  animate={{ fontSize: activeTab === tab.key ? '40px' : '24px' }}
+                  transition={{ type: 'spring', stiffness: 400, damping: 32 }}
+                  className="block px-1 font-black leading-none tracking-tight text-[#131313]"
+                  style={{ fontFamily: 'var(--p4-display-font, serif)' }}
+                >
+                  {tab.label}
+                </motion.span>
+              </motion.button>
+            ))}
+          </div>
+          <div className="relative mt-2 inline-block rounded-full bg-[#131313] px-3 py-1 text-[10px] font-black tracking-[0.2em] text-[var(--ui-bg)]">
+            AWARD SHOW
+          </div>
+        </div>
+      ) : (
+      <>
+      <div className="flex items-start justify-between gap-3">
+        <BackButton onClick={() => setCurrentPage('menu')} className="mt-1 -ml-1" />
+        <div className="flex-1">
+          <PageTitle title="成就" en="Achievements" enOffset={{ right: -28 }} />
+        </div>
+      </div>
+
+      {/* Tab bar */}
+      <div className="flex items-center gap-1 bg-gray-100 dark:bg-gray-800 rounded-2xl p-1">
+        {tabs.map(tab => (
+          <motion.button
+            key={tab.key}
+            onClick={() => { triggerNavFeedback(); setActiveTab(tab.key); }}
+            className={`relative flex-1 py-2.5 rounded-xl text-sm font-semibold transition-colors ${
+              activeTab === tab.key
+                ? 'text-gray-900 dark:text-white'
+                : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'
+            }`}
+          >
+            {activeTab === tab.key && (
+              <motion.div
+                layoutId="achievements-tab-indicator"
+                className="absolute inset-0 bg-white dark:bg-gray-900 rounded-xl shadow-sm"
+                transition={{ type: 'spring', stiffness: 400, damping: 30 }}
+              />
+            )}
+            <span className="relative z-10">{tab.label}</span>
+          </motion.button>
+        ))}
+      </div>
+      </>
+      )}
+
+      {/* Tab content */}
+      {tabContent}
+    </motion.div>
+    </P5RPage>
+  );
+};

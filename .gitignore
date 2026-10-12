@@ -1,0 +1,92 @@
+# Dependencies
+node_modules
+
+# Build outputs
+dist
+dist-ssr
+
+# Local env files
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Android build artifacts
+app-debug.apk
+app-release.apk
+*.apk
+*.aab
+
+# Android Gradle cache (local build state, not needed in repo)
+android/.gradle/
+android/app/build/
+android/build/
+android/capacitor-cordova-android-plugins/
+
+# Android Studio workspace/caches (machine-specific)
+android/.idea/workspace.xml
+android/.idea/caches/
+android/.idea/gradle.xml
+android/.idea/navEditor.xml
+
+# Capacitor generated assets (rebuilt by `npx cap sync`)
+android/app/src/main/assets/public/
+android/app/src/main/assets/capacitor.config.json
+android/app/src/main/assets/capacitor.plugins.json
+android/app/src/main/res/xml/config.xml
+
+# iOS build artifacts / caches（ios/.gitignore 已覆盖同款，这里是根级双保险：
+# 那份文件一旦被误删，`git add ios/` 会把 build/Pods/本机绝对路径整包带上远端）
+ios/App/build/
+ios/App/Pods/
+ios/App/output/
+ios/App/App/public/
+ios/App/App/capacitor.config.json
+ios/App/App/config.xml
+ios/DerivedData/
+ios/capacitor-cordova-ios-plugins/
+xcuserdata/
+
+# Scripts compiled output
+scripts/*.class
+
+# Misc local files
+*.log
+
+# 音频素材不入库（体积/授权考量）。public/ 下的 UI 反馈音需自备，
+# 文件名见 src/utils/feedback.ts 与各处 playSound() 调用；缺失时音效静默。
+*.mp3
+*.wav
+
+# 本地 Agent 工具目录
+.claude/
+
+# 塔罗原稿（118 MB PNG）：只提交 public/tarot 下压缩后的 webp，原稿留在本地
+/tarot/
+
+# 部署配置不入库：域名 / 证书路径 / root 全是特定机器的，且极易与线上脱节。
+# （旧版曾在仓库里躺了几个月、和线上没有一处对得上，排查时反而把人带偏。）
+# 线上那份以部署机上的站点配置为准（证书由 ACME 客户端自动续期）。
+nginx.conf
+
+# 文档不入库（用户规则 2026-08-31）：除 README.md 外的 .md 一律不推
+*.md
+!README.md
+
+# 本机测试台（无头浏览器脚本、假 PB、本机 PocketBase 实例）：只放本地，不上 GitHub
+tests-local/
+
+# ===== 本项目追加（2026-06）：公开仓库版权隔离 =====
+# 塔罗牌面 webp（public/tarot/ 三频道各 22 张）：来源上游美术，保守不入公开仓库
+public/tarot/
+
+# 毕业设计策划书等本地文档（*\.md 全局排除已覆盖，这里显式双保险）
+/策划书*.md

@@ -1,0 +1,178 @@
+/**
+ * ledgerFormat.ts — F5 心相记账的共享展示常量与金额格式化。
+ *
+ * 抽出供 pages/Ledger 与 components/ledger/* 复用（页面 import 组件、组件又需页面常量
+ * 会形成循环依赖，故落在独立模块）。
+ */
+import type { LedgerExpenseType, LedgerIncomeType } from '@/types';
+
+export const CATEGORY_META: Record<LedgerExpenseType, { icon: string; label: string; dot: string; bar: string; hex: string }> = {
+  food:      { icon: '🍜', label: '餐饮', dot: 'bg-amber-400',  bar: 'bg-amber-400',  hex: '#fbbf24' },
+  transport: { icon: '🚇', label: '交通', dot: 'bg-sky-400',    bar: 'bg-sky-400',    hex: '#38bdf8' },
+  shopping:  { icon: '🛍️', label: '购物', dot: 'bg-pink-400',   bar: 'bg-pink-400',   hex: '#f472b6' },
+  fun:       { icon: '🎮', label: '娱乐', dot: 'bg-violet-400', bar: 'bg-violet-400', hex: '#a78bfa' },
+  home:      { icon: '🏠', label: '居住', dot: 'bg-teal-400',   bar: 'bg-teal-400',   hex: '#2dd4bf' },
+  study:     { icon: '📚', label: '提升', dot: 'bg-indigo-400', bar: 'bg-indigo-400', hex: '#818cf8' },
+  other:     { icon: '📦', label: '其它', dot: 'bg-slate-400',  bar: 'bg-slate-400',  hex: '#94a3b8' },
+};
+/** 安全取类目元数据（老数据 / 未知值兜底为「其它」）。 */
+export const catMeta = (t?: LedgerExpenseType) => CATEGORY_META[t as LedgerExpenseType] ?? CATEGORY_META.other;
+/** 成长类目：触发投资属性加点奖励。 */
+export const GROWTH_CATEGORIES: LedgerExpenseType[] = ['study'];
+export const isGrowthCategory = (t?: LedgerExpenseType) => !!t && GROWTH_CATEGORIES.includes(t);
+export const INCOME_META: Record<LedgerIncomeType, { label: string }> = {
+  labor: { label: '劳动所得' },
+  other: { label: '其它收入' },
+};
+export const CATEGORY_KEYS: LedgerExpenseType[] = ['food', 'transport', 'shopping', 'fun', 'home', 'study', 'other'];
+export const INCOME_TYPES: LedgerIncomeType[] = ['labor', 'other'];
+
+// ── 录入选项（可在确认卡手动增删、持久化到 settings；undefined 时回退以下默认） ──
+export const DEFAULT_CHANNELS = ['支付宝', '微信', '现金', '银行卡', '信用卡'];
+/** （第 13 轮 2.6）渠道即账户：没填渠道的老数据归这一个 */
+export const UNASSIGNED_ACCOUNT = '未分配';
+/** 信用卡 / 花呗 / 白条这类是负债账户：余额可以为负，显示成「欠 ¥x」 */
+export const isDebtAccount = (name: string): boolean => /信用|花呗|白条|借呗|分期|贷/.test(name);
+export interface AccountBalance { name: string; balance: number; isDebt: boolean; unassigned: boolean }
+export const DEFAULT_INCOME_SOURCES = ['工资', '兼职', '投资理财', '红包', '报销', '退款'];
+/** 收入来源 → 是否算「劳动所得」（记账 +10SP）；匹配 labor 关键词即算。 */
+const LABOR_SOURCE_RE = /工资|薪|兼职|劳务|奖金|提成|外快|加班/;
+export const incomeTypeFromSource = (src?: string): LedgerIncomeType =>
+  src && LABOR_SOURCE_RE.test(src) ? 'labor' : 'other';
+
+const CURRENCY_SYMBOLS: Record<string, string> = { CNY: '¥', USD: '$', EUR: '€', JPY: '¥', GBP: '£', HKD: 'HK$', KRW: '₩' };
+export const sym = (code?: string) => CURRENCY_SYMBOLS[code ?? 'CNY'] ?? code ?? '¥';
+
+/** 绝对值 + 千分位；整数不带小数，否则两位。 */
+export function fmtMoney(n: number): string {
+  const v = Math.abs(n);
+  return Number.isInteger(v)
+    ? v.toLocaleString('en-US')
+    : v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+/** 带符号格式：负值前缀 −（用于总余额/结余等可负的数）。 */
+export function fmtSigned(n: number, $: string): string {
+  return `${n < 0 ? '−' : ''}${$}${fmtMoney(n)}`;
+}
+
+/** 金额取整到分（第 13 轮）：浮点累加 0.01+1.11+10 = 11.120000000000001 这类误差，比较 / 显示 / 落库前统一抹掉。 */
+export function roundMoney(n: number): number {
+  if (!Number.isFinite(n)) return 0;
+  const r = Math.round((Math.abs(n) + Number.EPSILON) * 100) / 100;
+  return n < 0 ? -r : r;
+}
+
+/** 金额不带千分位的纯文本（受控输入框回填用）：整数不带小数，小数去掉末尾 0。 */
+export function fmtPlain(n: number): string {
+  const v = roundMoney(n);
+  return Number.isInteger(v) ? String(v) : v.toFixed(2).replace(/0$/, '');
+}
+
+/**
+ * 金额输入清洗（第 13 轮 2.4）：金额框统一 type="text" inputMode="decimal"，键盘给什么都接——
+ * 中文 / 欧洲区域的小数符号（，、。、,）归一成点；只留数字和一个点；最多两位小数；末尾的点保留（"12." 还在打）。
+ * 原来 type="number"：iOS 区域小数符号是逗号时键盘只给「,」，数字框不认 → 值变空、保存钮灰；部分安卓键盘没有「.」。
+ * allowNegative：对账目标余额可以是负数（透支 / 信用卡）。
+ */
+export function sanitizeMoneyInput(raw: string, opts: { allowNegative?: boolean } = {}): string {
+  let s = String(raw ?? '').replace(/[，,。]/g, '.').replace(/[^\d.\-]/g, '');
+  const neg = !!opts.allowNegative && s.startsWith('-');
+  s = s.replace(/-/g, '');
+  const i = s.indexOf('.');
+  if (i >= 0) s = s.slice(0, i + 1) + s.slice(i + 1).replace(/\./g, '').slice(0, 2);
+  s = s.replace(/^0+(?=\d)/, '');
+  if (s.startsWith('.')) s = '0' + s;
+  return (neg ? '-' : '') + s;
+}
+
+/** 输入串 → 金额（取绝对值、到分）；空 / 非法 → 0。 */
+export function moneyFromInput(s: string): number {
+  const n = Number(String(s ?? '').replace(/[，,。]/g, '.'));
+  return Number.isFinite(n) ? roundMoney(Math.abs(n)) : 0;
+}
+
+/** 把 'YYYY-MM' 偏移 delta 个月。 */
+export function shiftMonth(period: string, delta: number): string {
+  const [y, m] = period.split('-').map(Number);
+  const d = new Date(y, m - 1 + delta, 1);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+
+const pad2 = (n: number) => String(n).padStart(2, '0');
+const dkey = (dt: Date) => `${dt.getFullYear()}-${pad2(dt.getMonth() + 1)}-${pad2(dt.getDate())}`;
+
+/**
+ * 当前记账周期。payCycle 关 / resetDay≤1 → 日历月；开 → 按发薪日(resetDay,2–28)切分的周期。
+ * key 取周期起始月 'YYYY-MM'（与日历月同格式，便于 budget / claims 复用同一键）。
+ */
+export function ledgerCycle(payCycle: boolean, resetDay: number, todayKey: string): { key: string; start: string; end: string; label: string; payCycle: boolean } {
+  const [y, m, d] = todayKey.split('-').map(Number);
+  if (!payCycle || resetDay <= 1) {
+    const key = `${y}-${pad2(m)}`;
+    return { key, start: `${key}-01`, end: `${key}-${pad2(new Date(y, m, 0).getDate())}`, label: monthLabel(key), payCycle: false };
+  }
+  const R = Math.min(28, resetDay);
+  const startD = d >= R ? new Date(y, m - 1, R) : new Date(y, m - 2, R);
+  const endD = new Date(startD.getFullYear(), startD.getMonth() + 1, R - 1);
+  return {
+    key: `${startD.getFullYear()}-${pad2(startD.getMonth() + 1)}`,
+    start: dkey(startD),
+    end: dkey(endD),
+    label: `${startD.getMonth() + 1}/${startD.getDate()} – ${endD.getMonth() + 1}/${endD.getDate()}`,
+    payCycle: true,
+  };
+}
+
+/** 给定周期 key（'YYYY-MM' = 周期起始月）→ 该周期日期区间 [start, end]（含端点）。 */
+export function cycleRangeForKey(payCycle: boolean, resetDay: number, periodKey: string): [string, string] {
+  const [y, m] = periodKey.split('-').map(Number);
+  if (!payCycle || resetDay <= 1) {
+    return [`${periodKey}-01`, `${periodKey}-${pad2(new Date(y, m, 0).getDate())}`];
+  }
+  const R = Math.min(28, resetDay);
+  return [dkey(new Date(y, m - 1, R)), dkey(new Date(y, m, R - 1))];
+}
+
+const WEEKDAYS_CN = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+/** 'YYYY-MM-DD' → 周几。 */
+export function weekdayCN(dateKey: string): string {
+  const [y, m, d] = dateKey.split('-').map(Number);
+  return WEEKDAYS_CN[new Date(y, m - 1, d).getDay()] ?? '';
+}
+
+/** 流水日期展示：当年只显示「M月D日」，往年才带年份「YYYY年M月D日」。 */
+export function ledgerDateLabel(dateKey: string): string {
+  const [y, m, d] = dateKey.split('-').map(Number);
+  const curY = new Date().getFullYear();
+  return y === curY ? `${m}月${d}日` : `${y}年${m}月${d}日`;
+}
+
+/** 'YYYY-MM' → 'YYYY年M月'。 */
+export function monthLabel(period: string): string {
+  const [y, m] = period.split('-');
+  return `${y}年${Number(m)}月`;
+}
+
+// ── 资产板块（F5③）：类目绑定 emoji 图标（替代图标库，零依赖、零存储） ──
+export const ASSET_CATEGORIES: { key: string; icon: string; label: string }[] = [
+  { key: 'digital', icon: '📱', label: '数码' },
+  { key: 'computer', icon: '💻', label: '电脑' },
+  { key: 'camera', icon: '📷', label: '影像' },
+  { key: 'instrument', icon: '🎸', label: '乐器' },
+  { key: 'audio', icon: '🎧', label: '音频' },
+  { key: 'game', icon: '🎮', label: '游戏' },
+  { key: 'transport', icon: '🚲', label: '出行' },
+  { key: 'home', icon: '🪑', label: '家居' },
+  { key: 'wearable', icon: '⌚', label: '穿戴' },
+  { key: 'book', icon: '📚', label: '书籍' },
+  { key: 'sport', icon: '🏋️', label: '运动' },
+  { key: 'other', icon: '📦', label: '其它' },
+];
+export const assetIcon = (category: string) => ASSET_CATEGORIES.find(c => c.key === category)?.icon ?? '📦';
+
+export const ASSET_STATUS: Record<'inuse' | 'idle' | 'soldout', { label: string; cls: string }> = {
+  inuse: { label: '在用', cls: 'text-emerald-500' },
+  idle: { label: '闲置', cls: 'text-amber-500' },
+  soldout: { label: '已出', cls: 'text-gray-400' },
+};

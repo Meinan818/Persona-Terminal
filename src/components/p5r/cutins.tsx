@@ -1,0 +1,623 @@
+/**
+ * p5rCutIns —— 红频道三张庆祝 cut-in（p5-modal-05 升级 / 06 今日完成 / 07 成就解锁）。
+ *
+ * 共同骨架（P5CutInStage）：
+ *   黑幕 → 猩红闸门横掠全屏 → 集中线爆开 → 大板从景深砸到面前（带一次落地震屏）
+ *   → 拼贴标题逐字砸落 → 主视觉巨星旋入 → 碎片迸溅 → 底部红色倒计时条。
+ *   关闭三通道（自动关 / 点幕 / 右上 ✕）与基座 CelebrationCutIn 同口径。
+ *
+ * 造型铁律沿用全站 P5 口径：任何一块都不是板正矩形；未完成/次级一律纯色灰，不用透明度。
+ * 装饰全部 aria-hidden + pointer-events-none；D0（boldness=0）直接给终态、零动画。
+ */
+import { useEffect, useId, useState, type CSSProperties, type ReactNode } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
+import { createPortal } from 'react-dom';
+import {
+  P5R, P5_FONT, P5_TITLE_FONT, roughQuad, starPts, jitterStarPts,
+  P5Panel, P5Star, P5StarOutline, P5RingStar, P5CollageTitle,
+} from './kit';
+import { useBoldness } from '@/utils/boldness';
+import { MusicalNotes } from '@/components/MusicalNotes';
+import { triggerLevelFeedback, triggerSuccessFeedback } from '@/utils/feedback';
+import { useAutoClose } from '@/utils/useAutoClose';
+import { useBackHandler } from '@/utils/useBackHandler';
+import { useFeedbackOnce } from '@/utils/useFeedbackOnce';
+import { useModalA11y } from '@/utils/useModalA11y';
+import { zClass } from '@/utils/zIndex';
+
+// ── 通用小件 ─────────────────────────────────────────────────────────────────
+/** 硬角 ✕（不用字形，免得不同平台字重不一） */
+const XGlyph = ({ size = 18, color = P5R.ink }: { size?: number; color?: string }) => (
+  <svg viewBox="0 0 24 24" width={size} height={size} aria-hidden>
+    <path d="M4.6 1.8 L12 9.2 L19.4 1.8 L22.2 4.6 L14.8 12 L22.2 19.4 L19.4 22.2 L12 14.8 L4.6 22.2 L1.8 19.4 L9.2 12 L1.8 4.6 Z" fill={color} />
+  </svg>
+);
+
+/** 右上关闭：tile=纸片黑✕（升级/完成稿）· star=黑星纸✕（成就稿） */
+const P5CloseKey = ({ onClose, variant = 'tile', className, style }: {
+  onClose: () => void; variant?: 'tile' | 'star'; className?: string; style?: React.CSSProperties;
+}) => {
+  const anim = useBoldness();
+  return (
+    <motion.button
+      type="button"
+      onClick={onClose}
+      aria-label="关闭"
+      whileTap={{ scale: 0.9, rotate: -6 }}
+      initial={anim ? { scale: 0, rotate: -120 } : false}
+      animate={{ scale: 1, rotate: variant === 'star' ? -8 : -4 }}
+      transition={{ type: 'spring', stiffness: 420, damping: 18, delay: 0.5 }}
+      className={`group absolute z-30 flex items-center justify-center focus-visible:outline-none ${
+        variant === 'star' ? '' : 'focus-visible:ring-2 focus-visible:ring-[#f0e9df]'
+      } ${className ?? ''}`}
+      style={style}
+    >
+      {variant === 'star' ? (
+        <>
+          {/* 星形关闭键的聚焦指示做成「外圈翻红」——方形 ring 套在星上会很脏 */}
+          <svg viewBox="0 0 100 100" width={62} height={62} aria-hidden className="absolute">
+            <polygon points={starPts(50, 50, 49)} fill={P5R.paper} className="group-focus-visible:hidden" />
+            <polygon points={starPts(50, 50, 49)} fill={P5R.redHot} className="hidden group-focus-visible:block" />
+            <polygon points={starPts(50, 50, 43)} fill={P5R.ink} />
+          </svg>
+          <span className="relative"><XGlyph size={18} color={P5R.paper} /></span>
+        </>
+      ) : (
+        <>
+          <span aria-hidden className="absolute inset-0" style={{ transform: 'translate(3px,4px)', background: P5R.ink, clipPath: roughQuad(471, 4) }} />
+          <span aria-hidden className="absolute inset-0" style={{ background: P5R.paper, clipPath: roughQuad(472, 4) }} />
+          <span aria-hidden className="absolute inset-[3px]" style={{ background: P5R.paper, clipPath: roughQuad(473, 3), boxShadow: `inset 0 0 0 2.5px ${P5R.ink}` }} />
+          <span className="relative"><XGlyph size={17} color={P5R.ink} /></span>
+        </>
+      )}
+    </motion.button>
+  );
+};
+
+/** 落地迸溅的纸屑（三色律内：红 / 黑 / 纸），三角与小星混着飞 */
+const SHARDS = [
+  { dx: -128, dy: -74, r: -38, s: 15, c: P5R.paper, star: false, d: 0 },
+  { dx: 132, dy: -58, r: 52, s: 13, c: P5R.ink, star: true, d: 0.04 },
+  { dx: -104, dy: 92, r: -76, s: 12, c: P5R.red, star: false, d: 0.07 },
+  { dx: 118, dy: 104, r: 40, s: 16, c: P5R.paper, star: true, d: 0.02 },
+  { dx: 14, dy: -128, r: 18, s: 11, c: P5R.red, star: true, d: 0.09 },
+  { dx: -146, dy: 8, r: -22, s: 14, c: P5R.ink, star: false, d: 0.05 },
+  { dx: 152, dy: 30, r: 66, s: 10, c: P5R.paper, star: false, d: 0.11 },
+  { dx: -44, dy: 134, r: -50, s: 12, c: P5R.ink, star: true, d: 0.06 },
+  { dx: 62, dy: -118, r: 30, s: 13, c: P5R.paper, star: false, d: 0.13 },
+  { dx: -76, dy: -118, r: -14, s: 10, c: P5R.red, star: true, d: 0.03 },
+];
+
+const Shards = ({ delay = 0.34 }: { delay?: number }) => (
+  <>
+    {SHARDS.map((b, i) => (
+      <motion.span
+        key={i}
+        aria-hidden
+        className="pointer-events-none absolute left-1/2 top-1/2 z-20"
+        style={{ width: b.s, height: b.s, marginLeft: -b.s / 2, marginTop: -b.s / 2 }}
+        initial={{ x: 0, y: 0, scale: 0, opacity: 0, rotate: 0 }}
+        animate={{ x: b.dx, y: b.dy, scale: 1, opacity: [0, 1, 1, 0], rotate: b.r }}
+        transition={{ duration: 0.85, delay: delay + b.d, ease: [0.12, 0.8, 0.3, 1], times: [0, 0.16, 0.7, 1] }}
+      >
+        {b.star ? (
+          <svg viewBox="0 0 100 100" width={b.s} height={b.s}><polygon points={starPts(50, 50, 49)} fill={b.c} /></svg>
+        ) : (
+          <span className="block h-full w-full" style={{ background: b.c, clipPath: 'polygon(48% 0, 100% 82%, 6% 100%)' }} />
+        )}
+      </motion.span>
+    ))}
+  </>
+);
+
+// ── 舞台 ─────────────────────────────────────────────────────────────────────
+/** 背景同心星层：由中心向外一圈圈铺开的暗红/黑星带（换幕之后的主结构底噪） */
+const STAGE_STAR_BANDS = ['#150001', '#3f0004', '#0f0001', '#4c0005', '#0b0000', '#340003', '#070000', '#280002', '#050000'];
+
+interface StageProps {
+  isOpen: boolean;
+  onClose: () => void;
+  ariaLabel: string;
+  autoCloseMs: number;
+  onShown?: () => void;
+  /** 卡片最大宽度（今日完成那张要更宽） */
+  maxW?: number;
+  /** 渲染在**幕布层**、卡片之外的附加效果（音符雨）。与中性主题 CelebrationCutIn
+      的 overlayExtras 同位：卡片那层带 scale 1.75→1 的砸落 + 震屏位移，挂在里面
+      会被整体缩放拖着走（音符只有十几像素、且锚点变成卡片一角），必须挂在外面。 */
+  overlayExtras?: ReactNode;
+  children: ReactNode;
+}
+
+
+/** 开场三圈星涟漪（v2.7.0.2f 抽出）：framer 逐帧 scale 0.22→1.55 会让合成器反复
+ *  重栅格化三张 640px 纹理——弹窗打开那一下的闪烁来源之一（与轮盘星暴同款）。
+ *  改 .wheel-burst CSS 合成器动画（参数逐项照搬），播完整组即卸载释放显存。 */
+const StageStarRipples = () => {
+  const [gone, setGone] = useState(false);
+  useEffect(() => {
+    const t = window.setTimeout(() => setGone(true), 1900); // 1.2s + 2×0.24s 延迟 + 余量
+    return () => clearTimeout(t);
+  }, []);
+  if (gone) return null;
+  return (
+    <>
+      {[0, 1, 2].map((k) => (
+        <svg
+          key={k}
+          aria-hidden
+          viewBox="0 0 100 100"
+          width={640}
+          height={640}
+          className="wheel-burst pointer-events-none absolute left-1/2 top-1/2"
+          style={{
+            marginLeft: -320,
+            marginTop: -320,
+            '--wb-from': 0.22,
+            '--wb-to': 1.55,
+            '--wb-dur': '1.2s',
+            '--wb-delay': `${0.18 + k * 0.24}s`,
+            '--wb-fade': 'wheel-burst-fade-cutin',
+          } as CSSProperties}
+        >
+          <polygon points={starPts(50, 50, 46)} fill="none" stroke="#7d0007" strokeWidth={2.4} strokeLinejoin="miter" />
+        </svg>
+      ))}
+    </>
+  );
+};
+
+/** 集中线（v2.7.0.2f 抽出）：210vmax 的 conic 放射层是全场最大的一张纹理，
+ *  framer 逐帧 scale 一次性动画也会churn出一串重栅格化。改 CSS 关键帧
+ *  （scale/rotate/opacity 合成器三件套），播完卸载。 */
+const CollectLines = () => {
+  const [gone, setGone] = useState(false);
+  useEffect(() => {
+    const t = window.setTimeout(() => setGone(true), 1200); // 0.78s + 0.14s 延迟 + 余量
+    return () => clearTimeout(t);
+  }, []);
+  if (gone) return null;
+  return (
+    <span
+      aria-hidden
+      className="p5-collect-lines pointer-events-none absolute left-1/2 top-1/2 h-[210vmax] w-[210vmax]"
+      style={{
+        marginLeft: '-105vmax',
+        marginTop: '-105vmax',
+        background: 'repeating-conic-gradient(from 0deg at 50% 50%, #050505 0deg 2.2deg, transparent 2.2deg 9deg)',
+        WebkitMaskImage: 'radial-gradient(circle at 50% 50%, transparent 16%, #000 44%)',
+        maskImage: 'radial-gradient(circle at 50% 50%, transparent 16%, #000 44%)',
+      }}
+    />
+  );
+};
+
+const P5CutInStage = ({ isOpen, onClose, ariaLabel, autoCloseMs, onShown, maxW = 384, overlayExtras, children }: StageProps) => {
+  const containerRef = useModalA11y(isOpen, onClose);
+  useBackHandler(isOpen, onClose);
+  useAutoClose(isOpen, autoCloseMs, onClose);
+  useFeedbackOnce(isOpen, onShown);
+  const anim = useBoldness();
+
+  return createPortal(
+    <AnimatePresence>
+      {isOpen && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.16 }}
+          className={`fixed inset-0 ${zClass.celebration} flex items-center justify-center overflow-hidden p-3`}
+          style={{ background: 'rgba(4,4,4,0.74)' }}
+          onClick={onClose}
+        >
+          {/* 同心星层：巨大的暗红/黑星带自中心一圈圈辐射出画面 */}
+          <motion.div
+            aria-hidden
+            className="pointer-events-none absolute left-1/2 top-1/2"
+            style={{ x: '-50%', y: '-50%' }}
+            initial={anim ? { scale: 0.42, rotate: -22, opacity: 0 } : false}
+            animate={{ scale: 1, rotate: -9, opacity: 1 }}
+            transition={{ duration: 0.85, delay: 0.06, ease: [0.16, 1, 0.3, 1] }}
+          >
+            <P5RingStar size={780} step={0.085} rings={STAGE_STAR_BANDS} />
+          </motion.div>
+          {/* 星形涟漪：三圈描边星接力向外扩，坐实「辐射」这件事（CSS 合成器版，见组件注释） */}
+          {anim && <StageStarRipples />}
+          {/* 大圆环（替掉原先左上角那块网点补丁） */}
+          <span aria-hidden className="pointer-events-none absolute rounded-full" style={{ left: -78, top: '8%', width: 200, height: 200, border: '14px solid #45000a' }} />
+          <span aria-hidden className="pointer-events-none absolute rounded-full" style={{ left: -28, top: 'calc(8% + 52px)', width: 108, height: 108, border: '11px solid #2f2d2a' }} />
+          <span aria-hidden className="pointer-events-none absolute rounded-full" style={{ right: -64, bottom: '11%', width: 172, height: 172, border: '13px solid #2f2d2a' }} />
+          <span aria-hidden className="pointer-events-none absolute rounded-full" style={{ right: -18, bottom: 'calc(11% + 46px)', width: 84, height: 84, border: '9px solid #45000a' }} />
+
+          {/* 集中线：从中心爆开的黑色放射条（P5 的「命中」标点） */}
+          {anim && <CollectLines />}
+          {/* 猩红闸门：一整块红从左掠出画面，是「换幕」那一下 */}
+          {anim && (
+            <motion.span
+              aria-hidden
+              className="pointer-events-none absolute inset-y-[-10%] left-0 w-[150%]"
+              style={{ background: P5R.red, clipPath: 'polygon(0 0, 100% 0, 84% 100%, 0 100%)' }}
+              initial={{ x: '-120%' }}
+              animate={{ x: '130%' }}
+              transition={{ duration: 0.6, ease: [0.72, 0, 0.28, 1] }}
+            />
+          )}
+          {/* 底噪：描边星（网点补丁已换成上面的大圆环） */}
+          <P5StarOutline size={92} color="#3d0004" width={9} rot={-16} className="absolute left-[-22px] bottom-[16%]" />
+          <P5StarOutline size={70} color="#3a3831" width={8} rot={14} className="absolute right-[-14px] top-[12%]" />
+
+          {/* 砸落层（scale/rotate） */}
+          <motion.div
+            ref={containerRef}
+            role="dialog"
+            aria-modal="true"
+            aria-label={ariaLabel}
+            onClick={(e) => e.stopPropagation()}
+            className="relative z-10 w-full"
+            style={{ maxWidth: maxW }}
+            initial={anim ? { scale: 1.75, rotate: -13, opacity: 0 } : false}
+            animate={{ scale: 1, rotate: 0, opacity: 1 }}
+            exit={{ scale: 0.72, rotate: 9, opacity: 0 }}
+            transition={{ type: 'spring', stiffness: 320, damping: 20, delay: 0.15 }}
+          >
+            {/* 震屏层（x/y）：与砸落分层，避免两组 transform 打架 */}
+            <motion.div
+              className="relative"
+              initial={false}
+              animate={anim ? { x: [0, -8, 7, -4, 2, 0], y: [0, 5, -4, 3, -1, 0] } : undefined}
+              transition={{ duration: 0.36, delay: 0.34, ease: 'linear' }}
+            >
+              {children}
+              {anim && <Shards />}
+              {/* 倒计时：黑槽 + 猩红条（也是「还能看多久」的提示） */}
+              {autoCloseMs > 0 && (
+                <div aria-hidden className="relative mt-3 h-[7px] overflow-hidden" style={{ background: '#2a2926', clipPath: roughQuad(490, 3) }}>
+                  {/* scaleX 而非 width：width 是布局属性，逐帧改它会让主线程在弹窗
+                      整个生命周期里每帧重排一次（见 CelebrationCutIn 同处注释） */}
+                  <motion.div
+                    initial={{ scaleX: 1 }}
+                    animate={{ scaleX: 0 }}
+                    transition={{ duration: autoCloseMs / 1000, ease: 'linear' }}
+                    className="h-full w-full"
+                    style={{ background: P5R.red, transformOrigin: 'left center' }}
+                  />
+                </div>
+              )}
+            </motion.div>
+          </motion.div>
+          {/* 幕布层附加效果（音符雨）：在砸落/震屏两层之外，锚点是整块幕布，
+              与中性主题 CelebrationCutIn 的 overlayExtras 同位同几何 */}
+          {overlayExtras}
+        </motion.div>
+      )}
+    </AnimatePresence>,
+    document.body,
+  );
+};
+
+/** 拼贴标题骑在板子上缘（三张稿共用的入场位）：偏移随字号走，永远压住上边线一半 */
+const StraddleTitle = ({ text, size = 50 }: { text: string; size?: number }) => (
+  <div className="pointer-events-none absolute left-0 right-0 z-20 flex justify-center px-1" style={{ top: -(size * 0.56) }}>
+    <P5CollageTitle text={text} size={size} star={false} />
+  </div>
+);
+
+// ── 05 · 恭喜升级 ────────────────────────────────────────────────────────────
+export const LevelUpP5 = ({ attributeName, newLevel, isOpen, onClose, masteryStars }: {
+  attributeName: string; newLevel: number; isOpen: boolean; onClose: () => void;
+  /** 精通升星（第 6 轮）：有值时文案换「精通 ★N」 */
+  masteryStars?: number;
+}) => {
+  const anim = useBoldness();
+  const stars = masteryStars ?? 0;
+  const isMastery = stars > 0;
+  return (
+    <P5CutInStage
+      isOpen={isOpen}
+      onClose={onClose}
+      ariaLabel={isMastery ? `精通提升！${attributeName} ★${stars}` : `恭喜升级！${attributeName} Lv.${newLevel}`}
+      autoCloseMs={3600}
+      onShown={triggerLevelFeedback}
+    >
+      <div className="relative">
+        <P5Panel seed={410} jag={12} frame={4} keyline={3} face={P5R.red} shadow={{ x: 6, y: 8 }} bodyClassName="relative overflow-hidden px-4 pb-4 pt-11">
+          {/* 红面里的巨大同心圆环：与「今日完成」同一套——半径成 1.5 等比、线宽同比，
+              整组放大 1.5× 后与初态自相似，所以 linear 循环看上去就是永远在向外扩散，
+              没有接缝。裁在板面内（bodyClassName 的 overflow-hidden）。 */}
+          {/* v2.7.0.2f：framer 逐帧 scale 无限循环 = 合成器反复重栅格化 620px 纹理，
+              弹窗开多久闪多久（与轮盘表盘同款病灶，用户上报「疯狂闪烁」）。
+              改 .p5-rings-zoom CSS 动画：栅格化一次，之后全程合成器。 */}
+          <svg
+            aria-hidden
+            viewBox="0 0 200 200"
+            className="p5-rings-zoom pointer-events-none absolute left-1/2 top-1/2"
+            style={{ width: 620, height: 620, marginLeft: -310, marginTop: -310 }}
+          >
+            {[6, 9, 13.5, 20.3, 30.4, 45.6, 68.4].map((r) => (
+              <circle key={r} cx="100" cy="100" r={r} fill="none" stroke="#e8464e" strokeWidth={r * 0.15} />
+            ))}
+          </svg>
+          {/* 巨星：灰影星在后、纸白星在前（稿上是错位双层） */}
+          {/* 位移写进 motion 的 x（用 -translate-x-1/2 会被 motion 的 transform 覆盖掉） */}
+          <motion.div
+            aria-hidden
+            className="pointer-events-none absolute left-1/2 top-[62px] h-[228px] w-[228px]"
+            style={{ x: '-50%' }}
+            initial={anim ? { scale: 0, rotate: -70, opacity: 0 } : false}
+            animate={{ scale: 1, rotate: 0, opacity: 1 }}
+            transition={{ type: 'spring', stiffness: 260, damping: 17, delay: 0.3 }}
+          >
+            <P5Star size={228} fill="#8d8880" className="absolute" style={{ left: -13, top: 10 }} />
+            <P5Star size={228} fill={P5R.paper} className="absolute" style={{ left: 0, top: 0 }} />
+          </motion.div>
+
+          <div className="relative flex flex-col items-center pt-[26px]">
+            {/* 属性名红片（压在星上） */}
+            <motion.span
+              className="relative px-4 py-1.5 text-[24px] font-black leading-none"
+              style={{ color: P5R.paper, fontFamily: P5_FONT }}
+              initial={anim ? { scale: 1.4, opacity: 0 } : false}
+              animate={{ scale: 1, opacity: 1 }}
+              transition={{ type: 'spring', stiffness: 460, damping: 22, delay: 0.46 }}
+            >
+              <span aria-hidden className="absolute inset-0" style={{ transform: 'translate(3px,4px)', background: P5R.ink, clipPath: roughQuad(411, 5) }} />
+              <span aria-hidden className="absolute inset-0" style={{ background: P5R.ink, clipPath: roughQuad(412, 4) }} />
+              <span aria-hidden className="absolute inset-[3px]" style={{ background: P5R.red, clipPath: roughQuad(413, 3) }} />
+              <span className="relative block max-w-[210px] truncate">{attributeName}</span>
+            </motion.span>
+
+            {/* Lv.N-1 → Lv.N */}
+            <motion.div
+              className="mt-[86px] flex items-center gap-2.5"
+              initial={anim ? { y: 20, opacity: 0 } : false}
+              animate={{ y: 0, opacity: 1 }}
+              transition={{ type: 'spring', stiffness: 340, damping: 24, delay: 0.58 }}
+            >
+              <span className="relative px-3.5 py-1.5 text-[30px] font-black leading-none" style={{ color: P5R.paper, fontFamily: P5_FONT }}>
+                <span aria-hidden className="absolute inset-0" style={{ transform: 'translate(3px,4px)', background: '#5c0004', clipPath: roughQuad(414, 5) }} />
+                <span aria-hidden className="absolute inset-0" style={{ background: P5R.paper, clipPath: roughQuad(415, 4) }} />
+                <span aria-hidden className="absolute inset-[3px]" style={{ background: P5R.ink, clipPath: roughQuad(416, 3) }} />
+                <span className="relative tabular-nums">{isMastery ? `★${stars - 1}` : `Lv.${Math.max(0, newLevel - 1)}`}</span>
+              </span>
+              <span aria-hidden className="h-0 w-0 border-y-[10px] border-l-[16px] border-y-transparent" style={{ borderLeftColor: P5R.ink }} />
+              <span
+                className="p5-lv-pulse relative px-3.5 py-1.5 text-[30px] font-black leading-none"
+                style={{ color: P5R.paper, fontFamily: P5_FONT }}
+              >
+                <span aria-hidden className="absolute inset-0" style={{ transform: 'translate(3px,4px)', background: P5R.ink, clipPath: roughQuad(417, 5) }} />
+                <span aria-hidden className="absolute inset-0" style={{ background: P5R.paper, clipPath: roughQuad(418, 4) }} />
+                <span aria-hidden className="absolute inset-[3px]" style={{ background: P5R.redHot, clipPath: roughQuad(419, 3) }} />
+                <span className="relative tabular-nums">{isMastery ? `★${stars}` : `Lv.${newLevel}`}</span>
+              </span>
+            </motion.div>
+
+            {/* 底部纸带（左端尖角） */}
+            <motion.div
+              className="relative mt-5 w-full px-6 py-2.5 text-center"
+              initial={anim ? { x: -26, opacity: 0 } : false}
+              animate={{ x: 0, opacity: 1 }}
+              transition={{ type: 'spring', stiffness: 380, damping: 26, delay: 0.7 }}
+            >
+              <span aria-hidden className="absolute inset-0" style={{ transform: 'translate(4px,5px)', background: P5R.ink, clipPath: 'polygon(0 52%, 16px 2px, 100% 0, calc(100% - 14px) 100%, 12px calc(100% - 3px))' }} />
+              <span aria-hidden className="absolute inset-0" style={{ background: P5R.ink, clipPath: 'polygon(0 52%, 16px 2px, 100% 0, calc(100% - 14px) 100%, 12px calc(100% - 3px))' }} />
+              <span aria-hidden className="absolute inset-[3px]" style={{ background: P5R.paper, clipPath: 'polygon(0 52%, 15px 2px, 100% 0, calc(100% - 13px) 100%, 11px calc(100% - 3px))' }} />
+              <span className="relative text-[16px] font-black" style={{ color: P5R.ink, fontFamily: P5_FONT }}>{isMastery ? '满级之后，你还在往前走。' : '继续加油，你越来越强了！'}</span>
+            </motion.div>
+          </div>
+        </P5Panel>
+
+        <StraddleTitle text={isMastery ? '精通提升！' : '恭喜升级！'} size={50} />
+        {/* ✕ 让到标题上方：稿上它是整幅构图右上角的独立一块，不压标题 */}
+        <P5CloseKey onClose={onClose} style={{ right: -6, top: -86, height: 48, width: 48 }} />
+      </div>
+    </P5CutInStage>
+  );
+};
+
+// ── 06 · 今日完成 ────────────────────────────────────────────────────────────
+/** 今日完成幅面形：四条明确斜边的不规则四边形（宽 > 高） */
+const TODO_PANEL_SHAPE = 'polygon(0 16px, 100% 0, calc(100% - 12px) 100%, 9px calc(100% - 9px))';
+export const TodoCompleteP5 = ({ isOpen, onClose, title, totalPoints, unlockHint, heading = '今日完成' }: {
+  isOpen: boolean; onClose: () => void; title: string;
+  totalPoints?: number; unlockHint?: { achievements: number; skills: number };
+  /** 「记录成功」复用同一张演出，只换标题（与 p3 的 BandCutInP3 同一套复用口径） */
+  heading?: string;
+}) => {
+  const anim = useBoldness();
+  const checkClipId = useId();
+  return (
+    <P5CutInStage
+      isOpen={isOpen}
+      onClose={onClose}
+      ariaLabel={`${heading}：${title}`}
+      autoCloseMs={3000}
+      onShown={triggerSuccessFeedback}
+      maxW={424}
+      /* 跳音符（数量随加点）：中性/蓝主题一直有，红频道走的是这张演出。
+         此前挂在卡片内部，被砸落层 scale 1.75→1 与震屏位移一起拖着，
+         音符只有十几像素、锚点也变成卡片一角，实际看不见（用户上报「红黄没有音符」）。
+         改挂幕布层 overlayExtras，几何与蓝/中性完全一致。 */
+      overlayExtras={anim && (totalPoints ?? 0) > 0 ? <MusicalNotes count={totalPoints ?? 0} /> : undefined}
+    >
+      <div className="relative">
+        {/* 幅面：宽 > 高 的不规则四边形（手写四条明确斜边，不用抖动——抖动只会读成毛边矩形）；
+            三层同形逐层内缩 → 四边黑框天然不等宽 */}
+        <div className="relative px-4 pb-4 pt-12">
+          <span aria-hidden className="pointer-events-none absolute inset-0" style={{ transform: 'translate(6px,8px)', background: P5R.ink, clipPath: TODO_PANEL_SHAPE }} />
+          <span aria-hidden className="pointer-events-none absolute inset-0" style={{ background: P5R.paper, clipPath: TODO_PANEL_SHAPE }} />
+          <span aria-hidden className="pointer-events-none absolute inset-[3px]" style={{ background: P5R.ink, clipPath: TODO_PANEL_SHAPE }} />
+          <span aria-hidden className="pointer-events-none absolute inset-[7px]" style={{ background: P5R.red, clipPath: TODO_PANEL_SHAPE }} />
+          {/* 板内巨大同心圆环：浅暗红描边，始终缓慢向外扩散（裁在面层轮廓内） */}
+          {/* 半径成 1.5 等比 + 线宽同比 → 整组放大 1.5× 后与初态自相似，
+              所以 linear 循环看上去就是「永远在向外扩散的同心圆环」，没有接缝 */}
+          <span aria-hidden className="pointer-events-none absolute inset-[7px] overflow-hidden" style={{ clipPath: TODO_PANEL_SHAPE }}>
+            {/* v2.7.0.2f：同升级卡——无限环改 .p5-rings-zoom 合成器动画 */}
+            <svg
+              viewBox="0 0 200 200"
+              className="p5-rings-zoom absolute left-1/2 top-1/2"
+              style={{ width: 640, height: 640, marginLeft: -320, marginTop: -320 }}
+            >
+              {[6, 9, 13.5, 20.3, 30.4, 45.6, 68.4].map((r) => (
+                <circle key={r} cx="100" cy="100" r={r} fill="none" stroke="#e8464e" strokeWidth={r * 0.15} />
+              ))}
+            </svg>
+          </span>
+
+          {/* 巨星 + 黑勾：整体斜置，贴纸叠层 = 黑硬影 / 纸白不规则粗描边 / 黑粗锁边 / 纸面 */}
+          <motion.div
+            aria-hidden
+            className="pointer-events-none relative mx-auto"
+            style={{ width: 208, height: 208 }}
+            initial={anim ? { scale: 0, rotate: 60, opacity: 0 } : false}
+            animate={{ scale: 1, rotate: 0, opacity: 1 }}
+            transition={{ type: 'spring', stiffness: 250, damping: 16, delay: 0.3 }}
+          >
+            {/* 倾斜写在内层 svg 上：motion 会接管外层的 transform */}
+            <svg viewBox="0 0 100 100" width={208} height={208} className="absolute left-0 top-0 overflow-visible" style={{ transform: 'rotate(-13deg)' }}>
+              <defs>
+                <clipPath id={checkClipId}>
+                  <polygon points={starPts(50, 50, 39.5)} />
+                </clipPath>
+              </defs>
+              <polygon points={jitterStarPts(50, 50, 53, 771, 0.055)} fill={P5R.ink} transform="translate(3 4)" />
+              <polygon points={jitterStarPts(50, 50, 53, 772, 0.075)} fill={P5R.paper} />
+              <polygon points={starPts(50, 50, 46)} fill={P5R.ink} />
+              <polygon points={starPts(50, 50, 39.5)} fill={P5R.paper} />
+              {/* 勾用纸面星裁一刀：稿上勾的两端就是被星缘齐口切断的 */}
+              <g clipPath={`url(#${checkClipId})`}>
+                <motion.polyline
+                  points="36,50 46,60 75,31"
+                  fill="none"
+                  stroke={P5R.ink}
+                  strokeWidth={11.5}
+                  strokeLinejoin="miter"
+                  strokeLinecap="butt"
+                  initial={anim ? { pathLength: 0 } : false}
+                  animate={{ pathLength: 1 }}
+                  transition={{ duration: 0.4, delay: 0.62, ease: [0.2, 0.9, 0.3, 1] }}
+                />
+              </g>
+            </svg>
+          </motion.div>
+
+          {/* 底部纸条：勾选框 + 任务名 + 红计数片。
+              收窄到 84%（原来顶满板宽，读成一条素长方形），两端各嵌一枚小星、
+              纸面上压一层极淡的红斜纹 —— 同一块纸条，装饰密度上去了才配得上这张演出。
+              入场也从「左滑淡入」换成「斜着甩进来 + 回正」。 */}
+          <motion.div
+            className="relative mx-auto mt-3 flex w-[84%] items-center gap-2 px-2.5 py-2"
+            initial={anim ? { x: -34, rotate: -5, opacity: 0 } : false}
+            animate={{ x: 0, rotate: -1.2, opacity: 1 }}
+            transition={{ type: 'spring', stiffness: 340, damping: 20, delay: 0.72 }}
+          >
+            <span aria-hidden className="absolute inset-0" style={{ transform: 'translate(4px,5px)', background: P5R.ink, clipPath: roughQuad(433, 6) }} />
+            <span aria-hidden className="absolute inset-0" style={{ background: P5R.ink, clipPath: roughQuad(434, 5) }} />
+            <span aria-hidden className="absolute inset-[3px]" style={{ background: P5R.paper, clipPath: roughQuad(435, 4) }} />
+            {/* 纸面斜纹：极淡的红，只在斜射光下看得见的那种印痕 */}
+            <span
+              aria-hidden
+              className="absolute inset-[3px]"
+              style={{
+                clipPath: roughQuad(435, 4),
+                backgroundImage: 'repeating-linear-gradient(118deg, rgba(192,0,8,0.09) 0 3px, transparent 3px 9px)',
+              }}
+            />
+            <span aria-hidden className="relative flex h-[26px] w-[26px] shrink-0 items-center justify-center" style={{ background: P5R.paper, boxShadow: `inset 0 0 0 3px ${P5R.ink}`, clipPath: roughQuad(436, 3) }}>
+              <svg viewBox="0 0 24 24" width={17} height={17}>
+                <polyline points="4,12 10,18 21,4" fill="none" stroke={P5R.red} strokeWidth={4.6} strokeLinejoin="miter" strokeLinecap="butt" />
+              </svg>
+            </span>
+            <span className="relative min-w-0 flex-1 truncate text-[15px] font-black" style={{ color: P5R.ink, fontFamily: P5_FONT }}>{title}</span>
+            {(totalPoints ?? 0) > 0 && (
+              <span className="relative shrink-0 px-2.5 py-1 text-[16px] font-black leading-none tabular-nums" style={{ background: P5R.red, color: P5R.paper, clipPath: roughQuad(437, 3), fontFamily: P5_FONT }}>
+                +{totalPoints}
+              </span>
+            )}
+            {/* 两端小星：纸条不再是一条光板 */}
+            <P5Star size={15} fill={P5R.red} ring={P5R.ink} className="absolute -left-[7px] -top-[7px]" rot={-14} />
+            <P5Star size={12} fill={P5R.ink} className="absolute -bottom-[6px] -right-[6px]" rot={12} />
+          </motion.div>
+
+          {unlockHint && (unlockHint.achievements > 0 || unlockHint.skills > 0) && (
+            <div className="relative mt-2 text-center text-[12px] font-black" style={{ color: P5R.paper, fontFamily: P5_FONT }}>
+              ★ 你解锁了新成就 / 新技能！
+            </div>
+          )}
+        </div>
+
+        <StraddleTitle text={heading} size={heading.length > 4 ? 50 : 60} />
+        <P5CloseKey onClose={onClose} variant="star" style={{ right: -10, top: -90, height: 62, width: 62 }} />
+      </div>
+    </P5CutInStage>
+  );
+};
+
+// ── 07 · 成就 / 技能解锁 ─────────────────────────────────────────────────────
+/** 稿上是缺角多边形，用户定稿改为「不规则四边形」：四角各自错动的纸板 + 不等宽黑框 */
+export const UnlockCutInP5 = ({ isOpen, onClose, heading, name, lines }: {
+  isOpen: boolean; onClose: () => void; heading: string; name: string; lines: [string, string];
+}) => {
+  const anim = useBoldness();
+  return (
+    <P5CutInStage isOpen={isOpen} onClose={onClose} ariaLabel={`${heading}${name}`} autoCloseMs={4500} onShown={triggerLevelFeedback} maxW={332}>
+      {/* 纸板收窄到 332（原 384）+ 内边距压紧：白板太大、四周空得慌 */}
+      <motion.div
+        className="relative"
+        // 出场不再只是淡入：整块纸板斜着砸进来再回正（外层管位移/旋转，
+        // P5Panel 自己的三层裁切不受影响）
+        initial={anim ? { scale: 0.72, rotate: -8, y: -26, opacity: 0 } : false}
+        animate={{ scale: 1, rotate: 0, y: 0, opacity: 1 }}
+        exit={anim ? { scale: 0.86, rotate: 4, opacity: 0 } : undefined}
+        transition={{ type: 'spring', stiffness: 300, damping: 17, mass: 0.9 }}
+      >
+        {/* 纸板背后探出的红/黑碎块 */}
+        <span aria-hidden className="pointer-events-none absolute -left-4 -top-2 h-[64%] w-[52%]" style={{ background: P5R.red, clipPath: roughQuad(451, 14), transform: 'rotate(-4deg)' }} />
+        <span aria-hidden className="pointer-events-none absolute -right-5 top-[18%] h-[58%] w-[46%]" style={{ background: P5R.ink, clipPath: roughQuad(452, 14), transform: 'rotate(5deg)' }} />
+        <span aria-hidden className="pointer-events-none absolute -bottom-4 left-[12%] h-[26%] w-[70%]" style={{ background: '#5c0004', clipPath: roughQuad(453, 13), transform: 'rotate(-2deg)' }} />
+
+        <P5Panel seed={450} jag={13} frame={4} keyline={0} face={P5R.paper} shadow={{ x: 6, y: 8 }} bodyClassName="px-4 pb-4 pt-10">
+          {/* 多环巨星（黑/纸/红/纸/黑）+ 两侧小星（右边原来还有两根红 / 黑斜刺，验收说看着像两条多余的线，拿掉了） */}
+          <motion.div
+            aria-hidden
+            className="pointer-events-none relative mx-auto"
+            style={{ width: 158, height: 158 }}
+            initial={anim ? { scale: 0, rotate: -110, opacity: 0 } : false}
+            animate={{ scale: 1, rotate: 0, opacity: 1 }}
+            transition={{ type: 'spring', stiffness: 260, damping: 15, delay: 0.24 }}
+          >
+            <P5RingStar size={158} className="absolute left-0 top-0" />
+            <P5Star size={26} fill={P5R.grey} rot={-14} className="absolute" style={{ left: -12, bottom: 22 }} />
+            <P5Star size={21} fill={P5R.red} rot={12} className="absolute" style={{ right: -7, top: 12 }} />
+          </motion.div>
+
+          {/* 名称黑条 */}
+          <motion.div
+            className="relative mx-auto mt-3 w-fit max-w-full px-3.5 py-1.5"
+            initial={anim ? { scaleX: 0.2, opacity: 0 } : false}
+            animate={{ scaleX: 1, opacity: 1 }}
+            transition={{ type: 'spring', stiffness: 400, damping: 26, delay: 0.46 }}
+          >
+            <span aria-hidden className="absolute inset-0" style={{ transform: 'translate(4px,5px)', background: P5R.red, clipPath: roughQuad(454, 5) }} />
+            <span aria-hidden className="absolute inset-0" style={{ background: P5R.ink, clipPath: roughQuad(455, 4) }} />
+            <span className="relative block truncate text-[24px] font-black leading-none" style={{ color: P5R.paper, fontFamily: P5_TITLE_FONT }}>{name}</span>
+          </motion.div>
+
+          <motion.div
+            className="relative mt-2.5 text-center"
+            initial={anim ? { y: 14, opacity: 0 } : false}
+            animate={{ y: 0, opacity: 1 }}
+            transition={{ type: 'spring', stiffness: 340, damping: 26, delay: 0.58 }}
+          >
+            <p className="text-[14px] font-black leading-snug" style={{ color: P5R.ink, fontFamily: P5_FONT }}>{lines[0]}</p>
+            <p className="text-[14px] font-black leading-snug" style={{ color: P5R.ink, fontFamily: P5_FONT }}>{lines[1]}</p>
+            <span className="mt-1.5 flex justify-center"><P5Star size={14} fill={P5R.ink} /></span>
+          </motion.div>
+        </P5Panel>
+
+        <StraddleTitle text={heading} size={46} />
+        <P5CloseKey onClose={onClose} variant="star" style={{ right: -14, top: -92, height: 60, width: 60 }} />
+      </motion.div>
+    </P5CutInStage>
+  );
+};

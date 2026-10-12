@@ -1,0 +1,447 @@
+import { motion, AnimatePresence } from 'motion/react';
+import { useState } from 'react';
+import { useAppStore } from '@/store';
+import { AttributeId, WeeklyGoalItem, WeeklyGoalType } from '@/types';
+import { Stepper } from '@/components/Stepper';
+import { useUiChannel } from '@/ui/useUiChannel';
+import { SlantButton } from '@/components/p3r/kit';
+import { P5R, P5_FONT, P5_TITLE_FONT, roughQuad, roughSlant, starPts } from '@/components/p5r/kit';
+import { ALL_GOAL_TYPES, ATTR_IDS, GOAL_TYPE_DESCS, GOAL_TYPE_LABELS, makeDefaultItem } from './weeklyGoalShared';
+
+// ── GoalSetupForm (shared between create & edit) ────────────────────────────
+export const GoalSetupForm = ({
+  initialItems,
+  initialReward,
+  weekStart,
+  weekEnd,
+  settings,
+  onConfirm,
+  onCancel,
+}: {
+  initialItems: WeeklyGoalItem[];
+  initialReward: string;
+  weekStart: string;
+  weekEnd: string;
+  settings: ReturnType<typeof useAppStore.getState>['settings'];
+  onConfirm: (items: WeeklyGoalItem[], reward: string) => void;
+  onCancel: () => void;
+}) => {
+  // Which types are toggled on
+  const [selectedTypes, setSelectedTypes] = useState<Set<WeeklyGoalType>>(
+    () => new Set(initialItems.map(g => g.type))
+  );
+  // Config per type (target + attribute)
+  const [itemConfigs, setItemConfigs] = useState<Record<WeeklyGoalType, WeeklyGoalItem>>(() => {
+    const base: Record<string, WeeklyGoalItem> = {};
+    ALL_GOAL_TYPES.forEach(t => {
+      const existing = initialItems.find(g => g.type === t);
+      base[t] = existing ?? makeDefaultItem(t);
+    });
+    return base as Record<WeeklyGoalType, WeeklyGoalItem>;
+  });
+  const [reward, setReward] = useState(initialReward);
+
+  const toggleType = (type: WeeklyGoalType) => {
+    setSelectedTypes(prev => {
+      const next = new Set(prev);
+      if (next.has(type)) {
+        if (next.size <= 2) return prev; // min 2
+        next.delete(type);
+      } else {
+        next.add(type);
+      }
+      return next;
+    });
+  };
+
+  const updateConfig = (type: WeeklyGoalType, patch: Partial<WeeklyGoalItem>) => {
+    setItemConfigs(prev => ({ ...prev, [type]: { ...prev[type], ...patch } }));
+  };
+
+  const canConfirm = selectedTypes.size >= 2;
+  // P3R（p3-modal-04 稿）：浅青斜卡 + 左上青色大勾块 + 白斜奖励 input + 斜切双钮
+  const p3 = useUiChannel() === 'p3';
+  // P5R（p5-modal-04 稿）：纸卡黑框硬影 + 每行左缘红星章 + 黑红步进器 + 斜双钮
+  const p5 = useUiChannel() === 'p5';
+
+  const handleConfirm = () => {
+    const items = ALL_GOAL_TYPES
+      .filter(t => selectedTypes.has(t))
+      .map(t => itemConfigs[t]);
+    onConfirm(items, reward);
+  };
+
+  // ── P3R 形态（结构差异大，独立分支；数据与 handlers 全同源）──────────────
+  // ── P5R 形态（p5-modal-04-weekly-goal-setup 1:1）───────────────────
+  if (p5) {
+    return (
+      <div className="p5-reskin relative">
+        {/* 纸卡底：黑硬影 + 黑框 + 纸面（三层错位不规则四边形） */}
+        <span aria-hidden className="pointer-events-none absolute inset-0" style={{ transform: 'translate(5px,6px)', background: '#000000', clipPath: roughQuad(401, 9) }} />
+        <span aria-hidden className="pointer-events-none absolute inset-0" style={{ background: '#050505', clipPath: roughQuad(402, 8) }} />
+        <span aria-hidden className="pointer-events-none absolute inset-[3.5px]" style={{ background: P5R.paper, clipPath: roughQuad(403, 5) }} />
+        <div className="relative px-4 pb-4 pt-5">
+          <h3 className="text-[24px] font-black leading-none" style={{ color: '#050505', fontFamily: P5_TITLE_FONT }}>设定本周目标</h3>
+          <p className="mt-2 text-[13px] font-black" style={{ color: '#050505' }}>
+            {weekStart} ~ {weekEnd}　· 至少选择 2 项
+          </p>
+          <span aria-hidden className="mt-3 block h-[2.5px] w-full" style={{ background: '#050505' }} />
+
+          <div className="mt-4 space-y-3.5">
+            {ALL_GOAL_TYPES.map((type, ti) => {
+              const isSelected = selectedTypes.has(type);
+              const cfg = itemConfigs[type];
+              const needsAttr = type === 'activity_count' || type === 'attr_points';
+              const seed = 410 + ti * 7;
+              return (
+                <div key={type} className="relative">
+                  {/* 行卡：黑硬影 + 黑框 + 纸面（未选中走灰面，不用透明度） */}
+                  <span aria-hidden className="pointer-events-none absolute inset-0" style={{ transform: 'translate(4px,5px)', background: '#000000', clipPath: roughQuad(seed, 7) }} />
+                  <span aria-hidden className="pointer-events-none absolute inset-0" style={{ background: '#050505', clipPath: roughQuad(seed + 1, 6) }} />
+                  <span aria-hidden className="pointer-events-none absolute inset-[3px]" style={{ background: isSelected ? P5R.paper : '#cdc7ba', clipPath: roughQuad(seed + 2, 4) }} />
+                  {/* 左缘红星章（稿上每行的签名件，出卡半截） */}
+                  <button
+                    type="button"
+                    onClick={() => toggleType(type)}
+                    aria-pressed={isSelected}
+                    aria-label={`${GOAL_TYPE_LABELS[type]}：${isSelected ? '已选中' : '点击添加'}`}
+                    className="absolute -left-1.5 top-2.5 z-10 flex h-[46px] w-[42px] cursor-pointer items-center justify-center focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#c00008]"
+                    style={{ background: isSelected ? P5R.red : '#6b6862', clipPath: 'polygon(4px 0, 100% 3px, calc(100% - 6px) 100%, 0 calc(100% - 5px))', boxShadow: '3px 3px 0 #000000' }}
+                  >
+                    <svg viewBox="0 0 100 100" className="h-6 w-6" aria-hidden>
+                      <polygon points={starPts(50, 50, 48)} fill={P5R.paper} />
+                    </svg>
+                  </button>
+
+                  <div className="relative py-3 pl-12 pr-4">
+                    <button type="button" onClick={() => toggleType(type)} className="block w-full cursor-pointer text-left" aria-hidden tabIndex={-1}>
+                      <span className="block text-[17px] font-black leading-tight" style={{ color: isSelected ? P5R.red : '#3a3831', fontFamily: P5_FONT }}>{GOAL_TYPE_LABELS[type]}</span>
+                      <span className="mt-0.5 block text-[11.5px] font-bold" style={{ color: '#050505' }}>{GOAL_TYPE_DESCS[type]}</span>
+                    </button>
+
+                    <AnimatePresence initial={false}>
+                      {isSelected && (
+                        <motion.div
+                          initial={{ height: 0, opacity: 0 }}
+                          animate={{ height: 'auto', opacity: 1 }}
+                          exit={{ height: 0, opacity: 0 }}
+                          transition={{ duration: 0.2 }}
+                          className="overflow-hidden"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-3 pt-3">
+                            <div className="flex flex-wrap items-center gap-2.5">
+                              <span className="text-[13px] font-black" style={{ color: '#050505' }}>目标</span>
+                              {needsAttr && (
+                                <select
+                                  value={cfg.attribute || 'knowledge'}
+                                  onChange={e => updateConfig(type, { attribute: e.target.value as AttributeId })}
+                                  onClick={e => e.stopPropagation()}
+                                  className="px-3 py-1 text-sm font-black focus:outline-none"
+                                >
+                                  {ATTR_IDS.map(id => (
+                                    <option key={id} value={id}>{settings.attributeNames[id]}</option>
+                                  ))}
+                                </select>
+                              )}
+                            </div>
+                            <Stepper
+                              value={cfg.target}
+                              min={1}
+                              max={999}
+                              aria-label={`${GOAL_TYPE_LABELS[type]}目标`}
+                              onChange={v => updateConfig(type, { target: v })}
+                            />
+                          </div>
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="mt-5">
+            <label className="mb-1.5 block text-[14px] font-black" style={{ color: '#050505' }}>完成奖励（选填）</label>
+            <input
+              type="text"
+              value={reward}
+              onChange={e => setReward(e.target.value)}
+              placeholder="给自己一个奖励吧…"
+              className="w-full px-4 py-2.5 text-sm focus:outline-none"
+            />
+          </div>
+
+          <div className="mt-5 flex items-center gap-3">
+            <motion.button
+              type="button"
+              whileTap={{ x: 2, y: 3 }}
+              onClick={onCancel}
+              className="relative flex-1 cursor-pointer py-2.5 text-[15px] font-black"
+              style={{ color: '#050505', fontFamily: P5_FONT }}
+            >
+              <span aria-hidden className="absolute inset-0" style={{ transform: 'translate(3px,4px)', background: '#000000', clipPath: roughSlant(430, 12, 3) }} />
+              <span aria-hidden className="absolute inset-0" style={{ background: '#050505', clipPath: roughSlant(430, 12, 3) }} />
+              <span aria-hidden className="absolute inset-[2.5px]" style={{ background: '#cdc7ba', clipPath: roughSlant(431, 11, 2.5) }} />
+              <span className="relative">取消</span>
+            </motion.button>
+            <motion.button
+              type="button"
+              whileTap={{ x: 2, y: 3 }}
+              disabled={!canConfirm}
+              onClick={handleConfirm}
+              className="relative flex-1 cursor-pointer py-2.5 text-[15px] font-black text-white disabled:cursor-not-allowed disabled:opacity-50"
+              style={{ fontFamily: P5_FONT }}
+            >
+              <span aria-hidden className="absolute inset-0" style={{ transform: 'translate(3px,4px)', background: '#000000', clipPath: roughSlant(432, 12, 3) }} />
+              <span aria-hidden className="absolute inset-0" style={{ background: '#050505', clipPath: roughSlant(432, 12, 3) }} />
+              <span aria-hidden className="absolute inset-[2.5px]" style={{ background: P5R.red, clipPath: roughSlant(433, 11, 2.5) }} />
+              <span className="relative">确认（{selectedTypes.size} 项）</span>
+              {/* 右缘纸星（稿上确认钮的签名件） */}
+              <svg viewBox="0 0 100 100" className="pointer-events-none absolute -right-4 -top-2 h-11 w-11" aria-hidden>
+                <polygon points={starPts(50, 50, 48)} fill={P5R.paper} stroke="#050505" strokeWidth="5" strokeLinejoin="miter" />
+              </svg>
+            </motion.button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (p3) {
+    return (
+      <div className="p3r-sheet relative">
+        {/* 左上青色大三角装饰（稿） */}
+        <span aria-hidden className="absolute -left-2 -top-2 h-0 w-0 border-r-[46px] border-t-[38px] border-r-transparent" style={{ borderTopColor: 'rgba(53,209,232,0.85)' }} />
+        <div className="relative px-4 pb-4 pt-5">
+          <h3 className="text-[26px] font-black italic leading-none" style={{ color: 'var(--p3r-ink, #0a1230)', fontFamily: '"Noto Sans SC Black", "Velvet Sans SC", sans-serif' }}>设定本周目标</h3>
+          <p className="mt-2 text-[13px] font-bold" style={{ color: 'var(--p3r-blue, #1b57ff)' }}>{weekStart} ~ {weekEnd}　· 至少选择 2 项</p>
+
+          <div className="mt-4 space-y-3">
+            {ALL_GOAL_TYPES.map((type, ti) => {
+              const isSelected = selectedTypes.has(type);
+              const cfg = itemConfigs[type];
+              const needsAttr = type === 'activity_count' || type === 'attr_points';
+              return (
+                <div
+                  key={type}
+                  className="relative overflow-hidden transition-all"
+                  style={{
+                    clipPath: 'polygon(14px 0, 100% 0, calc(100% - 14px) 100%, 0 100%)',
+                    background: isSelected ? 'rgba(207,234,246,0.55)' : 'rgba(255,255,255,0.85)',
+                    boxShadow: '0 8px 18px rgba(38,96,140,0.07)',
+                  }}
+                >
+                  {/* 头行：左上青色大勾块 + 标题/副题 */}
+                  <button
+                    type="button"
+                    className="flex w-full items-start gap-3.5 py-3 pl-4 pr-4 text-left"
+                    onClick={() => toggleType(type)}
+                    aria-pressed={isSelected}
+                  >
+                    <span
+                      aria-hidden
+                      className="flex h-11 w-11 shrink-0 items-center justify-center"
+                      style={{ clipPath: 'polygon(8px 0, 100% 0, calc(100% - 8px) 100%, 0 100%)', background: isSelected ? 'var(--p3r-cyan, #35d1e8)' : '#dfe9f1' }}
+                    >
+                      {isSelected && (
+                        <svg viewBox="0 0 14 11" className="h-5 w-6" fill="none">
+                          <path d="M1.5 5.5l3.5 3.5L12.5 1.5" stroke="white" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round" />
+                        </svg>
+                      )}
+                    </span>
+                    <span className="min-w-0 flex-1 pt-0.5">
+                      <span className="block text-[17px] font-black leading-tight" style={{ color: 'var(--p3r-ink, #0a1230)' }}>{GOAL_TYPE_LABELS[type]}</span>
+                      <span className="mt-0.5 block text-[11px] font-semibold" style={{ color: '#8a97ad' }}>{GOAL_TYPE_DESCS[type]}</span>
+                    </span>
+                    {!isSelected && <span className="shrink-0 pt-1 text-xs font-bold" style={{ color: '#8a97ad' }}>点击添加</span>}
+                  </button>
+                  {/* 卡角小三角（洋红/青交替，稿） */}
+                  <span aria-hidden className="absolute right-1 top-1 h-0 w-0 border-l-[14px] border-t-[11px] border-l-transparent" style={{ borderTopColor: ti % 2 ? 'var(--p3r-magenta, #f0417f)' : 'rgba(53,209,232,0.9)' }} />
+
+                  {/* 展开配置行：目标 label + 属性选择 + 步进器 */}
+                  <AnimatePresence initial={false}>
+                    {isSelected && (
+                      <motion.div
+                        initial={{ height: 0, opacity: 0 }}
+                        animate={{ height: 'auto', opacity: 1 }}
+                        exit={{ height: 0, opacity: 0 }}
+                        transition={{ duration: 0.2 }}
+                        className="overflow-hidden"
+                      >
+                        <div className="flex items-center justify-between gap-3 px-4 pb-3.5">
+                          <div className="flex flex-wrap items-center gap-2.5">
+                            <span className="text-[13px] font-black" style={{ color: 'var(--p3r-ink, #0a1230)' }}>目标</span>
+                            {needsAttr && (
+                              <select
+                                value={cfg.attribute || 'knowledge'}
+                                onChange={e => updateConfig(type, { attribute: e.target.value as AttributeId })}
+                                onClick={e => e.stopPropagation()}
+                                className="px-3 py-1 text-sm focus:outline-none"
+                              >
+                                {ATTR_IDS.map(id => (
+                                  <option key={id} value={id}>{settings.attributeNames[id]}</option>
+                                ))}
+                              </select>
+                            )}
+                          </div>
+                          <Stepper
+                            value={cfg.target}
+                            min={1}
+                            max={999}
+                            aria-label={`${GOAL_TYPE_LABELS[type]}目标`}
+                            onChange={v => updateConfig(type, { target: v })}
+                          />
+                        </div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="mt-4">
+            <label className="mb-1.5 block text-[14px]">完成奖励（选填）</label>
+            <div className="relative">
+              <input
+                type="text"
+                value={reward}
+                onChange={e => setReward(e.target.value)}
+                placeholder="给自己一个奖励吧…"
+                className="w-full px-4 py-2.5 text-sm focus:outline-none"
+              />
+              <span aria-hidden className="pointer-events-none absolute bottom-0 right-0 h-0 w-0 border-b-[12px] border-l-[16px] border-l-transparent" style={{ borderBottomColor: 'var(--p3r-cyan, #35d1e8)' }} />
+            </div>
+          </div>
+
+          <div className="mt-4 flex gap-3">
+            <SlantButton tone="ghost" onClick={onCancel} className="flex-1">取消</SlantButton>
+            <SlantButton tone="primary" magentaCorner disabled={!canConfirm} onClick={handleConfirm} className="flex-1">
+              确认（{selectedTypes.size} 项）
+            </SlantButton>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-2xl bg-white dark:bg-gray-900 border border-gray-200/80 dark:border-gray-700/80 shadow-sm overflow-hidden">
+      <div className="px-5 pt-4 pb-3 border-b border-gray-100 dark:border-gray-800/80">
+        <h3 className="font-bold text-gray-900 dark:text-white text-sm">设定本周目标</h3>
+        <p className="text-xs text-gray-400 dark:text-gray-500 mt-0.5">{weekStart} ~ {weekEnd}　· 至少选择 2 项</p>
+      </div>
+      <div className="p-4 space-y-2">
+        {ALL_GOAL_TYPES.map(type => {
+          const isSelected = selectedTypes.has(type);
+          const cfg = itemConfigs[type];
+          const needsAttr = type === 'activity_count' || type === 'attr_points';
+          return (
+            <div
+              key={type}
+              className={`rounded-xl border-2 transition-all overflow-hidden ${
+                isSelected
+                  ? 'border-primary/60 bg-primary/5 dark:border-gray-600 dark:bg-primary/10'
+                  : 'border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/40'
+              }`}
+            >
+              {/* Toggle header row */}
+              <button
+                type="button"
+                className="w-full flex items-center justify-between px-4 py-3 text-left"
+                onClick={() => toggleType(type)}
+              >
+                <div className="flex items-center gap-3">
+                  <div className={`w-5 h-5 rounded-full border-2 flex items-center justify-center transition-all flex-shrink-0 ${
+                    isSelected ? 'border-primary bg-primary' : 'border-gray-300 dark:border-gray-600'
+                  }`}>
+                    {isSelected && (
+                      <svg viewBox="0 0 10 8" className="w-3 h-3" fill="none">
+                        <path d="M1 4l2.5 2.5L9 1" stroke="white" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                    )}
+                  </div>
+                  <div>
+                    <p className={`text-sm font-semibold ${isSelected ? 'text-primary' : 'text-gray-700 dark:text-gray-300'}`}>
+                      {GOAL_TYPE_LABELS[type]}
+                    </p>
+                    <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-0.5">{GOAL_TYPE_DESCS[type]}</p>
+                  </div>
+                </div>
+                {!isSelected && (
+                  <span className="text-xs text-gray-400 dark:text-gray-500 flex-shrink-0">点击添加</span>
+                )}
+              </button>
+
+              {/* Expanded config (only when selected) */}
+              <AnimatePresence initial={false}>
+                {isSelected && (
+                  <motion.div
+                    initial={{ height: 0, opacity: 0 }}
+                    animate={{ height: 'auto', opacity: 1 }}
+                    exit={{ height: 0, opacity: 0 }}
+                    transition={{ duration: 0.2 }}
+                    className="overflow-hidden"
+                  >
+                    <div className="px-4 pb-3 flex items-center justify-between gap-3 border-t border-primary/10 dark:border-gray-700/70">
+                      <div className="flex items-center gap-2 pt-2.5 flex-wrap">
+                        <span className="text-xs text-gray-500 dark:text-gray-400">目标</span>
+                        {needsAttr && (
+                          <select
+                            value={cfg.attribute || 'knowledge'}
+                            onChange={e => updateConfig(type, { attribute: e.target.value as AttributeId })}
+                            onClick={e => e.stopPropagation()}
+                            className="text-xs px-2 py-1 rounded-lg bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-300 border border-gray-200 dark:border-gray-600 focus:outline-none"
+                          >
+                            {ATTR_IDS.map(id => (
+                              <option key={id} value={id}>{settings.attributeNames[id]}</option>
+                            ))}
+                          </select>
+                        )}
+                      </div>
+                      <div className="pt-2.5">
+                        {/* 共享 Stepper（旧组件体内子组件已删——那会让每次 render 重建子树）。
+                            展开区是头部 toggle 按钮的兄弟节点，外层无 onClick，无需 stopPropagation */}
+                        <Stepper
+                          value={cfg.target}
+                          min={1}
+                          max={999}
+                          aria-label={`${GOAL_TYPE_LABELS[type]}目标`}
+                          onChange={v => updateConfig(type, { target: v })}
+                        />
+                      </div>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+          );
+        })}
+
+        <div className="pt-1">
+          <label className="text-xs font-medium text-gray-700 dark:text-gray-300 mb-1 block">完成奖励（选填）</label>
+          <input
+            type="text"
+            value={reward}
+            onChange={e => setReward(e.target.value)}
+            placeholder="给自己一个奖励吧…"
+            className="w-full px-3 py-2 text-sm border border-gray-200 dark:border-gray-600 rounded-xl dark:bg-gray-800 dark:text-white focus:outline-none focus:border-primary"
+          />
+        </div>
+        <div className="flex gap-2 pt-1">
+          <button type="button" onClick={onCancel} className="flex-1 py-2.5 rounded-xl bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 text-sm font-medium">取消</button>
+          <motion.button
+            type="button"
+            whileTap={{ scale: 0.97 }}
+            onClick={handleConfirm}
+            disabled={!canConfirm}
+            className="flex-1 py-2.5 rounded-xl bg-primary text-white text-sm font-semibold disabled:opacity-40"
+          >
+            确认（{selectedTypes.size} 项）
+          </motion.button>
+        </div>
+      </div>
+    </div>
+  );
+};

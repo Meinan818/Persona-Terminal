@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+        <string>面具终端</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>UILaunchStoryboardName</key>
+	<string>LaunchScreen</string>
+	<!-- UIScene 生命周期（2.8.0.5 b18 被审核打回「启动即崩」）：iOS 27 SDK 起 UIKit 要求 App 走场景，
+	     Capacitor 5 模板的老式 AppDelegate + UIMainStoryboardFile 在 iOS 27 上起不来。窗口与
+	     CAPBridgeViewController 仍由 Main.storyboard 建（UISceneStoryboardFile），场景代理见 AppDelegate.swift。 -->
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UIWindowSceneSessionRoleApplication</key>
+			<array>
+				<dict>
+					<key>UISceneConfigurationName</key>
+					<string>Default Configuration</string>
+					<key>UISceneDelegateClassName</key>
+					<string>$(PRODUCT_MODULE_NAME).SceneDelegate</string>
+					<key>UISceneStoryboardFile</key>
+					<string>Main</string>
+				</dict>
+			</array>
+		</dict>
+	</dict>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>armv7</string>
+	</array>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+	<!-- iPad（第 20 批）：四个方向都开——iPadOS 26 起 App 跑在可拖大小的窗口里，横屏 / 任意尺寸都得能用；iPhone 仍只竖屏 -->
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UIViewControllerBasedStatusBarAppearance</key>
+	<true/>
+	<!-- 语音输入（助手 🎤 转写）需要麦克风；未配置听觉档的用户永远不会触发这条弹窗 -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>语音输入需要使用麦克风，把你说的话转写成文字。</string>
+	<!-- 头像上传 / 拍照记账走系统拍照时需要相机 -->
+	<key>NSCameraUsageDescription</key>
+	<string>拍摄头像或账单照片时需要使用相机。</string>
+	<!-- 仅使用标准 HTTPS（豁免加密审查），免去每次提交都答一遍出口合规问卷 -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<!-- 一起进步 · 后台刷新（PactRefreshPlugin.swift 用 BGAppRefreshTask，只需「后台获取」；标识同 PactRefresh.taskId） -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>fetch</string>
+	</array>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.yuuki.pgt.pact</string>
+	</array>
+</dict>
+</plist>

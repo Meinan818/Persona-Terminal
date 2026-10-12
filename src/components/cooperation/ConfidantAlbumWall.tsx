@@ -1,0 +1,1128 @@
+/**
+ * ConfidantAlbumWall —— 羁绊专辑墙（PRD_V2.5_FINAL §5.3 定稿交互）。
+ *
+ * 同伴 = 竖版塔罗牌（正面直接复用 TarotCardSVG，逆位同伴天然倒置），3D cover flow：
+ *   - 中央卡正对放大，两侧透视斜排渐暗；两侧卡「拖拽或点击」切换，磁吸 + 触觉；
+ *   - 中央卡「单击翻转」；横向拖拽带阻尼、过阈值(±90px)也翻过去，不足回弹；
+ *   - 中央卡「上滑」进详情（ConfidantDetailModal）；背面另有「查看档案」按钮兜底；
+ *   - 下方信息条（称呼 · 牌名 · Rank）+ range scrubber 快速跳卡；
+ *   - 列表末尾「空白牌」= 新增同伴入口。
+ *
+ * 工程护栏：只渲染中央 ±3 张；动画全走 transform；D0 降级为横向 snap 列表。
+ * 三主题卡面差分后置（PRD 后备层），先做通用塔罗版。
+ */
+import { useRef, useState, type CSSProperties } from 'react';
+import { motion } from 'motion/react';
+import type { CloudProfile, Confidant, Friendship } from '@/types';
+import { OnlineStarBadge } from './OnlineStarBadge';
+import { ConfidantNameFx } from './ConfidantNameFx';
+import { MAX_INTIMACY, thresholdsFor } from '@/utils/confidantLevels';
+import { PactPartnerTag } from './PactTag';
+import { OrgBadge } from '@/components/org/OrgBadge';
+import { GoalLine, SwapFaces, swapTagProps, useStatusSwap } from '@/components/profile/PresenceLine';
+import { TAROT_BY_ID } from '@/constants/tarot';
+import { TarotCardSVG } from '@/components/astrology/TarotCardSVG';
+import { useBoldness } from '@/utils/boldness';
+import { playSound, triggerLightHaptic } from '@/utils/feedback';
+import { useUiChannel } from '@/ui/useUiChannel';
+import { useAppStore } from '@/store';
+import { useShortViewportScale } from '@/utils/useViewportScale';
+import { hardTagInk } from '@/utils/levelDifficulty';
+import { P3R, slantClip } from '@/components/p3r/kit';
+import { WallSpinBackdrop } from './WallSpinBackdrop';
+
+// 基准尺寸（19.5:9 长屏原稿口径）；实际渲染尺寸 = 基准 × useShortViewportScale——
+// 3:4 竖屏（视口高 ~500px）下整墙按比例缩，铭牌/应援行才装得进一屏（v2.7 适配）
+const CARD_W = 182;
+const SPACING = 88;          // 相邻卡横向间距
+const FLIP_THRESHOLD = 90;   // 中央卡拖拽翻转阈值（px）
+const OPEN_ARM = 12;         // 下滑打开档案的视觉阈值（px）
+const DOWN_CAP = 20;        // 下滑卡片位移上限（px）
+const UP_CAP = 15;          // 上滑橡皮筋位移上限（px）
+const STEP_X = 92;           // 横滑实时切卡步长（px/张，跟手一张张翻）
+/** 翻牌音的最小间隔（ms）。横拖是「实时一张张切」，快速划过十几张会把音效叠成一片糊；
+ *  留 90ms 既能听出一张一响的颗粒感，又不会把总线压出嗡声。 */
+const FLIP_SFX_GAP = 90;
+
+/** 单张卡的祈愿状态（与列表视图 ConfidantCard 同口径，两处共用一个构造函数） */
+export interface AlbumPrayerState {
+  alreadyPrayed: boolean;
+  /** 对方今天为我祈过、我还没回 —— 回敬双方 +3 SP，值得高亮 */
+  waitingReciprocity: boolean;
+  pending: boolean;
+  onPray: () => void;
+}
+
+/**
+ * 未缔结 COOP 的在线好友——也进牌阵（用户口径：占位卡横在墙上方太奇怪）。
+ * 本地没有 Confidant 行，所以是独立的一种牌：正面 = 头像卡面（可自裁，
+ * faceDataUrl 来自 db.onlineCardFaces），翻面 = 客人档案背（祈愿 / 缔结 / 裁切）。
+ */
+export interface FriendWallItem {
+  kind: 'friend';
+  /** 稳定 key（friend-<friendship.id>），供锚定与滚动条用 */
+  id: string;
+  profile: CloudProfile;
+  friendship: Friendship;
+  /** 自裁卡面（db.onlineCardFaces），无则退回官方头像 cover */
+  faceDataUrl?: string;
+  prayer?: AlbumPrayerState;
+}
+
+type WallItem = Confidant | FriendWallItem | 'add';
+
+const isFriend = (it: WallItem): it is FriendWallItem =>
+  it !== 'add' && (it as FriendWallItem).kind === 'friend';
+
+export interface ConfidantAlbumWallProps {
+  confidants: Confidant[];
+  onOpenDetail: (id: string) => void;
+  onCreate: () => void;
+  /** 达到同伴上限时隐藏空白牌 */
+  canCreate: boolean;
+  /**
+   * 逐卡取祈愿状态；返回 undefined = 这张卡不是"在线同伴"，不显示祈愿。
+   * 专辑墙成为默认视图后祈愿入口一度整个消失（只有列表视图接了线），这条就是补回来的通道。
+   */
+  prayerFor?: (c: Confidant) => AlbumPrayerState | undefined;
+  /** 未缔结的在线好友牌（排在同伴之后、空白牌之前） */
+  friends?: FriendWallItem[];
+  /** 打开好友档案抽屉（含缔结 COOP 流程） */
+  onOpenFriend?: (f: FriendWallItem) => void;
+  /** 裁切好友卡面（宿主开 ImageCropDialog；卡背上的 ✂️ 走它） */
+  onCropFriend?: (f: FriendWallItem) => void;
+}
+
+/**
+ * 背面档案（与正面同尺寸；rotateY(180) 预翻，父层翻转后正读）。
+ * 三频道各一套配色：以前一律暗靛紫渐变，在红/黄主题里既出戏又不好读。
+ *   p5 = 纸面黑框红点缀 · p4 = 奶油面墨字橙点缀 · p3 = 白底蓝字 · 中性 = 原靛紫。
+ */
+const BACK_SKIN = {
+  p5: {
+    face: '#f0e9df', line: '#050505', radius: 2,
+    ink: '#050505', sub: '#494540', meta: '#c00008', accent: '#c00008',
+    track: '#cdc7ba', bar: 'linear-gradient(90deg, #c00008, #d90008)',
+    advice: '#8e0000', btnBg: '#c00008', btnInk: '#f0e9df',
+    shadow: '5px 6px 0 #050505',
+  },
+  p4: {
+    face: '#fff9e3', line: '#131313', radius: 14,
+    ink: '#131313', sub: 'rgba(19,19,19,0.66)', meta: '#b26a00', accent: 'var(--p4-orange, #f9a11b)',
+    track: 'rgba(19,19,19,0.12)', bar: 'linear-gradient(90deg, #f9a11b, #ffd900)',
+    advice: '#b26a00', btnBg: '#131313', btnInk: '#ffd900',
+    shadow: '0 4px 0 rgba(19,19,19,0.25)',
+  },
+  p3: {
+    face: P3R.panel, line: 'rgba(147,190,222,0.45)', radius: 14,
+    ink: P3R.ink, sub: P3R.inkSoft, meta: P3R.blue, accent: P3R.blue,
+    track: 'var(--p3r-track, #e4eef5)', bar: 'linear-gradient(90deg, #35d1e8, #7fd8ee)',
+    advice: P3R.magenta, btnBg: P3R.blue, btnInk: '#ffffff',
+    shadow: '0 16px 36px -14px rgba(38,96,140,0.35)',
+  },
+  neutral: {
+    face: 'linear-gradient(180deg, #1e1b4b, #0f172a)', line: 'rgba(165,180,252,0.4)', radius: 12,
+    ink: '#ffffff', sub: 'rgba(199,210,254,0.8)', meta: '#a5b4fc', accent: '#a5b4fc',
+    track: 'rgba(255,255,255,0.15)', bar: 'linear-gradient(90deg, #818cf8, #e879f9)',
+    advice: 'rgba(245,208,254,0.85)', btnBg: 'rgba(255,255,255,0.14)', btnInk: '#ffffff',
+    shadow: '0 10px 30px -12px rgba(49,46,129,0.6)',
+  },
+} as const;
+
+/** 底部 10px 淡出（内容没碰到底就看不出来）；老 WebView 只认 -webkit- 前缀 */
+const FADE_TAIL: CSSProperties = {
+  WebkitMaskImage: 'linear-gradient(180deg, #000 calc(100% - 10px), transparent)',
+  maskImage: 'linear-gradient(180deg, #000 calc(100% - 10px), transparent)',
+};
+
+const CardBackFace = ({ c, onOpenDetail, prayer }: {
+  c: Confidant;
+  onOpenDetail: () => void;
+  prayer?: AlbumPrayerState;
+}) => {
+  const channel = useUiChannel();
+  const sk = BACK_SKIN[channel];
+  const p5 = channel === 'p5';
+  const card = TAROT_BY_ID[c.arcanaId];
+  // 等级内进度（v2.7.0.6 改用真实阈值：之前是「20 + 等级×10」的近似值，和详情页对不上）
+  const th = thresholdsFor(c);
+  const lvBase = th[Math.min(c.intimacy, MAX_INTIMACY)];
+  const lvNext = c.intimacy >= MAX_INTIMACY ? lvBase : th[c.intimacy + 1];
+  const inLevel = Math.max(0, c.intimacyPoints - lvBase);
+  const lvSpan = Math.max(1, lvNext - lvBase);
+  // RANK 与名片状态共用一枚（第 6 项）
+  const rankSwap = useStatusSwap(c.source === 'online' ? c.linkedProfile?.status : undefined);
+  return (
+    <div
+      className="flex h-full w-full flex-col px-4 py-4"
+      style={{
+        background: sk.face,
+        border: `${p5 ? 3 : 1}px solid ${sk.line}`,
+        borderRadius: sk.radius,
+        boxShadow: sk.shadow,
+        color: sk.ink,
+      }}
+    >
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="flex min-w-0 items-center gap-1.5">
+          {/* 在线好友才有星；卡背自带配色，用 ink 覆盖频道色以免撞底 */}
+          {c.source === 'online' && !!c.linkedCloudUserId && (
+            <OnlineStarBadge
+              glow={!!prayer?.waitingReciprocity && !prayer?.alreadyPrayed}
+              ink={sk.accent}
+              size={13}
+            />
+          )}
+          <ConfidantNameFx
+            waiting={!!prayer?.waitingReciprocity && !prayer?.alreadyPrayed}
+            maxBond={c.intimacy >= MAX_INTIMACY}
+            className="text-lg font-black"
+          >
+            <span style={{ color: sk.ink }}>{c.name}</span>
+          </ConfidantNameFx>
+        </span>
+        <span className="shrink-0 text-[10px] font-bold" style={{ color: sk.meta }}>
+          {card?.roman ?? ''} {c.orientation === 'reversed' ? '逆位' : '正位'}
+        </span>
+      </div>
+      <div className="mt-0.5 text-xs font-semibold" style={{ color: sk.sub }}>{card?.name ?? c.arcanaId}</div>
+      {/* 名片目标（第 6 项）：在线同伴的 linkedProfile 里带着；状态在下面 RANK 那枚里轮换 */}
+      {c.source === 'online' && (
+        <GoalLine goal={c.linkedProfile?.goal} compact className="mt-2" colors={{ ink: sk.ink, sub: sk.sub, accent: sk.accent }} />
+      )}
+
+      <div className="mt-3">
+        <div className="flex items-baseline justify-between text-[10px] font-bold" style={{ color: sk.meta }}>
+          <span className={rankSwap.preset ? 'cursor-pointer' : undefined} {...swapTagProps(rankSwap, `RANK ${c.intimacy}`)}>
+            <SwapFaces swap={rankSwap} lv={<>RANK {c.intimacy}</>} />
+          </span>
+          <span className="tabular-nums">{c.intimacy >= MAX_INTIMACY ? 'MAX' : `${inLevel}/${lvSpan}`}</span>
+        </div>
+        <div
+          className="mt-1 h-1.5 overflow-hidden"
+          style={{ background: sk.track, borderRadius: p5 ? 0 : 9999, clipPath: p5 ? 'polygon(2px 0, 100% 0, calc(100% - 2px) 100%, 0 100%)' : undefined }}
+        >
+          <div
+            className="h-full"
+            style={{ width: `${c.intimacy >= MAX_INTIMACY ? 100 : Math.min(100, (inLevel / lvSpan) * 100)}%`, background: sk.bar, borderRadius: p5 ? 0 : 9999 }}
+          />
+        </div>
+      </div>
+
+      {/* 一起进步（v2.7.0.6）：今天还差谁；两样都没有这一行不占位 */}
+      {c.source === 'online' && c.linkedCloudUserId && !c.archivedAt && (
+        <div className="mt-2 flex flex-wrap gap-1 empty:hidden"><PactPartnerTag partnerId={c.linkedCloudUserId} surface={channel === 'neutral' ? 'night' : 'default'} /><OrgBadge userId={c.linkedCloudUserId} surface={channel === 'neutral' ? 'night' : 'default'} /></div>
+      )}
+
+      {/* 关系描述 + 谏言：牌面定高，上面的约定 / 组织标记折到三行时这里放不下（第 19 批组织名写全以后）。
+          以前两段 line-clamp 一起被压扁、字从中间横着切开；现在两段照常排，放不下的部分从底下淡出 */}
+      {(c.description || c.aiAdvice) && (
+        <div className={`${c.description ? 'mt-3' : 'mt-2'} min-h-0 flex-1 overflow-hidden`} style={FADE_TAIL}>
+          {c.description && (
+            <p className="line-clamp-3 text-[11px] leading-relaxed" style={{ color: sk.sub }}>{c.description}</p>
+          )}
+          {c.aiAdvice && (
+            <p className={`${c.description ? 'mt-2 ' : ''}line-clamp-2 text-[11px] leading-relaxed`} style={{ color: sk.advice }}>✦ {c.aiAdvice}</p>
+          )}
+        </div>
+      )}
+
+      {/* 底部动作区。在线同伴 = 祈愿 + 档案两格；本地同伴 = 档案独占一行。
+          祈愿按钮的皮跟着 BACK_SKIN 走（p5 直角硬边 / p4 圆角墨框 / p3 斜切 / 中性圆角），
+          状态字直接写在按钮里——用户不必点开详情页才知道今天祈没祈过。 */}
+      <div className="mt-auto flex gap-1.5">
+        {prayer && (
+          <button
+            type="button"
+            onPointerDown={(e) => e.stopPropagation()}
+            onPointerUp={(e) => e.stopPropagation()}
+            onClick={(e) => { e.stopPropagation(); if (!prayer.alreadyPrayed && !prayer.pending) prayer.onPray(); }}
+            disabled={prayer.alreadyPrayed || prayer.pending}
+            aria-label={prayer.alreadyPrayed ? '今日已祈愿' : prayer.waitingReciprocity ? '回敬祈愿' : '为 Ta 祈愿'}
+            className="flex-1 py-2 text-[11px] font-black active:brightness-95 disabled:active:brightness-100"
+            style={{
+              // 已祈愿 = 描边留白态（不用 opacity 表达状态）；待回敬 = 强调色实心；常态 = 弱底描边
+              background: prayer.alreadyPrayed ? 'transparent' : prayer.waitingReciprocity ? sk.accent : 'transparent',
+              color: prayer.alreadyPrayed ? sk.sub : prayer.waitingReciprocity ? (p5 || channel === 'p4' ? sk.btnInk : '#ffffff') : sk.accent,
+              border: `${p5 ? 2 : 1}px solid ${prayer.alreadyPrayed ? sk.line : sk.accent}`,
+              borderRadius: p5 ? 0 : 8,
+              clipPath: channel === 'p3' ? slantClip(8) : p5 ? 'polygon(3px 0, 100% 2px, calc(100% - 3px) 100%, 0 calc(100% - 2px))' : undefined,
+            }}
+          >
+            {prayer.pending ? '祈愿中…'
+              : prayer.alreadyPrayed ? '今日已祈愿'
+              : prayer.waitingReciprocity ? '✦ 回敬祈愿'
+              : '✦ 祈愿'}
+          </button>
+        )}
+        <button
+          type="button"
+          // 拦住 pointerdown/up：卡墙手势在祖先 wall 上用 pointer 事件监听，
+          // 只 stopPropagation click 挡不住（翻转走 pointerup）——按钮会被翻回吞掉
+          onPointerDown={(e) => e.stopPropagation()}
+          onPointerUp={(e) => e.stopPropagation()}
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpenDetail();
+          }}
+          className={`${prayer ? 'flex-1' : 'w-full'} py-2 text-xs font-black active:brightness-95`}
+          style={{
+            background: sk.btnBg,
+            color: sk.btnInk,
+            borderRadius: p5 ? 0 : 8,
+            clipPath: channel === 'p3' ? slantClip(8) : p5 ? 'polygon(3px 0, 100% 2px, calc(100% - 3px) 100%, 0 calc(100% - 2px))' : undefined,
+          }}
+        >
+          {prayer ? '档案 →' : '查看档案 →'}
+        </button>
+      </div>
+    </div>
+  );
+};
+
+/** 空白牌（新增入口；p3=浅青虚线白牌） */
+const BlankCard = () => {
+  const p3 = useUiChannel() === 'p3';
+  return (
+    <div
+      className={p3
+        ? 'flex h-full w-full flex-col items-center justify-center gap-3 rounded-[14px]'
+        : 'flex h-full w-full flex-col items-center justify-center gap-3 rounded-xl border-2 border-dashed border-indigo-300/50 bg-indigo-500/5 text-indigo-400'}
+      style={p3 ? { border: '2px dashed rgba(53,209,232,0.6)', background: 'var(--p3r-blank, rgba(226,243,250,0.6))', color: P3R.blue } : undefined}
+    >
+      <span className="text-5xl font-thin leading-none">+</span>
+      <span className="text-xs font-bold tracking-wide">缔结新的羁绊</span>
+    </div>
+  );
+};
+
+/**
+ * 未缔结好友 · 正面。
+ * 有图（自裁卡面 > 官方头像）= 整张牌面 cover；无图 = 频道纹样的「客人牌背」
+ * （斜纹 + 大 ✦ + 首字母）。右上角恒挂「未缔结」虚线小签——一眼与羁绊牌区分。
+ */
+const FriendCardFace = ({ f }: { f: FriendWallItem }) => {
+  const channel = useUiChannel();
+  const sk = BACK_SKIN[channel];
+  const p5 = channel === 'p5';
+  const src = f.faceDataUrl || f.profile.avatarUrl;
+  const name = f.profile.nickname || f.profile.userId || '未命名客人';
+  return (
+    <div
+      className="relative h-full w-full overflow-hidden"
+      style={{
+        background: sk.face,
+        border: `${p5 ? 3 : 1}px solid ${sk.line}`,
+        borderRadius: sk.radius,
+        boxShadow: sk.shadow,
+      }}
+    >
+      {src ? (
+        <img src={src} alt={name} draggable={false} className="absolute inset-0 h-full w-full object-cover" />
+      ) : (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-2" style={{ color: sk.accent }}>
+          {/* 客人牌背纹样：频道色斜纹打底 */}
+          <div
+            aria-hidden
+            className="absolute inset-0 opacity-[0.12]"
+            style={{ background: `repeating-linear-gradient(-45deg, ${typeof sk.accent === 'string' ? sk.accent : '#888'} 0 6px, transparent 6px 16px)` }}
+          />
+          <span className="text-4xl" aria-hidden>✦</span>
+          <span className="text-3xl font-black">{(name[0] || '?').toUpperCase()}</span>
+        </div>
+      )}
+      {/* 底部名条（压在图上要有底衬才立得住） */}
+      <div
+        className="absolute inset-x-0 bottom-0 flex items-center gap-1.5 px-2.5 py-2"
+        style={{ background: 'linear-gradient(transparent, rgba(0,0,0,0.62))' }}
+      >
+        <OnlineStarBadge glow={!!f.prayer?.waitingReciprocity && !f.prayer?.alreadyPrayed} ink="#ffffff" size={11} />
+        <span className="min-w-0 truncate text-[13px] font-black text-white">{name}</span>
+      </div>
+      {/* 未缔结签 */}
+      <span
+        className="absolute right-1.5 top-1.5 px-1.5 py-0.5 text-[9px] font-black tracking-wider"
+        style={{
+          color: p5 ? '#f0e9df' : '#ffffff',
+          background: 'rgba(0,0,0,0.45)',
+          border: `1px dashed ${p5 ? '#f0e9df' : 'rgba(255,255,255,0.75)'}`,
+          borderRadius: p5 ? 0 : 6,
+        }}
+      >
+        未缔结
+      </span>
+    </div>
+  );
+};
+
+/**
+ * 未缔结好友 · 背面（翻面后的客人档案）。
+ * 复用 BACK_SKIN 四频道皮与 CardBackFace 同语言，但内容是客人版：
+ * 无 RANK 条（还没有羁绊等级），换成 LV / @userId；主 CTA 是「缔结 COOP」。
+ */
+const FriendCardBack = ({ f, onOpen, onCrop, onProfile }: {
+  f: FriendWallItem;
+  onOpen: () => void;
+  onCrop?: () => void;
+  /** 点虚线块 → 直接打开 GUEST PROFILE */
+  onProfile?: () => void;
+}) => {
+  const channel = useUiChannel();
+  const theme = useAppStore(s => s.user?.theme);
+  const sk = BACK_SKIN[channel];
+  const p5 = channel === 'p5';
+  const name = f.profile.nickname || f.profile.userId || '未命名客人';
+  const prayer = f.prayer;
+  const btnClip = channel === 'p3' ? slantClip(8) : p5 ? 'polygon(3px 0, 100% 2px, calc(100% - 3px) 100%, 0 calc(100% - 2px))' : undefined;
+  const stop = (e: React.SyntheticEvent) => e.stopPropagation();
+  // LV 与名片状态共用一枚（第 6 项）
+  const lvSwap = useStatusSwap(f.profile.status);
+  return (
+    <div
+      className="flex h-full w-full flex-col px-4 py-4"
+      style={{
+        background: sk.face,
+        border: `${p5 ? 3 : 1}px solid ${sk.line}`,
+        borderRadius: sk.radius,
+        boxShadow: sk.shadow,
+        color: sk.ink,
+      }}
+    >
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="flex min-w-0 items-center gap-1.5">
+          <OnlineStarBadge glow={!!prayer?.waitingReciprocity && !prayer?.alreadyPrayed} ink={sk.accent} size={13} />
+          <span className="truncate text-lg font-black" style={{ color: sk.ink }}>{name}</span>
+        </span>
+        <span className="shrink-0 text-[10px] font-bold" style={{ color: sk.meta }}>GUEST</span>
+      </div>
+      {/* ID 是入口本身（虚线下划线 = 可点，与 COOP 详情页同一套语言），点开 GUEST PROFILE。
+          flex-wrap：ID 长的时候 LV 自己换到下一行，而不是被卡缘切掉。 */}
+      <div className="mt-0.5 flex flex-wrap items-baseline gap-x-1.5 text-xs font-semibold" style={{ color: sk.sub }}>
+        <button
+          type="button"
+          onPointerDown={stop}
+          onPointerUp={stop}
+          onClick={(e) => { e.stopPropagation(); onProfile?.(); }}
+          disabled={!onProfile}
+          className="min-w-0 max-w-full break-all text-left font-semibold active:brightness-90 disabled:active:brightness-100"
+          style={{
+            color: 'inherit',
+            borderBottom: onProfile ? `1px dashed ${sk.accent}` : undefined,
+            lineHeight: 1.5,
+          }}
+        >
+          @{f.profile.userId ?? '—'}
+        </button>
+        {(typeof f.profile.totalLv === 'number' || lvSwap.preset) && (
+          <span
+            className={`shrink-0 tabular-nums ${lvSwap.preset ? 'cursor-pointer' : ''}`}
+            // 困难档的客人：LV 换成主题对应的高调色（R19）
+            style={f.profile.levelDifficulty === 'hard' ? { color: hardTagInk(theme).ink, fontWeight: 900 } : undefined}
+            {...swapTagProps(lvSwap, `LV ${f.profile.totalLv ?? ''}`)}
+          >
+            <SwapFaces swap={lvSwap} lv={<>LV {f.profile.totalLv ?? '—'}</>} />
+          </span>
+        )}
+      </div>
+
+      {/* 一起进步（v2.7.0.6）：普通好友也能约 */}
+      <div className="mt-2 flex flex-wrap gap-1"><PactPartnerTag partnerId={f.profile.id} surface={channel === 'neutral' ? 'night' : 'default'} /><OrgBadge userId={f.profile.id} surface={channel === 'neutral' ? 'night' : 'default'} /></div>
+
+      {/* 名片目标（第 6 项）；没有才放那句「还未缔结」（状态在上面 LV 那枚里轮换） */}
+      {f.profile.goal ? (
+        <GoalLine goal={f.profile.goal} compact className="mt-3" colors={{ ink: sk.ink, sub: sk.sub, accent: sk.accent }} />
+      ) : (
+      <p className="mt-3 text-[11px] leading-relaxed" style={{ color: sk.sub }}>
+        还未缔结 COOP 契约——两张塔罗尚未互相照亮。递出契约，Ta 就会正式落座这面墙。
+      </p>
+      )}
+
+
+      <div className="mt-auto space-y-1.5">
+        <div className="flex gap-1.5">
+          {prayer && (
+            <button
+              type="button"
+              onPointerDown={stop}
+              onPointerUp={stop}
+              onClick={(e) => { e.stopPropagation(); if (!prayer.alreadyPrayed && !prayer.pending) prayer.onPray(); }}
+              disabled={prayer.alreadyPrayed || prayer.pending}
+              aria-label={prayer.alreadyPrayed ? '今日已祈愿' : prayer.waitingReciprocity ? '回敬祈愿' : '为 Ta 祈愿'}
+              className="flex-1 py-2 text-[11px] font-black active:brightness-95 disabled:active:brightness-100"
+              style={{
+                background: prayer.alreadyPrayed ? 'transparent' : prayer.waitingReciprocity ? sk.accent : 'transparent',
+                color: prayer.alreadyPrayed ? sk.sub : prayer.waitingReciprocity ? (p5 || channel === 'p4' ? sk.btnInk : '#ffffff') : sk.accent,
+                border: `${p5 ? 2 : 1}px solid ${prayer.alreadyPrayed ? sk.line : sk.accent}`,
+                borderRadius: p5 ? 0 : 8,
+                clipPath: btnClip,
+              }}
+            >
+              {prayer.pending ? '祈愿中…'
+                : prayer.alreadyPrayed ? '今日已祈愿'
+                : prayer.waitingReciprocity ? '✦ 回敬祈愿'
+                : '✦ 祈愿'}
+            </button>
+          )}
+          <button
+            type="button"
+            onPointerDown={stop}
+            onPointerUp={stop}
+            onClick={(e) => { e.stopPropagation(); onOpen(); }}
+            // 两格并排时字要压到 11px：「缔结 COOP →」在 182px 宽的牌上会顶出卡缘
+            className={`${prayer ? 'flex-1' : 'w-full'} truncate px-1 py-2 text-[11px] font-black active:brightness-95`}
+            style={{ background: sk.btnBg, color: sk.btnInk, borderRadius: p5 ? 0 : 8, clipPath: btnClip }}
+          >
+            缔结 COOP
+          </button>
+        </div>
+        {onCrop && (f.profile.avatarUrl || f.faceDataUrl) && (
+          <button
+            type="button"
+            onPointerDown={stop}
+            onPointerUp={stop}
+            onClick={(e) => { e.stopPropagation(); onCrop(); }}
+            className="w-full py-1.5 text-[11px] font-black active:brightness-95"
+            style={{ color: sk.accent, border: `1px dashed ${sk.line}`, borderRadius: p5 ? 0 : 8, background: 'transparent' }}
+          >
+            ✂️ 裁切卡面
+          </button>
+        )}
+      </div>
+    </div>
+  );
+};
+
+const idOf = (item: WallItem) => (item === 'add' ? '__add__' : item.id);
+
+/** 「卡面用头像」开着时，整张牌面换成头像图（离线=本地上传，在线=对方云端头像） */
+const faceOf = (c: Confidant): string | undefined =>
+  c.avatarAsCardFace
+    ? (c.cardFaceDataUrl || c.customAvatarDataUrl || c.linkedProfile?.avatarUrl || undefined)
+    : undefined;
+
+/**
+ * WallScrubber —— 刻度条式快速跳卡（替代原生 range，Persona 资源条语言）。
+ * 每个同伴一根竖刻度、空白牌一个描边点；当前项放大成主题色圆头 pill。
+ * 整条轨道可点/拖：按 x 比例取最近刻度，命中区是整轨（刻度细也好点）。
+ */
+const WallScrubber = ({
+  items,
+  index,
+  onJump,
+}: {
+  items: WallItem[];
+  index: number;
+  onJump: (i: number) => void;
+}) => {
+  const trackRef = useRef<HTMLDivElement>(null);
+  const dragging = useRef(false);
+
+  const pickFromX = (clientX: number): number => {
+    const rect = trackRef.current?.getBoundingClientRect();
+    if (!rect || rect.width === 0) return index;
+    const ratio = (clientX - rect.left) / rect.width;
+    return Math.max(0, Math.min(items.length - 1, Math.round(ratio * (items.length - 1))));
+  };
+
+  return (
+    <div
+      ref={trackRef}
+      className="relative flex h-9 cursor-pointer touch-none items-center gap-[3px]"
+      onPointerDown={(e) => {
+        dragging.current = true;
+        onJump(pickFromX(e.clientX));
+        try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /* noop */ }
+      }}
+      onPointerMove={(e) => { if (dragging.current) onJump(pickFromX(e.clientX)); }}
+      onPointerUp={() => { dragging.current = false; }}
+      onPointerCancel={() => { dragging.current = false; }}
+      role="slider"
+      aria-label="快速跳卡"
+      aria-valuemin={0}
+      aria-valuemax={items.length - 1}
+      aria-valuenow={index}
+    >
+      {items.map((it, i) => {
+        const active = i === index;
+        const isAdd = it === 'add';
+        return (
+          <div key={idOf(it)} className="flex flex-1 items-center justify-center">
+            {isAdd ? (
+              <motion.div
+                aria-hidden
+                className="rounded-full border-2 border-indigo-400/60"
+                animate={{ width: active ? 12 : 8, height: active ? 12 : 8, borderColor: active ? 'var(--color-primary)' : 'rgba(129,140,248,0.5)' }}
+              />
+            ) : (
+              <motion.div
+                aria-hidden
+                className="rounded-full"
+                animate={{
+                  width: active ? 6 : 3,
+                  height: active ? 24 : 10,
+                  backgroundColor: active ? 'var(--color-primary)' : 'rgba(148,163,184,0.45)',
+                }}
+                transition={{ type: 'spring', stiffness: 400, damping: 30 }}
+              />
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+};
+
+export const ConfidantAlbumWall = ({ confidants, onOpenDetail, onCreate, canCreate, prayerFor, friends, onOpenFriend, onCropFriend }: ConfidantAlbumWallProps) => {
+  const wallChannel = useUiChannel();
+  const isP4 = wallChannel === 'p4';
+  const isP5 = wallChannel === 'p5';
+  const bold = useBoldness();
+  const p3 = useUiChannel() === 'p3';
+  const attributeNames = useAppStore(s => s.settings.attributeNames);
+  // 3:4 矮视口适配：卡牌/间距/切卡步长同乘缩放（基准 CARD_W 等只是原稿尺寸）
+  const vScale = useShortViewportScale(760, 0.72);
+  const cw = Math.round(CARD_W * vScale);
+  const ch = Math.round(cw * 1.6);
+  const spacing = Math.round(SPACING * vScale);
+  const stepX = Math.round(STEP_X * vScale);
+  // 中央卡用【id 锚定】而非数字下标：详情互动/排序变化导致 confidants 重排时，
+  // 中央卡跟着原卡平滑走位，而不是「index 指到了别人」（实测踩坑：查看详情
+  // 会更新排序权重，关闭弹窗后数字锚让中央卡换人）。
+  const [centerId, setCenterId] = useState<string | null>(null);
+  const [flipped, setFlipped] = useState(false);
+  const [dragRot, setDragRot] = useState(0);   // 中央卡拖拽的实时附加角
+  const [slideX, setSlideX] = useState(0);     // 滑动切换的实时位移
+  const [dragY, setDragY] = useState(0);       // 中央卡上滑预览位移（负值）
+  const [dragDown, setDragDown] = useState(0); // 中央卡下滑「往下翻一点点」橡皮筋位移（正值）
+  const overDetailRef = useRef(false);         // 上滑是否已越过详情阈值（跨越时触觉一次）
+
+  /**
+   * 牌序（用户口径）：已缔结 → 未缔结+在线 → 离线 → 归档 → 空白牌。
+   *
+   * 好友牌不能简单地拼在最后：那样翻牌时会变成「在线同伴 → 离线同伴 → 在线好友」，
+   * 中间隔着一堆离线的人，而这三档在语义上是**一条连续的亲疏轴**（已结契 → 在线但
+   * 还没结 → 根本不在线上）。所以在这里按档重排，好友插在两档同伴中间。
+   * 各档内部保持调用方给的次序（filter 稳定），页面那边的 createdAt 倒序不受影响。
+   */
+  const wallFriends = friends ?? [];
+  const bonded = confidants.filter(c => !c.archivedAt && c.source === 'online');
+  const offline = confidants.filter(c => !c.archivedAt && c.source !== 'online');
+  const archived = confidants.filter(c => !!c.archivedAt);
+  const items: WallItem[] = [
+    ...bonded,
+    ...wallFriends,
+    ...offline,
+    ...archived,
+    ...(canCreate ? ['add' as const] : []),
+  ];
+  const count = items.length;
+
+  // index 由 centerId 派生：锚卡被移除/筛掉时回落 0
+  const anchored = centerId ? items.findIndex((it) => idOf(it) === centerId) : 0;
+  const index = anchored === -1 ? 0 : anchored;
+  // 铭牌上的 LV / RANK 与名片状态共用一枚标签（第 6 项）：有状态先显示状态，3 秒或点一下切换
+  const captionItem = items[index];
+  const captionSwap = useStatusSwap(
+    !captionItem || captionItem === 'add'
+      ? undefined
+      : isFriend(captionItem)
+        ? captionItem.profile.status
+        : captionItem.source === 'online' ? captionItem.linkedProfile?.status : undefined,
+  );
+
+  /** 上一次翻牌音的时刻（见 FLIP_SFX_GAP） */
+  const lastFlipSfx = useRef(0);
+
+  const go = (next: number) => {
+    const clamped = Math.max(0, Math.min(count - 1, next));
+    if (clamped !== index) {
+      triggerLightHaptic();
+      // 左右翻牌音。go() 是**唯一**的换牌入口——横拖实时步进、两侧卡起拖、
+      // 松手惯性、scrubber 跳卡、键盘 ←/→ 全走这里，一处挂上即全覆盖。
+      // 音色不分主题（塔罗是跨频道的同一套牌），故不进 THEME_SOUNDS 表。
+      const now = performance.now();
+      if (now - lastFlipSfx.current >= FLIP_SFX_GAP) {
+        lastFlipSfx.current = now;
+        playSound('/tarots.mp3', 0.6);
+      }
+      setFlipped(false);
+      setCenterId(idOf(items[clamped]));
+    }
+  };
+
+  // ── 手势（容器统一 pointer 处理；flip=中央卡按下，slide=其余区域）──────────
+  const gesture = useRef<{
+    mode: 'flip' | 'slide' | null;
+    startX: number;
+    startY: number;
+    startT: number;
+    targetIdx: number | null;
+    /** 主轴锁：首次超过阈值时定死，避免斜拖时横纵行为来回抖 */
+    axis: 'x' | 'y' | null;
+    /** 正面横拖实时步进的基准 index（切卡跟手用） */
+    startIndex: number;
+  }>({ mode: null, startX: 0, startY: 0, startT: 0, targetIdx: null, axis: null, startIndex: 0 });
+
+  const onPointerDown = (e: React.PointerEvent) => {
+    if (!bold) return;
+    const el = (e.target as HTMLElement).closest('[data-wall-idx]');
+    const idx = el ? Number(el.getAttribute('data-wall-idx')) : null;
+    gesture.current = {
+      mode: idx === index ? 'flip' : 'slide',
+      startX: e.clientX,
+      startY: e.clientY,
+      startT: performance.now(),
+      targetIdx: idx,
+      axis: null,
+      startIndex: index,
+    };
+    // capture 失败不致命（合成事件 / 已释放的 pointerId 会抛 NotFoundError）
+    try {
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    } catch {
+      /* noop */
+    }
+  };
+
+  const onPointerMove = (e: React.PointerEvent) => {
+    const g = gesture.current;
+    if (!g.mode) return;
+    const dx = e.clientX - g.startX;
+    const dy = e.clientY - g.startY;
+    if (g.mode === 'flip') {
+      const item = items[index];
+      // 主轴锁：第一次超过 6px 时定死，之后横纵不再互抢
+      if (!g.axis && (Math.abs(dx) > 6 || Math.abs(dy) > 6)) {
+        g.axis = Math.abs(dx) > Math.abs(dy) ? 'x' : 'y';
+      }
+      if (g.axis === 'y') {
+        if (dy > 0 && item !== 'add') {
+          // 下滑：打开档案预览（跟手下沉，位移封顶 DOWN_CAP 防截断），过阈越界一次触觉
+          const v = Math.min(DOWN_CAP, dy * 0.5);
+          setDragDown(v);
+          setDragY(0);
+          const over = v >= OPEN_ARM;
+          if (over && !overDetailRef.current) triggerLightHaptic();
+          overDetailRef.current = over;
+        } else if (dy < 0) {
+          // 上滑：橡皮筋翻角（无动作，位移封顶 UP_CAP）
+          setDragY(Math.max(-UP_CAP, dy * 0.5));
+          setDragDown(0);
+        }
+      } else if (g.axis === 'x') {
+        if (flipped) {
+          // 背面横拖 → 翻转预览（阻尼 0.42），翻回正面
+          setDragRot(Math.max(-170, Math.min(170, dx * 0.42)));
+          setSlideX(0);
+        } else {
+          // 正面横拖 → 实时一张张切卡（跟手，和 scrubber 手感一致）；张内余量做偏移
+          const n = Math.round(-dx / stepX);
+          go(g.startIndex + n);
+          setSlideX(dx + n * stepX);
+          setDragRot(0);
+        }
+      }
+    } else {
+      // 两侧卡起拖 → 同样实时一张张切（不等松手）
+      const n = Math.round(-dx / stepX);
+      go(g.startIndex + n);
+      setSlideX(dx + n * stepX);
+    }
+  };
+
+  const endGesture = (e: React.PointerEvent) => {
+    const g = gesture.current;
+    if (!g.mode) return;
+    const dx = e.clientX - g.startX;
+    const dy = e.clientY - g.startY;
+    const dt = Math.max(1, performance.now() - g.startT);
+    const isTap = Math.abs(dx) < 8 && Math.abs(dy) < 8;
+
+    if (g.mode === 'flip') {
+      const item = items[index];
+      if (isTap) {
+        // 单击翻转（空白牌单击 = 新增）
+        if (item === 'add') onCreate();
+        else {
+          setFlipped((f) => !f);
+          triggerLightHaptic();
+        }
+      } else if (g.axis === 'y' && dy > 0) {
+        // 下滑过阈值 → 打开档案（上滑橡皮筋无动作）；好友牌开的是客人档案抽屉
+        if (Math.min(DOWN_CAP, dy * 0.5) >= OPEN_ARM && item !== 'add') {
+          if (isFriend(item)) onOpenFriend?.(item);
+          else onOpenDetail(item.id);
+        }
+      } else if (g.axis === 'x') {
+        if (flipped) {
+          // 背面横拖过阈值 → 翻回正面
+          if (Math.abs(dx) > FLIP_THRESHOLD) {
+            setFlipped(false);
+            triggerLightHaptic();
+          }
+        } else {
+          // 正面横拖已实时切卡，松手只做甩动补偿（快甩多切一张）
+          const velocity = dx / dt;
+          if (Math.abs(velocity) > 0.5) go(index + (velocity < 0 ? 1 : -1));
+        }
+      }
+      // 上滑（axis==='y' && dy<0）无动作，橡皮筋回弹
+      setDragRot(0);
+      setDragY(0);
+      setDragDown(0);
+      setSlideX(0);
+      overDetailRef.current = false;
+    } else {
+      if (isTap && g.targetIdx !== null) {
+        // 点两侧卡 = 跳到它
+        go(g.targetIdx);
+      } else {
+        // 拖动中已实时切卡，松手只做甩动补偿（快甩多切一张）
+        const velocity = dx / dt; // px/ms
+        if (Math.abs(velocity) > 0.5) go(index + (velocity < 0 ? 1 : -1));
+      }
+      setSlideX(0);
+    }
+    gesture.current.mode = null;
+  };
+
+  // ── D0 降级：横向 snap 列表 ───────────────────────────────────────────────
+  if (!bold) {
+    return (
+      <div className="flex gap-4 overflow-x-auto pb-4 pt-2 [scrollbar-width:thin]" style={{ scrollSnapType: 'x mandatory' }}>
+        {items.map((item) =>
+          item === 'add' ? (
+            <button key="add" type="button" onClick={onCreate} className="shrink-0" style={{ width: cw * 0.8, height: ch * 0.8, scrollSnapAlign: 'center' }}>
+              <BlankCard />
+            </button>
+          ) : isFriend(item) ? (
+            <button key={item.id} type="button" onClick={() => onOpenFriend?.(item)} className="shrink-0" style={{ width: cw * 0.8, height: ch * 0.8, scrollSnapAlign: 'center' }}>
+              <FriendCardFace f={item} />
+            </button>
+          ) : (
+            <button key={item.id} type="button" onClick={() => onOpenDetail(item.id)} className="shrink-0" style={{ scrollSnapAlign: 'center' }}>
+              <TarotCardSVG card={TAROT_BY_ID[item.arcanaId]} orientation={item.orientation} width={cw * 0.8} staticCard showOrientationTag={false} faceOverride={faceOf(item)} />
+              <div className="mt-1 truncate text-center text-xs font-bold text-gray-700 dark:text-gray-200">{item.name}</div>
+            </button>
+          ),
+        )}
+      </div>
+    );
+  }
+
+  const current = items[index];
+
+  return (
+    <div className={p3 ? 'select-none -mt-1' : 'select-none'}>
+      {/* 墙体 */}
+      <div
+        className="relative touch-none overflow-hidden"
+        style={{ height: ch + (p3 ? 22 : 46), perspective: 1100 }}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={endGesture}
+        onPointerCancel={endGesture}
+        tabIndex={0}
+        role="listbox"
+        aria-label="羁绊专辑墙"
+        aria-activedescendant={current !== 'add' && current ? `wall-card-${current.id}` : undefined}
+        onKeyDown={(e) => {
+          if (e.key === 'ArrowLeft') go(index - 1);
+          if (e.key === 'ArrowRight') go(index + 1);
+          if (e.key === 'Enter' && current !== 'add' && current) {
+            if (isFriend(current)) onOpenFriend?.(current);
+            else onOpenDetail(current.id);
+          }
+        }}
+      >
+        {items.map((item, i) => {
+          const offset = i - index;
+          if (Math.abs(offset) > 3) return null; // 虚拟化 ±3
+          const isCenter = offset === 0;
+          const slideShift = slideX * 0.55; // 拖动跟手（磁吸在松手时）
+          const x = offset * spacing + slideShift;
+          const rotY = isCenter ? (flipped ? 180 : 0) + dragRot : offset < 0 ? 38 : -38;
+          // 上滑橡皮筋上飘 / 下滑打开预览下沉（二者互斥，axis 锁保证）
+          const y = isCenter ? dragY + dragDown : 0;
+          // 上滑时卡顶前倾一点（橡皮筋翻角，rotateX 负 = 顶部靠近）；下滑不翻角
+          const rotX = isCenter ? dragY * 0.4 : 0;
+          // 下滑打开预览：轻微放大暗示「聚焦/展开」（位移封顶后靠放大补足反馈）
+          const liftScale = isCenter ? 1 + Math.min(0.05, dragDown / 300) : 0.78;
+          const key = item === 'add' ? 'add' : item.id;
+          return (
+            <motion.div
+              key={key}
+              id={item !== 'add' ? `wall-card-${item.id}` : undefined}
+              data-wall-idx={i}
+              role="option"
+              aria-selected={isCenter}
+              aria-label={item === 'add'
+                ? '缔结新的羁绊'
+                : isFriend(item)
+                  ? `${item.profile.nickname || item.profile.userId || '未命名客人'}（在线好友 · 未缔结 COOP）`
+                  : `${item.name}（${TAROT_BY_ID[item.arcanaId]?.name ?? ''}，RANK ${item.intimacy}）`}
+              className="absolute left-1/2 top-4 cursor-pointer"
+              style={{ width: cw, height: ch, marginLeft: -cw / 2, transformStyle: 'preserve-3d', zIndex: 100 - Math.abs(offset) }}
+              animate={{ x, y, rotateX: rotX, rotateY: rotY, scale: liftScale }}
+              transition={{ type: 'spring', stiffness: 260, damping: 28 }}
+            >
+              {/* 正面 */}
+              <div className="absolute inset-0" style={{ backfaceVisibility: 'hidden' }}>
+                {item === 'add' ? (
+                  <BlankCard />
+                ) : isFriend(item) ? (
+                  <FriendCardFace f={item} />
+                ) : (
+                  <TarotCardSVG card={TAROT_BY_ID[item.arcanaId]} orientation={item.orientation} width={cw} staticCard showOrientationTag={false} faceOverride={faceOf(item)} />
+                )}
+                {/* 两侧渐暗罩（transform-only 之外唯一的视觉层，纯透明度；p3 用蓝灰调防白卡发脏） */}
+                {!isCenter && <div aria-hidden className={`absolute inset-0 ${p3 ? 'rounded-[14px]' : 'rounded-xl'}`} style={{ background: p3 ? '#4a7a9c' : '#000', opacity: 0.18 + Math.abs(offset) * 0.16 }} />}
+              </div>
+              {/* 背面（仅真实卡） */}
+              {item !== 'add' && (
+                <div className="absolute inset-0" style={{ backfaceVisibility: 'hidden', transform: 'rotateY(180deg)' }}>
+                  {isFriend(item) ? (
+                    <FriendCardBack
+                      f={item}
+                      onOpen={() => onOpenFriend?.(item)}
+                      onCrop={onCropFriend ? () => onCropFriend(item) : undefined}
+                      onProfile={onOpenFriend ? () => onOpenFriend(item) : undefined}
+                    />
+                  ) : (
+                    <CardBackFace c={item} onOpenDetail={() => onOpenDetail(item.id)} prayer={prayerFor?.(item)} />
+                  )}
+                </div>
+              )}
+            </motion.div>
+          );
+        })}
+
+        {/* 下滑反馈：底部提示胶囊，随下滑量渐显；过阈值变主题色实心「松手打开」 */}
+        {dragDown > 6 && current !== 'add' && (() => {
+          const progress = Math.min(1, dragDown / OPEN_ARM);
+          const armed = progress >= 1;
+          return (
+            <div
+              aria-hidden
+              className="pointer-events-none absolute inset-x-0 top-0 z-[80] flex justify-center"
+              style={{ opacity: 0.4 + progress * 0.6 }}
+            >
+              <div
+                className="flex items-center gap-1.5 rounded-full px-3.5 py-1.5 text-xs font-black shadow-lg transition-colors"
+                style={{
+                  background: armed ? 'var(--color-primary)' : 'rgba(30,27,75,0.9)',
+                  color: '#fff',
+                  transform: `scale(${0.9 + progress * 0.1})`,
+                }}
+              >
+                <motion.span animate={{ y: armed ? [1, 3, 1] : 0 }} transition={{ duration: 0.6, repeat: armed ? Infinity : 0 }}>↓</motion.span>
+                {armed ? '松手打开档案' : '下滑查看档案'}
+              </div>
+            </div>
+          );
+        })()}
+      </div>
+
+      {/* 档案铭牌 + scrubber（p3：信息已上卡，铭牌只留空白牌文案 + scrubber + 蓝提示行） */}
+      <div className={`relative mx-auto max-w-sm px-3 ${p3 ? '-mt-1' : 'mt-2'}`}>
+        {/* 铭牌背后那枚跟着翻牌动的背景件（红星转 60° / 黄星转 90° / 蓝水波；组织名册的专辑墙也用它） */}
+        <WallSpinBackdrop channel={isP4 ? 'p4' : isP5 ? 'p5' : p3 ? 'p3' : 'neutral'} index={index} />
+        {/* 跳卡条（p3 稿：在铭牌文字**上方**）。
+            必须放在铭牌三岔分支之外——原本它嵌在"已缔结同伴"那一支里，
+            于是蓝/粉频道翻到未缔结好友或空白牌时整条就消失了
+            （非 p3 频道的那份在分支外，所以只有 p3 中招）。 */}
+        {p3 && count > 1 && (
+          <div className="mb-3.5">
+            <WallScrubber items={items} index={index} onJump={go} />
+          </div>
+        )}
+        {current === 'add' || !current ? (
+          <div className="text-center">
+            <div className={`text-2xl font-black ${p3 ? '' : 'text-gray-800 dark:text-gray-100'}`} style={p3 ? { color: P3R.ink } : undefined}>缔结新的羁绊</div>
+            <div className={`mt-0.5 text-xs font-semibold ${p3 ? '' : 'text-gray-400 dark:text-gray-500'}`} style={p3 ? { color: P3R.grey } : undefined}>点一下这张空白牌开始</div>
+          </div>
+        ) : isFriend(current) ? (
+          /* 好友铭牌：客人版——眉标 GUEST，名字带星，提示缔结。四频道共用一版轻样式 */
+          <div className="text-center">
+            <div className={`text-[11px] font-black tracking-[0.16em] ${p3 ? '' : isP4 ? 'text-[var(--ui-accent)]' : isP5 ? '' : 'text-indigo-400 dark:text-indigo-300'}`}
+                 style={p3 ? { color: P3R.blue } : isP5 ? { color: '#d90008' } : undefined}>
+              GUEST · 未缔结 COOP
+            </div>
+            <div className="mt-0.5 flex items-center justify-center gap-2">
+              <OnlineStarBadge glow={!!current.prayer?.waitingReciprocity && !current.prayer?.alreadyPrayed} size={14} />
+              <motion.h3
+                key={current.id}
+                initial={{ opacity: 0, y: 4 }}
+                animate={{ opacity: 1, y: 0 }}
+                // pr-[0.18em]（仅 p3/粉）：Arial Black 斜体的字形会探出自己的内容盒，
+                // truncate 的 overflow:hidden 正好贴着盒切，末字右侧就被削掉一刀
+                // ——羁绊铭牌早就踩过并留了这道内边距，这块客人铭牌照抄时漏了。
+                // max-w 也跟着放宽到 80%：70% 在长名字上会提前进省略号。
+                className={`truncate leading-tight ${
+                  isP4
+                    ? 'max-w-[70%] text-[36px] font-black text-[#131313]'
+                    : p3
+                      ? 'max-w-[80%] pr-[0.18em] text-[34px] font-black italic'
+                      : 'max-w-[70%] text-[28px] font-black text-gray-900 dark:text-white'
+                }`}
+                style={isP4 ? { fontFamily: 'var(--p4-display-font, serif)' } : p3 ? { color: P3R.ink, fontFamily: '"Noto Sans SC Black", "Velvet Sans SC", sans-serif' } : undefined}
+              >
+                {current.profile.nickname || current.profile.userId || '未命名客人'}
+              </motion.h3>
+              {(typeof current.profile.totalLv === 'number' || captionSwap.preset) && (
+                <span className={`shrink-0 px-2 py-1 text-[11px] font-black leading-none text-white rounded-lg ${captionSwap.preset ? 'cursor-pointer' : ''}`}
+                      style={p3 ? { background: P3R.blue, borderRadius: 0, clipPath: slantClip(6) } : isP5 ? { background: '#c00008', borderRadius: 0, boxShadow: '0 0 0 2px #f0e9df' } : isP4 ? { background: 'var(--p4-orange, #f9a11b)', borderRadius: 8 } : { background: 'var(--color-primary)' }}
+                      {...swapTagProps(captionSwap, `LV ${current.profile.totalLv ?? ''}`)}>
+                  <SwapFaces swap={captionSwap} lv={<>LV {current.profile.totalLv ?? '—'}</>} />
+                </span>
+              )}
+            </div>
+            {/* 原来这里是一行"翻面可祈愿、递出 COOP 契约…"的操作说明——牌背上写着同样的按钮，
+                这行等于把说明书摊在墙上。换成真正有时效的那一件事：对方今天为我祈过、我还没回。
+                回敬之后自然消失。 */}
+            {current.prayer?.waitingReciprocity && !current.prayer.alreadyPrayed && (
+              <p className="mx-auto mt-2 max-w-[21rem] text-[12px] font-black leading-relaxed"
+                 style={{ color: isP4 ? '#b26a00' : isP5 ? '#c00008' : p3 ? P3R.magenta : 'var(--color-primary)' }}>
+                ✦ 今日未回应对方祈愿
+              </p>
+            )}
+          </div>
+        ) : p3 ? (
+          <>
+          <motion.div
+            key={current.id}
+            initial={{ opacity: 0, y: 16 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ type: 'spring', stiffness: 300, damping: 26 }}
+            className="text-center"
+          >
+            {/* 牌位眉签：罗马 · 牌名 · 正逆 */}
+            <div className="flex items-center justify-center gap-2 text-[12px] font-black tracking-[0.14em]" style={{ color: P3R.blue }}>
+              <span aria-hidden className="flex items-center gap-[3px]">
+                <span className="h-0 w-0 border-y-[4px] border-y-transparent border-r-[6px]" style={{ borderRightColor: P3R.cyan }} />
+                <span className="h-0 w-0 border-y-[4px] border-y-transparent border-l-[6px]" style={{ borderLeftColor: P3R.cyan }} />
+              </span>
+              {TAROT_BY_ID[current.arcanaId]?.roman ? `${TAROT_BY_ID[current.arcanaId]?.roman} · ` : ''}
+              {TAROT_BY_ID[current.arcanaId]?.name}
+              {current.orientation === 'reversed' ? ' · 逆位' : ' · 正位'}
+            </div>
+            {/* 名字大字 + 蓝斜片（放大、放宽 max-w 防右截断） */}
+            <div className="mt-1.5 flex items-center justify-center gap-2.5">
+              <span aria-hidden className="h-[34px] w-[9px] shrink-0" style={{ background: P3R.blue, transform: 'skewX(-18deg)' }} />
+              {/* pr-[0.18em]：Arial Black 斜体的字形会探出自己的内容盒，truncate 的
+                  overflow:hidden 正好贴着盒切，末字右侧就少一刀。留一点右内边距，
+                  让它裁的是空白而不是笔画。 */}
+              <h3 className="max-w-[80%] truncate pr-[0.18em] text-[40px] font-black italic leading-tight" style={{ color: P3R.ink, fontFamily: '"Noto Sans SC Black", "Velvet Sans SC", sans-serif' }}>
+                {current.name}
+              </h3>
+            </div>
+            {/* LV 蓝斜块（洋红角）+ 属性青斜块 */}
+            <div className="mt-2.5 flex items-center justify-center gap-2">
+              <span className={`relative inline-flex items-center px-4 py-1 text-white ${captionSwap.preset ? 'cursor-pointer' : ''}`} style={{ clipPath: slantClip(8), background: P3R.blue }}
+                    {...swapTagProps(captionSwap, `LV ${current.intimacy}`)}>
+                <SwapFaces
+                  swap={captionSwap}
+                  statusClassName="text-[13px] font-black italic"
+                  lv={<><span className="text-[11px] font-black tracking-wider text-white/85">LV</span><span className="ml-1 text-[18px] font-black italic leading-none tabular-nums">{current.intimacy}</span></>}
+                />
+                <span aria-hidden className="absolute -bottom-[2px] right-1 h-[5px] w-[12px]" style={{ background: P3R.magenta, clipPath: 'polygon(30% 0, 100% 0, 70% 100%, 0 100%)' }} />
+              </span>
+              {current.skillAttribute && attributeNames[current.skillAttribute] && (
+                <span className="inline-block px-3.5 py-1 text-[13px] font-black" style={{ clipPath: slantClip(8), background: P3R.cyanFaint, color: P3R.blueDeep }}>
+                  {attributeNames[current.skillAttribute]}
+                </span>
+              )}
+            </div>
+            {/* 关系描述 */}
+            {current.description && (
+              <p className="mx-auto mt-2.5 line-clamp-2 max-w-[21rem] text-[13px] font-semibold leading-relaxed" style={{ color: P3R.inkSoft }}>
+                {current.description}
+              </p>
+            )}
+          </motion.div>
+          </>
+        ) : (
+          <div className="text-center">
+            {/* eyebrow：牌名 · 罗马数 · 正逆位（P4 = 蓝色粗字，p4-cooperation-reference-v2） */}
+            <div
+              className={
+                isP4
+                  ? 'text-[13px] font-black tracking-[0.14em] text-[var(--ui-accent)]'
+                  : isP5
+                    ? 'text-[12px] font-black tracking-[0.14em]'
+                    : 'text-[11px] font-bold tracking-[0.14em] text-indigo-400 dark:text-indigo-300'
+              }
+              style={isP5 ? { color: '#d90008' } : undefined}
+            >
+              {TAROT_BY_ID[current.arcanaId]?.roman ? `${TAROT_BY_ID[current.arcanaId]?.roman} · ` : ''}
+              {TAROT_BY_ID[current.arcanaId]?.name}
+              {current.orientation === 'reversed' ? ' · 逆位' : ' · 正位'}
+            </div>
+            {/* 大名字 + RANK 徽章（P4 = 衬线大字 + 橙色斜章） */}
+            <div className="mt-0.5 flex items-center justify-center gap-2.5">
+              <motion.h3
+                key={current.id}
+                initial={{ opacity: 0, y: 4 }}
+                animate={{ opacity: 1, y: 0 }}
+                className={`max-w-[70%] truncate leading-tight ${
+                  isP4 ? 'text-[36px] font-black text-[#131313]' : 'text-[28px] font-black text-gray-900 dark:text-white'
+                }`}
+                style={isP4 ? { fontFamily: 'var(--p4-display-font, serif)' } : undefined}
+              >
+                <ConfidantNameFx
+                  waiting={!!prayerFor?.(current)?.waitingReciprocity && !prayerFor?.(current)?.alreadyPrayed}
+                  maxBond={current.intimacy >= MAX_INTIMACY}
+                >
+                  {current.name}
+                </ConfidantNameFx>
+              </motion.h3>
+              <span
+                className={`shrink-0 px-2 py-1 text-[11px] font-black leading-none text-white ${isP4 ? 'italic' : 'rounded-lg'} ${captionSwap.preset ? 'cursor-pointer' : ''}`}
+                {...swapTagProps(captionSwap, `RANK ${current.intimacy}`)}
+                style={
+                  isP4
+                    ? { background: 'var(--p4-orange, #f9a11b)', borderRadius: 8, transform: 'skewX(-8deg)', boxShadow: '0 2px 0 rgba(19,19,19,0.25)' }
+                    : isP5
+                      ? { background: '#c00008', borderRadius: 0, clipPath: 'polygon(3px 0, 100% 1px, calc(100% - 3px) 100%, 0 calc(100% - 2px))', boxShadow: '0 0 0 2px #f0e9df' }
+                      : { background: 'linear-gradient(135deg, rgb(var(--color-bond-rgb)), rgb(var(--color-bond-bright-rgb)))' }
+                }
+              >
+                <SwapFaces swap={captionSwap} lv={<>RANK {current.intimacy}</>} />
+              </span>
+            </div>
+            {/* 关系描述（此前只有蓝频道有，红/黄两套铭牌漏了这一行）。
+                颜色交给 text-gray-500：页面上的 .p5-onink / .p4-onbright 会把它
+                分别翻成纸灰 / 墨灰，正好是两个频道要的层级色。 */}
+            {current.description && (
+              <p
+                className="mx-auto mt-2 line-clamp-2 max-w-[21rem] text-[13px] font-semibold leading-relaxed text-gray-500 dark:text-gray-400"
+                style={isP4 ? { fontFamily: 'var(--p4-display-font, serif)' } : undefined}
+              >
+                {current.description}
+              </p>
+            )}
+          </div>
+        )}
+
+        {!p3 && count > 1 && (
+          <div className="mt-2">
+            <WallScrubber items={items} index={index} onJump={go} />
+          </div>
+        )}
+        {p3 ? (
+          <div className="mt-2.5 flex items-center justify-center gap-2 text-[11px] font-bold" style={{ color: P3R.blue }}>
+            <span aria-hidden className="flex items-center gap-[3px]">
+              <span className="h-0 w-0 border-y-[4px] border-y-transparent border-r-[6px]" style={{ borderRightColor: P3R.cyan }} />
+              <span className="h-0 w-0 border-y-[4px] border-y-transparent border-l-[6px]" style={{ borderLeftColor: P3R.cyan }} />
+            </span>
+            左右切换 · 单击翻面 · 下滑看档案
+          </div>
+        ) : (
+          <div className="mt-0.5 text-center text-[10px] text-gray-300 dark:text-gray-600">
+            左右切换 · 单击翻面 · 下滑看档案
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};

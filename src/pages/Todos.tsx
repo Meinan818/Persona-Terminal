@@ -1,0 +1,1841 @@
+import { motion, AnimatePresence } from 'motion/react';
+import { useMemo, useRef, useState, useEffect } from 'react';
+import { v4 as uuidv4 } from 'uuid';
+import { useAppStore, toLocalDateKey } from '@/store';
+import { useShallow } from 'zustand/react/shallow';
+import { OrgOpTodoTag, PactTodoTag } from '@/components/cooperation/PactTag';
+import { DeadlineTag } from '@/components/todo/DeadlineTag';
+import { WishBoard, useWishPane, wishSkinFor } from '@/components/wish/WishBoard';
+import { PaneSwapMark } from '@/components/wish/PaneSwapMark';
+import { BufferedTextInput } from '@/components/ui/BufferedTextInput';
+import { minimalStep } from '@/utils/minimalStep';
+import { BigDealPanel } from '@/components/bigdeal/BigDealPanel';
+import { BigDealHomeCard } from '@/components/bigdeal/BigDealHomeCard';
+import { FateDrawSheet } from '@/components/fate/FateDrawSheet';
+import { QuestBoardSheet, useQuestBoard } from '@/components/quests/QuestBoardSheet';
+import { AttributeId, Todo, TodoFrequency } from '@/types';
+import { useCloudSocialStore } from '@/store/cloudSocial';
+import { isPactLive } from '@/utils/pactLogic';
+import { OP_KIND_LABEL, opProgress } from '@/utils/orgOps';
+import { goBondView } from '@/components/org/BondTitle';
+import { triggerSuccessFeedback, triggerNavFeedback } from '@/utils/feedback';
+import { TAP } from '@/utils/motion';
+import { GoalDeck } from '@/components/weeklyGoal/GoalDeck';
+// ── 行动域统一基元（UI_AUDIT_V2.5.md §3.2 + §4.6 交互协议）──
+import { Toggle } from '@/components/Toggle';
+import { Stepper } from '@/components/Stepper';
+import { EmptyState } from '@/components/EmptyState';
+import { ListCard } from '@/components/ListCard';
+import { ActionSheet } from '@/components/ActionSheet';
+import { ConfirmDialog } from '@/components/ConfirmDialog';
+import { SheetModal } from '@/components/SheetModal';
+import { ArchiveIcon, EditIcon, RestoreIcon, TrashIcon } from '@/components/icons';
+import { useUiChannel } from '@/ui/useUiChannel';
+import { P4CountPill, P4EmptyBloom, P4SectionTitle, P4Sparkle } from '@/ui/p4Kit';
+import { BigSlantTitle, GhostWords, P3EmptySlab, P3R, SlantButton } from '@/components/p3r/kit';
+import { roughQuad, P5Wedge, P5Chip, P5StarFab } from '@/components/p5r/kit';
+import { extractScheduleFromImage, type ScheduleIntakeItem } from '@/utils/visionIntake';
+import { readAsDataUrl, downscaleDataUrl } from '@/utils/imageCrop';
+import { getVisionAIConfig } from '@/utils/aiClient';
+
+const weekdayLabels = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+
+// 今日任务卡：长按 = 唤出上下文菜单（§4.6 协议，不再直接进编辑）
+const ActiveTodoCard = ({
+  todo,
+  progress,
+  attrName,
+  allAttrNames,
+  pct,
+  onOpenMenu,
+  onArchive,
+  renderFrequencyBadge,
+}: {
+  todo: ReturnType<typeof useAppStore.getState>['todos'][number];
+  progress: { count: number; target: number; isComplete: boolean };
+  attrName: string;
+  allAttrNames: Record<string, string>;
+  pct: number;
+  onOpenMenu: (id: string) => void;
+  onArchive: (id: string) => void;
+  renderFrequencyBadge: (frequency: import('@/types').TodoFrequency, targetCount?: number, isLongTerm?: boolean) => string;
+}) => {
+  // 按压期提示：ListCard 不外露 pressing 态，外层 wrapper 旁观指针起落自行维护
+  //（只旁观不拦截，事件照常冒泡给 ListCard 的长按计时；菜单弹出时由回调强制收起，防残留）
+  const [pressHint, setPressHint] = useState(false);
+  const hideHint = () => setPressHint(false);
+
+  return (
+    <div
+      onPointerDown={(e) => {
+        // 与 useLongPress 同口径：鼠标右键/中键不算按压
+        if (e.pointerType === 'mouse' && e.button !== 0) return;
+        setPressHint(true);
+      }}
+      onPointerUp={hideHint}
+      onPointerCancel={hideHint}
+      onPointerLeave={hideHint}
+    >
+    {/* 重要性表达 = 左强调条 + 现有 ⭐pill（amber 满底填充取消，向 Activities 的强调条语言看齐） */}
+    <ListCard
+      accent={todo.important ? 'bg-amber-400' : undefined}
+      onLongPress={() => {
+        hideHint();
+        onOpenMenu(todo.id);
+      }}
+    >
+      <div className="flex items-start justify-between gap-2">
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-1.5 flex-wrap mb-1">
+            {todo.important && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-400/20 text-amber-700 dark:text-amber-300 font-semibold">⭐ 重要</span>
+            )}
+            {todo.fateDrawnDate === toLocalDateKey() && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-primary/15 text-primary font-semibold">✦ 签</span>
+            )}
+            <PactTodoTag todo={todo} />
+            <OrgOpTodoTag todo={todo} />
+            <DeadlineTag todo={todo} done={progress.isComplete} />
+            <h4 className="font-semibold text-sm text-gray-800 dark:text-white truncate">{todo.title}</h4>
+          </div>
+          <div className="flex items-center gap-1.5 flex-wrap">
+            {/* 主属性 */}
+            <span className="text-[10px] text-gray-400 dark:text-gray-500">{attrName} +{todo.points}</span>
+            {/* 额外属性加成 */}
+            {todo.extraBoosts && todo.extraBoosts.map((b, i) => (
+              <span key={i} className="text-[10px] text-gray-400 dark:text-gray-500">
+                {allAttrNames[b.attribute] ?? b.attribute} +{b.points}
+              </span>
+            ))}
+            <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-primary/10 text-primary">
+              {renderFrequencyBadge(todo.frequency, todo.targetCount, todo.isLongTerm)}
+            </span>
+            {todo.repeatDaily && !todo.isLongTerm && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">每日</span>
+            )}
+            {todo.weekdays && todo.weekdays.length > 0 && (
+              <span className="text-[10px] text-gray-400 dark:text-gray-500">{todo.weekdays.map((d: number) => weekdayLabels[d]).join(' ')}</span>
+            )}
+          </div>
+        </div>
+        <div className="flex items-center gap-1 flex-shrink-0">
+          {/* 归档（不启用）按钮；约定 / 作战的待办跟着约定 / 作战走，不能手动归档（第 8 轮） */}
+          {!isLinkedTodo(todo) && (
+          <button
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={() => onArchive(todo.id)}
+            className="w-7 h-7 rounded-full bg-gray-100 dark:bg-gray-700 flex items-center justify-center text-gray-500 dark:text-gray-400 hover:bg-orange-100 dark:hover:bg-orange-900/30 hover:text-orange-500 transition-colors"
+            title="归档（不启用）"
+          >
+            <ArchiveIcon />
+          </button>
+          )}
+        </div>
+      </div>
+      {/* Progress bar */}
+      <div className="mt-2.5">
+        <div className="flex items-center justify-between text-[10px] text-gray-400 dark:text-gray-500 mb-1">
+          <span>{todo.isLongTerm ? '长期进度' : '今日进度'}</span>
+          <span>{progress.count}/{progress.target}</span>
+        </div>
+        <div className="h-1.5 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
+          <motion.div
+            className="h-full bg-primary rounded-full"
+            initial={{ width: 0 }}
+            animate={{ width: `${pct}%` }}
+            transition={{ duration: 0.5, ease: 'easeOut' }}
+          />
+        </div>
+      </div>
+      {pressHint && (
+        <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-1.5 text-center">长按打开菜单</p>
+      )}
+    </ListCard>
+    </div>
+  );
+};
+
+// ── PendingWeekdayTodoCard（日期未到，在归档区显示）：长按同款菜单 ───────────
+const PendingWeekdayTodoCard = ({
+  todo,
+  attrName,
+  onOpenMenu,
+  onArchive,
+  onDelete,
+  renderFrequencyBadge,
+}: {
+  todo: ReturnType<typeof useAppStore.getState>['todos'][number];
+  attrName: string;
+  onOpenMenu: (id: string) => void;
+  onArchive: (id: string) => void;
+  /** 快捷删除钮：交给页面级 ConfirmDialog 二段确认（§4.6 删除协议） */
+  onDelete: (id: string) => void;
+  renderFrequencyBadge: (frequency: import('@/types').TodoFrequency, targetCount?: number, isLongTerm?: boolean) => string;
+}) => {
+  // 同 ActiveTodoCard：wrapper 旁观指针起落，维护"长按打开菜单"提示
+  const [pressHint, setPressHint] = useState(false);
+  const hideHint = () => setPressHint(false);
+
+  return (
+    <div
+      onPointerDown={(e) => {
+        if (e.pointerType === 'mouse' && e.button !== 0) return;
+        setPressHint(true);
+      }}
+      onPointerUp={hideHint}
+      onPointerCancel={hideHint}
+      onPointerLeave={hideHint}
+    >
+    {/* 未到日期 = dimmed 降明度（统一替代旧的灰底 + opacity-75 自绘） */}
+    <ListCard
+      dimmed
+      onLongPress={() => {
+        hideHint();
+        onOpenMenu(todo.id);
+      }}
+    >
+      <div className="flex items-start justify-between gap-2">
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-1.5 flex-wrap mb-1">
+            {/* 未到日期标签 */}
+            <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400 font-medium">
+              {todo.startDate ? `📅 ${todo.startDate} 启用` : '📅 未到日期'}
+            </span>
+            {todo.important && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-400/20 text-amber-700 dark:text-amber-300">⭐</span>
+            )}
+            <h4 className="font-semibold text-sm text-gray-500 dark:text-gray-400 truncate">{todo.title}</h4>
+          </div>
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span className="text-[10px] text-gray-400 dark:text-gray-500">{attrName} +{todo.points}</span>
+            <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-gray-200/60 dark:bg-gray-700/60 text-gray-400 dark:text-gray-500">
+              {renderFrequencyBadge(todo.frequency, todo.targetCount, todo.isLongTerm)}
+            </span>
+            {todo.weekdays && todo.weekdays.length > 0 && (
+              <span className="text-[10px] text-gray-400 dark:text-gray-500">
+                {todo.weekdays.map((d: number) => weekdayLabels[d]).join(' ')}
+              </span>
+            )}
+          </div>
+        </div>
+        {!isLinkedTodo(todo) && (
+        <div className="flex items-center gap-1 flex-shrink-0">
+          {/* 归档（禁用）按钮 */}
+          <button
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={() => onArchive(todo.id)}
+            className="w-7 h-7 rounded-full bg-gray-100 dark:bg-gray-700 flex items-center justify-center text-gray-400 dark:text-gray-500 hover:bg-orange-100 dark:hover:bg-orange-900/30 hover:text-orange-500 transition-colors"
+            title="归档"
+          >
+            <ArchiveIcon />
+          </button>
+          {/* 彻底删除：唤起页面级 ConfirmDialog（旧"二次点按确认"机制已移除） */}
+          <button
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={() => onDelete(todo.id)}
+            className="w-7 h-7 rounded-full flex items-center justify-center transition-colors bg-red-50 dark:bg-red-900/20 text-red-400 hover:bg-red-100 dark:hover:bg-red-900/40"
+            title="删除"
+          >
+            <TrashIcon />
+          </button>
+        </div>
+        )}
+      </div>
+      {pressHint && (
+        <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-1.5 text-center">长按打开菜单</p>
+      )}
+    </ListCard>
+    </div>
+  );
+};
+
+/** 跟着「一起进步」约定或组织作战走的待办：标题、日期、归档 / 删除都由约定 / 作战决定（第 8 轮顺带修） */
+const isLinkedTodo = (t: Pick<import('@/types').Todo, 'pact' | 'orgOp'>): boolean => !!t.pact || !!t.orgOp;
+
+const ATTR_IDS: AttributeId[] = ['knowledge', 'guts', 'dexterity', 'kindness', 'charm'];
+
+// 行动页子视图（任务）：页头/页级转场由宿主 Actions.tsx 承担，本组件只渲染内容
+export const TodosView = () => {
+  const { todos, settings, attributes, addTodo, updateTodo, deleteTodo, getTodayTodoProgress, getTodoDateLabel, weeklyGoals, saveWeeklyGoal, deleteWeeklyGoal, completeWeeklyGoal, getWeeklyGoalProgress, undoTodayTodoCompletion, addWish, wishes, setWishStatus} = useAppStore(useShallow(s => ({ todos: s.todos, settings: s.settings, attributes: s.attributes, addTodo: s.addTodo, updateTodo: s.updateTodo, deleteTodo: s.deleteTodo, getTodayTodoProgress: s.getTodayTodoProgress, getTodoDateLabel: s.getTodoDateLabel, weeklyGoals: s.weeklyGoals, saveWeeklyGoal: s.saveWeeklyGoal, deleteWeeklyGoal: s.deleteWeeklyGoal, completeWeeklyGoal: s.completeWeeklyGoal, getWeeklyGoalProgress: s.getWeeklyGoalProgress, undoTodayTodoCompletion: s.undoTodayTodoCompletion, addWish: s.addWish, wishes: s.wishes, setWishStatus: s.setWishStatus })));
+  const channel = useUiChannel();
+  const isP4 = channel === 'p4';
+  // P5R：红主题 FAB 换八角红块（p5-menu 稿「+」形制）
+  const p5 = channel === 'p5';
+  // P3R（蓝主题）形态：设计稿 p3-actions-reference-v3——节直接铺水面底、大斜体节题、浅青空态板
+  const p3 = channel === 'p3';
+  const [showAdd, setShowAdd] = useState(false);
+
+  // ── 📷 课表/日程照片批量导入（FS3.4-②，走视觉档）────────────────────────────
+  // 拍/选一张课表 → 视觉模型解析成 {事项, 星期, 时间} 清单 → 勾选确认 → 批量建任务。
+  // 星期条目建为周重复任务（weekdays），无星期信息的建为每日重复。
+  const scheduleVision = !!getVisionAIConfig(settings);
+  const scheduleFileRef = useRef<HTMLInputElement | null>(null);
+  const [scheduleBusy, setScheduleBusy] = useState(false);
+  const [scheduleErr, setScheduleErr] = useState<string | null>(null);
+  const [scheduleItems, setScheduleItems] = useState<Array<ScheduleIntakeItem & { on: boolean }> | null>(null);
+  const [scheduleAttr, setScheduleAttr] = useState<AttributeId>('knowledge');
+
+  const handleScheduleShot = async (f: File) => {
+    if (scheduleBusy) return;
+    setScheduleBusy(true);
+    setScheduleErr(null);
+    try {
+      const raw = await readAsDataUrl(f);
+      const dataUrl = await downscaleDataUrl(raw);
+      const items = await extractScheduleFromImage(dataUrl, settings);
+      if (!items.length) {
+        setScheduleErr('这张图里没读出可导入的条目——换一张更清晰/更正的试试');
+      } else {
+        setScheduleItems(items.map(it => ({ ...it, on: true })));
+        setShowAdd(false);
+      }
+    } catch (e) {
+      setScheduleErr(e instanceof Error ? e.message : '解析失败，稍后再试');
+    } finally {
+      setScheduleBusy(false);
+    }
+  };
+
+  const importingRef = useRef(false);
+  const importSchedule = async () => {
+    // 连点两下会建两遍同样的任务：导入期间忽略后续点击
+    if (importingRef.current) return;
+    importingRef.current = true;
+    try {
+      await importScheduleInner();
+    } finally {
+      importingRef.current = false;
+    }
+  };
+  const importScheduleInner = async () => {
+    const sel = (scheduleItems ?? []).filter(i => i.on);
+    for (const it of sel) {
+      await addTodo({
+        title: (it.time ? `${it.time} ${it.title}` : it.title).slice(0, 30),
+        attribute: scheduleAttr,
+        points: 1,
+        frequency: 'single' as TodoFrequency,
+        repeatDaily: it.weekdays.length === 0,
+        weekdays: it.weekdays,
+        isActive: true,
+      });
+    }
+    setScheduleItems(null);
+    if (sel.length) triggerSuccessFeedback();
+  };
+  /**
+   * 「今日任务 ⇄ 愿望」（PRD_V2.6 §1.1，位置修正：在**行动-任务**里而不是首页）。
+   * 切到愿望后：抽签入口与任务列表让位给 WishBoard，右下 FAB 同步变成「添加愿望」。
+   */
+  const { isWishPane, togglePane, paneLabel, activeWishCount } = useWishPane();
+  const wishSkin = wishSkinFor(p5 ? 'p5' : isP4 ? 'p4' : p3 ? 'p3' : 'neutral');
+  const [wishAddOpen, setWishAddOpen] = useState(false);
+  const [wishDraft, setWishDraft] = useState('');
+  const [editingTodoId, setEditingTodoId] = useState<string | null>(null);
+  /** 表单模式（三段式表单第二段）：single/count 映射 frequency；big = BIG DEAL（frequency 恒 single） */
+  const emptyForm = {
+    title: '',
+    mode: 'single' as 'single' | 'count' | 'big',
+    attribute: 'knowledge' as AttributeId,
+    points: 2,
+    extraBoosts: [] as Array<{ attribute: AttributeId; points: number }>,
+    targetCount: 1,
+    repeatDaily: false,
+    isLongTerm: false,
+    weekdays: [] as number[],
+    isActive: true,
+    important: false,
+    startDate: '' as string,
+    // BIG DEAL 专属
+    currentState: '' as string,
+    deadline: '' as string,
+    steps: [] as Array<{ id?: string; title: string; attribute?: AttributeId; done?: boolean; doneAt?: string; source: 'manual' | 'ai' }>,
+  };
+  const [form, setForm] = useState(emptyForm);
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
+
+  const todayWeekday = new Date().getDay();
+  const todayDateKey = toLocalDateKey();
+  // 今日进度按 id 建一次 Map（第 4 轮）：以前每一行都调 getTodayTodoProgress（内部各 find 一遍）
+  const todoCompletionsForProgress = useAppStore(s => s.todoCompletions);
+  const progressById = useMemo(
+    () => new Map(todos.map(t => [t.id, getTodayTodoProgress(t.id)])),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [todos, todoCompletionsForProgress, todayDateKey],
+  );
+  const progressOf = (id: string) => progressById.get(id) ?? getTodayTodoProgress(id);
+  const activeTodos = useMemo(() => {
+    const active = todos.filter(t => {
+      if (!t.isActive) return false;
+      // 未来启用日期的任务不出现在今日任务
+      if (t.startDate && t.startDate > todayDateKey) return false;
+      const matchesWeekday = !t.weekdays || t.weekdays.length === 0 || t.weekdays.includes(todayWeekday);
+      return matchesWeekday;
+    });
+    // BIG DEAL 恒在最上（PRD_V2.6 §2.1），其次重要任务。
+    // 这一页是 BigDealHomeCard **唯一真正执行过**的渲染点（三个 Dashboard 那边
+    // 曾被 filter 整个滤掉），但这里偏偏没有置顶——于是十来条日常里，大事就沉在
+    // 中间，卡片式样跟普通行差不多，用户「反正就是没看到」的第二重原因。
+    return [...active].sort((a, b) => {
+      if (a.isBigDeal && !b.isBigDeal) return -1;
+      if (!a.isBigDeal && b.isBigDeal) return 1;
+      if (a.important && !b.important) return -1;
+      if (!a.important && b.important) return 1;
+      return 0;
+    });
+  }, [todos, todayWeekday, todayDateKey]);
+
+  /** 未到日期的任务：startDate 在未来，或 isActive 但今天不是指定的星期几 */
+  const pendingDateTodos = useMemo(() =>
+    todos.filter(t =>
+      t.isActive && (
+        (t.startDate && t.startDate > todayDateKey) ||
+        (t.weekdays && t.weekdays.length > 0 && !t.weekdays.includes(todayWeekday))
+      )
+    ),
+  [todos, todayWeekday, todayDateKey]);
+
+  /** 已完成的归档任务（按完成时间倒序） */
+  const completedArchivedTodos = useMemo(() =>
+    todos.filter(t => !t.isActive && t.completedAt)
+      .sort((a, b) => new Date(b.completedAt!).getTime() - new Date(a.completedAt!).getTime()),
+  [todos]);
+  /** 手动归档（未启用）的任务 */
+  const inactiveArchivedTodos = useMemo(() => todos.filter(t => !t.isActive && !t.completedAt), [todos]);
+  const [expandCompleted, setExpandCompleted] = useState(false);
+  /** 离场的愿望（已实现 / 已收起），进归档区展示 */
+  const archivedWishes = useMemo(
+    () => wishes.filter(w => !w.parentId && w.status !== 'active')
+      .sort((a, b) => new Date(b.fulfilledAt ?? b.archivedAt ?? b.createdAt).getTime()
+                    - new Date(a.fulfilledAt ?? a.archivedAt ?? a.createdAt).getTime()),
+    [wishes],
+  );
+
+  // ── §4.6 交互协议状态 ──
+  //   menuTodoId      长按菜单的目标任务：单个 ActionSheet 按 id 寻址，所有卡共用
+  //   pendingDeleteId 待删除任务：单个 ConfirmDialog 二段确认，
+  //                   替代旧"3 秒内再点一次"机制（confirmDeleteId/Timer 已整体移除）
+  const [menuTodoId, setMenuTodoId] = useState<string | null>(null);
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
+  const menuTodo = menuTodoId ? todos.find(t => t.id === menuTodoId) : undefined;
+  const pendingDeleteTodo = pendingDeleteId ? todos.find(t => t.id === pendingDeleteId) : undefined;
+
+  const resetForm = () => {
+    setForm(emptyForm);
+    setAiError(null);
+    setShowMore(false);
+  };
+
+  /** 统一关闭表单弹窗：SheetModal 的 backdrop/ESC/Android back 与"取消"按钮共用同一条路径 */
+  const closeForm = () => {
+    setShowAdd(false);
+    setEditingTodoId(null);
+    resetForm();
+  };
+
+  /** 更多设置折叠区（重要/每日/截止日/周几/启用/启用日期）；编辑带非默认值的任务时自动展开 */
+  const [showMore, setShowMore] = useState(false);
+  /** BIG DEAL 二级面板（聚合卡点击落点） */
+  const [dealPanelId, setDealPanelId] = useState<string | null>(null);
+  /** 抽签仪式面板 */
+  const [fateOpen, setFateOpen] = useState(false);
+  // 委托板（第 6 轮）：解锁后与抽签并排；周一后第一次进任务页顺手刷新
+  const [questOpen, setQuestOpen] = useState(false);
+  const questBoard = useQuestBoard();
+  const refreshQuests = useAppStore((s) => s.refreshQuests);
+  useEffect(() => { if (questBoard.unlocked) void refreshQuests(); }, [questBoard.unlocked, refreshQuests]);
+  /**
+   * 正在编辑的是约定（一起进步）或组织作战的待办：标题、每日重置、截止日、周几、启用日期、是否启用都由约定 / 作战决定，表单里锁住
+   * （改了会让约定打不了卡；改了标题「撤销完成」就找不到那条记录——第 8 轮顺带修）。属性、分值、重要照常能改。
+   */
+  const editingPactTodo = editingTodoId ? todos.find(t => t.id === editingTodoId && isLinkedTodo(t)) : undefined;
+  // 约定 / 作战还在进行中吗（删掉已完成的那条会被对账重新建出来，只有结束了的才给删）；没拉到时当作还在进行
+  const pacts = useCloudSocialStore(s => s.pacts);
+  const pactsLoaded = useCloudSocialStore(s => s.pactsLoaded);
+  const orgViews = useCloudSocialStore(s => s.orgs);
+  const orgsLoaded = useCloudSocialStore(s => s.orgsLoaded);
+  const linkLive = (t: Todo): boolean => {
+    if (t.pact) {
+      if (!pactsLoaded) return true;
+      const pact = pacts.find(x => x.id === t.pact!.id);
+      return !!pact && isPactLive(pact);
+    }
+    if (t.orgOp) {
+      const v = orgViews.find(x => x.org.id === t.orgOp!.orgId);
+      const op = v?.ops?.find(x => x.id === t.orgOp!.opId);
+      // 组织还没拉到 / 作战还没拉到：当作还在进行；组织拉到了、这个组织已经不在了：当作结束
+      if (!v) return !orgsLoaded;
+      if (!v.ops) return true;
+      return !!op && opProgress(v, op).status === 'active';
+    }
+    return false;
+  };
+  /** 作战已经达成：那一条的完成不能再撤（服务器上的打卡已经定下来了） */
+  const opAchieved = (t: Todo): boolean => {
+    if (!t.orgOp) return false;
+    const v = orgViews.find(x => x.org.id === t.orgOp!.orgId);
+    const op = v?.ops?.find(x => x.id === t.orgOp!.opId);
+    return !!v && !!op && opProgress(v, op).status === 'achieved';
+  };
+  const openLinked = (t: Todo) => {
+    if (t.orgOp) {
+      useCloudSocialStore.getState().setHideoutOrgId(t.orgOp.orgId);
+      goBondView('orgs');
+      useCloudSocialStore.getState().setHideoutSection('ops');
+    } else {
+      useAppStore.getState().setCurrentPage('cooperation');
+    }
+  };
+
+  const handleSave = async () => {
+    if (!form.title.trim()) return;
+    const isBig = form.mode === 'big';
+    const pactLocked = !!editingPactTodo;
+    const validExtraBoosts = form.extraBoosts
+      .filter(b => b.points >= 1)
+      .map(b => ({ attribute: b.attribute, points: Math.max(1, Math.min(5, b.points)) }));
+    const payload = {
+      title: pactLocked ? editingPactTodo!.title : form.title.trim(),
+      attribute: form.attribute,
+      points: Math.max(1, Math.min(5, form.points)),
+      extraBoosts: validExtraBoosts.length > 0 ? validExtraBoosts : undefined,
+      frequency: (form.mode === 'count' ? 'count' : 'single') as TodoFrequency,
+      targetCount: form.mode === 'count' ? Math.max(1, form.targetCount) : undefined,
+      repeatDaily: isBig ? false : pactLocked ? !!editingPactTodo?.repeatDaily : form.repeatDaily,
+      isLongTerm: form.mode === 'count' ? form.isLongTerm : false,
+      weekdays: isBig ? [] : pactLocked ? (editingPactTodo?.weekdays ?? []) : form.weekdays.sort(),
+      isActive: pactLocked ? editingPactTodo!.isActive : form.isActive,
+      important: form.important,
+      startDate: pactLocked ? editingPactTodo?.startDate : form.startDate || undefined,
+      // BIG DEAL：已有子步保留 id/done/doneAt（编辑不清进度），新行补 uuid
+      isBigDeal: isBig || undefined,
+      currentState: isBig ? form.currentState.trim() || undefined : undefined,
+      // 截止日：BIG DEAL 的软时限，或单次 / 计数任务的 DDL（与每日重置互斥，勾了每日重置就不存）；约定待办原样保留
+      deadline: pactLocked
+        ? editingPactTodo?.deadline
+        : (isBig || !form.repeatDaily) && form.deadline ? form.deadline : undefined,
+      steps: isBig
+        ? form.steps
+            .map(s => ({ ...s, title: s.title.trim() }))
+            .filter(s => s.title)
+            .map(s => ({ id: s.id ?? uuidv4(), title: s.title, attribute: s.attribute, done: s.done, doneAt: s.doneAt, source: s.source }))
+        : undefined,
+    };
+
+    if (editingTodoId) {
+      await updateTodo(editingTodoId, payload);
+      setEditingTodoId(null);
+    } else {
+      await addTodo(payload);
+    }
+    setShowAdd(false);
+    resetForm();
+  };
+
+  const handleEdit = (todoId: string) => {
+    const todo = todos.find(t => t.id === todoId);
+    if (!todo) return;
+    setEditingTodoId(todoId);
+    setForm({
+      title: todo.title,
+      mode: todo.isBigDeal ? 'big' : todo.frequency === 'count' ? 'count' : 'single',
+      attribute: todo.attribute,
+      points: todo.points,
+      extraBoosts: todo.extraBoosts ? [...todo.extraBoosts] : [],
+      targetCount: todo.targetCount || 1,
+      repeatDaily: !!todo.repeatDaily,
+      isLongTerm: !!todo.isLongTerm,
+      weekdays: todo.weekdays || [],
+      isActive: todo.isActive,
+      important: !!todo.important,
+      startDate: todo.startDate || '',
+      currentState: todo.currentState || '',
+      deadline: todo.deadline || '',
+      steps: (todo.steps ?? []).map(s => ({ ...s })),
+    });
+    setAiError(null);
+    setShowMore(!!(todo.important || todo.repeatDaily || (todo.weekdays?.length ?? 0) > 0 || !todo.isActive || todo.startDate || (todo.deadline && !todo.isBigDeal)));
+    setShowAdd(true);
+  };
+
+  /** BIG DEAL「帮我拆」：复用 decomposeWishAI（伪 Wish 树），失败落一条离线模板步 */
+  const runFormAI = async () => {
+    const title = form.title.trim();
+    if (!title || aiBusy) return;
+    setAiBusy(true);
+    setAiError(null);
+    try {
+      const parent = {
+        id: 'draft',
+        title,
+        kind: (form.deadline ? 'pressure' : 'long_term') as 'pressure' | 'long_term',
+        currentState: form.currentState.trim() || undefined,
+        status: 'active' as const,
+        source: 'manual' as const,
+        createdAt: new Date(),
+      };
+      const children = form.steps
+        .filter(s => s.title.trim())
+        .map((s, i) => ({
+          id: s.id ?? `draft-${i}`,
+          parentId: 'draft',
+          title: s.title.trim(),
+          status: (s.done ? 'done' : 'active') as 'done' | 'active',
+          source: s.source,
+          createdAt: new Date(),
+        }));
+      const list = await useAppStore.getState().decomposeWishAI(parent, children);
+      if (list.length === 0) {
+        setAiError('这次没拆出能用的小步。换个说法，或手写一条吧');
+      } else {
+        setForm(prev => ({ ...prev, steps: [...prev.steps, ...list.map(t => ({ title: t, source: 'ai' as const }))] }));
+      }
+    } catch {
+      // 无 Key / 网络失败 → 离线模板兜底一条
+      const fallback = minimalStep(useAppStore.getState().user?.theme, title);
+      setForm(prev => ({ ...prev, steps: [...prev.steps, { title: fallback, source: 'manual' as const }] }));
+      setAiError('AI 未接通，先放了一条离线拆步——可改可删');
+    } finally {
+      setAiBusy(false);
+    }
+  };
+
+  const toggleWeekday = (day: number) => {
+    setForm(prev => {
+      const exists = prev.weekdays.includes(day);
+      const updated = exists ? prev.weekdays.filter(d => d !== day) : [...prev.weekdays, day];
+      return { ...prev, weekdays: updated };
+    });
+  };
+
+  const renderFrequencyBadge = (frequency: TodoFrequency, targetCount?: number, isLongTerm?: boolean) => {
+    if (frequency === 'single') return '单次';
+    if (frequency === 'count') {
+      if (isLongTerm) return `长期 · ${targetCount || 1}次`;
+      return `多次 · ${targetCount || 1}次`;
+    }
+    return '';
+  };
+
+  return (
+    // 子视图化：页级 motion 容器（opacity 进出场）移交宿主 Actions 的 tabpanel 包装层，
+    // 自身退化为纯 div——若保留 exit 会拖长宿主 AnimatePresence mode="wait" 的 180ms 切换预算
+    <div className="space-y-6">
+      {/* ── 目标区：本周目标 / 倒计时 ───────────────────── */}
+      <GoalDeck
+        settings={settings}
+        attributes={attributes}
+        weeklyGoals={weeklyGoals}
+        saveWeeklyGoal={saveWeeklyGoal}
+        deleteWeeklyGoal={deleteWeeklyGoal}
+        completeWeeklyGoal={completeWeeklyGoal}
+        getWeeklyGoalProgress={getWeeklyGoalProgress}
+      />
+
+      <div className={isP4 ? 'grid grid-cols-1 wide-lg:grid-cols-2 gap-6' : p3 ? 'relative mt-8 space-y-10' : 'grid grid-cols-1 wide-lg:grid-cols-2 gap-4'}>
+        {p3 && <GhostWords words={['PLAN']} className="left-[6px] top-[36%] text-[84px]" />}
+        {/* 今日任务：P4 = 无卡壳，衬线区题直压黄底 + 黑胶囊计数（p4-actions-reference-v2）；p3 = 水面底大斜体节题 */}
+        <div className={isP4 ? '' : p3 ? 'relative' : p5 ? 'relative' : 'rounded-2xl bg-white dark:bg-gray-900 border border-gray-100 dark:border-gray-800 shadow-sm overflow-hidden'}>
+          {p5 ? (
+            /* p5-modal-04 稿：黑楞区标 + 右缘红计数章（坐在纸卡顶缘上） */
+            <div className="relative z-10 mb-[-6px] flex items-center justify-between pl-1 pr-2">
+              <button type="button" onClick={togglePane} aria-label={paneLabel} className="text-left">
+                <P5Wedge tone="ink" rot={-1.4}>{isWishPane ? '愿望' : '今日任务'}<PaneSwapMark tone="#c00008" /></P5Wedge>
+              </button>
+              <P5Chip tone="red" rot={1.6}>{isWishPane ? `${activeWishCount} 个` : `${activeTodos.length} 项`}</P5Chip>
+            </div>
+          ) : isP4 ? (
+            <button type="button" onClick={togglePane} aria-label={paneLabel} className="block w-full text-left">
+              <P4SectionTitle meta={<P4CountPill>{isWishPane ? `${activeWishCount} 个` : `${activeTodos.length} 项`}</P4CountPill>} className="px-1 pb-2">
+                {isWishPane ? '愿望' : '今日任务'}<PaneSwapMark tone="var(--p4-orange, #f9a11b)" />
+              </P4SectionTitle>
+            </button>
+          ) : p3 ? (
+            <button type="button" onClick={togglePane} aria-label={paneLabel} className="block w-full text-left">
+              <BigSlantTitle
+                title={isWishPane ? '愿望' : '今日任务'}
+                titleSuffix={<PaneSwapMark tone="var(--p3r-blue, #1b57ff)" />}
+                count={isWishPane ? `${activeWishCount} 个` : `${activeTodos.length} 项`}
+                className="mb-4"
+              />
+            </button>
+          ) : (
+            <div className="flex items-center justify-between px-5 pt-4 pb-3 border-b border-gray-100 dark:border-gray-800">
+              <button type="button" onClick={togglePane} aria-label={paneLabel} className="flex items-center gap-1.5 text-left">
+                <h3 className="font-bold text-gray-900 dark:text-white">{isWishPane ? '愿望' : '今日任务'}</h3>
+                <PaneSwapMark tone="var(--color-primary)" />
+              </button>
+              <span className="text-xs text-gray-400 dark:text-gray-500 bg-gray-100 dark:bg-gray-800 px-2.5 py-1 rounded-full">
+                {isWishPane ? `${activeWishCount} 个` : `${activeTodos.length} 项`}
+              </span>
+            </div>
+          )}
+          {/* 抽签入口（TASKS_MERGE_PRD §4.2）：决策短路——不知道先做哪个，交给命运单抽。
+              愿望面下隐藏：抽签抽的是"今天做什么"，与"远处的灯"不是一件事 */}
+          {!isWishPane && (
+          <div className={`mb-2 flex items-stretch gap-2 ${p3 || isP4 || p5 ? '' : 'mx-3 mt-3'}`}>
+          <button
+            type="button"
+            onClick={() => setFateOpen(true)}
+            className={`flex min-w-0 flex-1 items-center gap-2 px-3 py-2 text-left text-xs font-bold transition ${
+              p3
+                ? ''
+                : isP4
+                  // p4-onlight：纸条夜间仍是亮黄面，墨字必须钉死不随毯式翻白（白底白字，用户点名）
+                  ? 'p4-onlight rounded-full border-2 border-[#131313]/70 bg-[var(--p4-paper,#fff7b0)] text-[#131313]'
+                  : p5
+                    ? 'relative z-10 border-2 border-[#050505] bg-[#f0e9df] text-[#131313] shadow-[3px_3px_0_rgba(0,0,0,0.45)]'
+                    : 'rounded-xl border border-dashed border-gray-300 text-gray-500 dark:border-gray-600 dark:text-gray-400'
+            }`}
+            style={p3 ? { clipPath: 'polygon(10px 0, 100% 0, calc(100% - 10px) 100%, 0 100%)', background: 'var(--p3r-panel-glass, rgba(255,255,255,0.85))', color: P3R.ink, boxShadow: '0 4px 12px rgba(38,96,140,0.08)' } : undefined}
+          >
+            <span aria-hidden className={p5 ? 'text-[#c00008]' : isP4 ? 'text-[#f9a11b]' : 'text-primary'}>✦</span>
+            {/* 窄屏（和委托按钮并排时）长句会被截成「命运会…」：400px 以下换短句 */}
+            <span className="min-w-0 flex-1 truncate">
+              <span className="min-[400px]:hidden">让命运替你挑一件</span>
+              <span className="hidden min-[400px]:inline">不知道做什么好？命运会替你选择</span>
+            </span>
+            <span aria-hidden className="opacity-50">›</span>
+          </button>
+          {/* 委托板入口（第 6 轮）：角标 = 可领取张数；第 14 批：周一刷出新委托、还没打开看过时挂一个红点。第 13 轮起常驻——里面的「今日委托」不需要记录史，
+              「本周委托」没解锁时在抽屉里写明条件。
+              角标放在按钮外面那层：蓝频道按钮有斜切 clip-path，放在里面会被裁掉一角 */}
+          {(
+            <span className="relative flex shrink-0">
+            <button
+              type="button"
+              onClick={() => setQuestOpen(true)}
+              aria-label={`委托板${questBoard.claimable ? `，${questBoard.claimable} 张可领取` : questBoard.unseen ? '，本周有新委托' : ''}`}
+              className={`relative flex shrink-0 items-center gap-1.5 px-3 py-2 text-xs font-bold transition ${
+                p3
+                  ? ''
+                  : isP4
+                    ? 'p4-onlight rounded-full border-2 border-[#131313]/70 bg-[var(--p4-paper,#fff7b0)] text-[#131313]'
+                    : p5
+                      ? 'relative z-10 border-2 border-[#050505] bg-[#f0e9df] text-[#131313] shadow-[3px_3px_0_rgba(0,0,0,0.45)]'
+                      : 'rounded-xl border border-dashed border-gray-300 text-gray-500 dark:border-gray-600 dark:text-gray-400'
+              }`}
+            style={p3 ? { clipPath: 'polygon(10px 0, 100% 0, calc(100% - 10px) 100%, 0 100%)', background: 'var(--p3r-panel-glass, rgba(255,255,255,0.85))', color: P3R.ink, boxShadow: '0 4px 12px rgba(38,96,140,0.08)' } : undefined}
+            >
+              <span aria-hidden className={p5 ? 'text-[#c00008]' : isP4 ? 'text-[#f9a11b]' : 'text-primary'}>📜</span>
+              <span>委托</span>
+            </button>
+            {questBoard.claimable > 0 ? (
+              <span aria-hidden className="pointer-events-none absolute -right-1.5 -top-1.5 z-20 flex h-4 min-w-4 items-center justify-center rounded-full bg-[#e02020] px-1 text-[10px] font-black leading-none text-white">{questBoard.claimable}</span>
+            ) : questBoard.unseen ? (
+              <span aria-hidden data-testid="quest-new-dot" className="pointer-events-none absolute -right-1 -top-1 z-20 h-2.5 w-2.5 rounded-full bg-[#e02020] ring-2 ring-white dark:ring-gray-900" />
+            ) : null}
+            </span>
+          )}
+          </div>
+          )}
+          <div className={isP4 || p3 ? 'space-y-2' : p5 ? 'relative space-y-2 px-3 pb-3 pt-5' : 'p-3 space-y-2'}>
+            {p5 && (
+              <>
+                <span aria-hidden className="pointer-events-none absolute inset-0" style={{ transform: 'translate(4px,5px)', background: '#000000', clipPath: roughQuad(371, 8), zIndex: -1 }} />
+                <span aria-hidden className="pointer-events-none absolute inset-0" style={{ background: '#050505', clipPath: roughQuad(372, 7), zIndex: -1 }} />
+                <span aria-hidden className="pointer-events-none absolute inset-[3px]" style={{ background: '#f0e9df', clipPath: roughQuad(373, 5), zIndex: -1 }} />
+              </>
+            )}
+            {/* 两面切换有进出动效（PRD_V2.6 反馈 §6）：mode="wait" 让旧面先退场，
+                否则两份列表会在同一帧里叠着算高度，视觉上"抖一下"。
+                只动 opacity + x，D0 下 motion 会自动退化成直给。 */}
+            <AnimatePresence mode="wait" initial={false}>
+              {isWishPane && (
+                <motion.div
+                  key="wish-pane"
+                  initial={{ opacity: 0, x: 18 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  exit={{ opacity: 0, x: -18 }}
+                  transition={{ duration: 0.2, ease: [0.2, 0, 0.1, 1] }}
+                >
+                  <WishBoard skin={wishSkin} />
+                </motion.div>
+              )}
+            </AnimatePresence>
+            {!isWishPane && activeTodos.map(todo => {
+              // BIG DEAL：聚合卡（进度=子步派生，点击进二级面板；⋯ 走同一长按菜单）
+              if (todo.isBigDeal) {
+                return (
+                  <BigDealHomeCard
+                    key={todo.id}
+                    todo={todo}
+                    channel={p3 ? 'p3' : isP4 ? 'p4' : p5 ? 'p5' : 'plain'}
+                    onOpen={() => setDealPanelId(todo.id)}
+                    onMenu={() => setMenuTodoId(todo.id)}
+                  />
+                );
+              }
+              const progress = progressOf(todo.id);
+              const attrName = settings.attributeNames[todo.attribute];
+              const pct = Math.min(100, (progress.count / progress.target) * 100);
+              return (
+                <ActiveTodoCard
+                  key={todo.id}
+                  todo={todo}
+                  progress={progress}
+                  attrName={attrName}
+                  allAttrNames={settings.attributeNames}
+                  pct={pct}
+                  onOpenMenu={setMenuTodoId}
+                  onArchive={(id) => updateTodo(id, { isActive: false })}
+                  renderFrequencyBadge={renderFrequencyBadge}
+                />
+              );
+            })}
+            {activeTodos.length === 0 && (
+              isP4 ? <P4EmptyBloom text="还没有任务，添加一个开始吧" /> : p3 ? <P3EmptySlab /> : <EmptyState text="还没有任务，添加一个开始吧" />
+            )}
+          </div>
+        </div>
+
+        {/* 已归档 */}
+        <div className={isP4 ? '' : p3 ? 'relative' : p5 ? 'relative' : 'rounded-2xl bg-white dark:bg-gray-900 border border-gray-100 dark:border-gray-800 shadow-sm overflow-hidden'}>
+          {p5 ? (
+            <div className="relative z-10 mb-[-6px] flex items-center justify-between pl-1 pr-2">
+              <P5Wedge tone="ink" rot={-1.2}>已归档</P5Wedge>
+              <P5Chip tone="red" rot={1.4}>{completedArchivedTodos.length + inactiveArchivedTodos.length + pendingDateTodos.length} 项</P5Chip>
+            </div>
+          ) : isP4 ? (
+            <P4SectionTitle
+              meta={<P4CountPill>{completedArchivedTodos.length + inactiveArchivedTodos.length + pendingDateTodos.length} 项</P4CountPill>}
+              className="px-1 pb-2"
+            >
+              已归档
+            </P4SectionTitle>
+          ) : p3 ? (
+            <BigSlantTitle
+              title="已归档"
+              count={`${completedArchivedTodos.length + inactiveArchivedTodos.length + pendingDateTodos.length} 项`}
+              className="mb-4"
+            />
+          ) : (
+            <div className="flex items-center justify-between px-5 pt-4 pb-3 border-b border-gray-100 dark:border-gray-800">
+              <h3 className="font-bold text-gray-900 dark:text-white">已归档</h3>
+              <span className="text-xs text-gray-400 dark:text-gray-500 bg-gray-100 dark:bg-gray-800 px-2.5 py-1 rounded-full">
+                {completedArchivedTodos.length + inactiveArchivedTodos.length + pendingDateTodos.length} 项
+              </span>
+            </div>
+          )}
+          <div className={isP4 || p3 ? 'space-y-2' : p5 ? 'relative space-y-2 px-3 pb-3 pt-5' : 'p-3 space-y-2'}>
+            {p5 && (
+              <>
+                <span aria-hidden className="pointer-events-none absolute inset-0" style={{ transform: 'translate(4px,5px)', background: '#000000', clipPath: roughQuad(381, 8), zIndex: -1 }} />
+                <span aria-hidden className="pointer-events-none absolute inset-0" style={{ background: '#050505', clipPath: roughQuad(382, 7), zIndex: -1 }} />
+                <span aria-hidden className="pointer-events-none absolute inset-[3px]" style={{ background: '#f0e9df', clipPath: roughQuad(383, 5), zIndex: -1 }} />
+              </>
+            )}
+
+            {/* ── 未到日期（startDate 在未来 / 今日不在指定星期内）── */}
+            {pendingDateTodos.length > 0 && (
+              <div className="text-[10px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider px-1 pt-1 pb-0.5">未到日期</div>
+            )}
+            {pendingDateTodos.map(todo => (
+              <PendingWeekdayTodoCard
+                key={todo.id}
+                todo={todo}
+                attrName={settings.attributeNames[todo.attribute]}
+                onOpenMenu={setMenuTodoId}
+                onArchive={(id) => updateTodo(id, { isActive: false })}
+                onDelete={setPendingDeleteId}
+                renderFrequencyBadge={renderFrequencyBadge}
+              />
+            ))}
+
+            {/* ── 未启用（手动归档）── */}
+            {inactiveArchivedTodos.length > 0 && (
+              <>
+                {pendingDateTodos.length > 0 && <div className="border-t border-gray-100 dark:border-gray-800 my-1" />}
+                <div className="text-[10px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider px-1 pt-1 pb-0.5">未启用</div>
+              </>
+            )}
+            {inactiveArchivedTodos.map(todo => (
+              // 入场微动效留在外层 wrapper（ListCard 不承载动画 props）；未启用 = dimmed
+              <motion.div key={todo.id} initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }}>
+              <ListCard dimmed>
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-1.5 flex-wrap mb-1">
+                      {todo.archivedAt && getTodoDateLabel(new Date(todo.archivedAt)) && (
+                        <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-300">
+                          {getTodoDateLabel(new Date(todo.archivedAt))}
+                        </span>
+                      )}
+                      {todo.important && (
+                        <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-400/20 text-amber-700 dark:text-amber-300">⭐</span>
+                      )}
+                      <span className="font-semibold text-sm truncate text-gray-700 dark:text-gray-200">
+                        {todo.title}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span className="text-[10px] text-gray-400 dark:text-gray-500">
+                        {settings.attributeNames[todo.attribute]} +{todo.points}
+                      </span>
+                      {todo.extraBoosts && todo.extraBoosts.map((b, i) => (
+                        <span key={i} className="text-[10px] text-gray-400 dark:text-gray-500">
+                          {settings.attributeNames[b.attribute] ?? b.attribute} +{b.points}
+                        </span>
+                      ))}
+                      {todo.weekdays && todo.weekdays.length > 0 && (
+                        <span className="text-[10px] text-gray-400 dark:text-gray-500">{todo.weekdays.map(d => weekdayLabels[d]).join(' ')}</span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1 flex-shrink-0">
+                    {/* 约定 / 作战的待办：由约定 / 作战收起来的，不给编辑和恢复；结束了的可以删掉 */}
+                    {!isLinkedTodo(todo) && (
+                    <button
+                      onClick={() => handleEdit(todo.id)}
+                      className="w-7 h-7 rounded-full bg-gray-100 dark:bg-gray-700 flex items-center justify-center text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"
+                      title="编辑"
+                    >
+                      <EditIcon />
+                    </button>
+                    )}
+                    {!(isLinkedTodo(todo) && linkLive(todo)) && (
+                    <button
+                      onClick={() => setPendingDeleteId(todo.id)}
+                      className="w-7 h-7 rounded-full flex items-center justify-center transition-colors bg-red-50 dark:bg-red-900/20 text-red-400 hover:bg-red-100 dark:hover:bg-red-900/40"
+                      title="删除"
+                    >
+                      <TrashIcon />
+                    </button>
+                    )}
+                    {!isLinkedTodo(todo) && (
+                    <button
+                      onClick={() => updateTodo(todo.id, { isActive: true, archivedAt: undefined })}
+                      className="w-7 h-7 rounded-full bg-primary/10 flex items-center justify-center text-primary hover:bg-primary/20 transition-colors"
+                      title="恢复（重置为未完成）"
+                    >
+                      <RestoreIcon />
+                    </button>
+                    )}
+                  </div>
+                </div>
+              </ListCard>
+              </motion.div>
+            ))}
+
+            {/* ── 已完成 ── */}
+            {completedArchivedTodos.length > 0 && (
+              <>
+                {(pendingDateTodos.length > 0 || inactiveArchivedTodos.length > 0) && <div className="border-t border-gray-100 dark:border-gray-800 my-1" />}
+                <div className={`px-1 pt-1 pb-0.5 text-[10px] font-semibold uppercase tracking-wider ${p5 ? 'font-black' : 'text-emerald-500 dark:text-emerald-400'}`} style={p5 ? { color: '#c00008' } : undefined}>已完成</div>
+              </>
+            )}
+            {(expandCompleted ? completedArchivedTodos : completedArchivedTodos.slice(0, 5)).map(todo => {
+              const archivedProgress = progressOf(todo.id);
+              const wasCompletedToday = archivedProgress.isComplete;
+              return (
+                // 已完成 = dimmed（emerald 满底取消，完成态由 ✓ 徽章 + 删除线表达）
+                <motion.div key={todo.id} initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }}>
+                <ListCard dimmed>
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-1.5 flex-wrap mb-1">
+                        {wasCompletedToday ? (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 font-semibold">✓ 今日已完成</span>
+                        ) : (
+                          todo.completedAt && (
+                            <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
+                              ✓ {new Date(todo.completedAt).toLocaleDateString('zh-CN', { month: 'long', day: 'numeric' })}完成
+                            </span>
+                          )
+                        )}
+                        {todo.important && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-400/20 text-amber-700 dark:text-amber-300">⭐</span>
+                        )}
+                        {/* 归档区身份标签（PRD_V2.6 §2.3）：一屏几十条历史里，
+                            "这条当年是一件大事"和"这是普通待办"必须一眼分得出 */}
+                        {todo.isBigDeal && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-indigo-500/15 font-black text-indigo-600 dark:text-indigo-300">◆ BIG DEAL</span>
+                        )}
+                        {todo.wishId && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-primary/15 font-black text-primary">✦ 愿望</span>
+                        )}
+                        <span className="font-semibold text-sm truncate line-through text-gray-400 dark:text-gray-500">
+                          {todo.title}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span className="text-[10px] text-gray-400 dark:text-gray-500">
+                          {settings.attributeNames[todo.attribute]} +{todo.points}
+                        </span>
+                        {todo.extraBoosts && todo.extraBoosts.map((b, i) => (
+                          <span key={i} className="text-[10px] text-gray-400 dark:text-gray-500">
+                            {settings.attributeNames[b.attribute] ?? b.attribute} +{b.points}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1 flex-shrink-0">
+                      {!(isLinkedTodo(todo) && linkLive(todo)) && (
+                      <button
+                        onClick={() => setPendingDeleteId(todo.id)}
+                        className="w-7 h-7 rounded-full flex items-center justify-center transition-colors bg-red-50 dark:bg-red-900/20 text-red-400 hover:bg-red-100 dark:hover:bg-red-900/40"
+                        title="删除"
+                      >
+                        <TrashIcon />
+                      </button>
+                      )}
+                      {wasCompletedToday && opAchieved(todo) ? null : wasCompletedToday ? (
+                        <button
+                          // 当天的"恢复" = "撤销"：连点数 + 历史记录 + todoCompletion 一并回滚
+                          onClick={() => undoTodayTodoCompletion(todo.id)}
+                          className="w-7 h-7 rounded-full bg-primary/10 flex items-center justify-center text-primary hover:bg-primary/20 transition-colors"
+                          title="撤销今日完成（同时回退点数和记录）"
+                        >
+                          <RestoreIcon />
+                        </button>
+                      ) : (
+                        <button
+                          onClick={async () => {
+                            await addTodo({
+                              title: todo.title,
+                              attribute: todo.attribute,
+                              points: todo.points,
+                              extraBoosts: todo.extraBoosts,
+                              frequency: todo.frequency,
+                              repeatDaily: todo.repeatDaily,
+                              isLongTerm: todo.isLongTerm,
+                              targetCount: todo.targetCount,
+                              weekdays: todo.weekdays,
+                              important: todo.important,
+                              isActive: true,
+                            });
+                          }}
+                          className="w-7 h-7 rounded-full bg-primary/10 flex items-center justify-center text-primary hover:bg-primary/20 transition-colors"
+                          title="按此配置新建任务"
+                        >
+                          <svg viewBox="0 0 16 16" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="1.5">
+                            <path d="M2.5 8A5.5 5.5 0 1 1 13 5.5" strokeLinecap="round" />
+                            <path d="M13 2.5v3h-3" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </ListCard>
+                </motion.div>
+              );
+            })}
+            {completedArchivedTodos.length > 5 && (
+              <button
+                onClick={() => setExpandCompleted(v => !v)}
+                className="w-full py-1.5 text-center text-[11px] font-semibold text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300 transition-colors border-t border-dashed border-gray-200 dark:border-gray-700"
+              >
+                {expandCompleted ? '收起' : `展开全部（共 ${completedArchivedTodos.length} 项）`}
+              </button>
+            )}
+
+            {/* 离场的愿望（PRD_V2.6 §1.4）：实现的与收起的都落在这里。
+                「已实现」靠 fulfilledAt 判定而不是 status —— archivedAt 只说明"离场"，
+                分不出是达成了还是放弃了，而这两件事对用户的意义完全相反。 */}
+            {archivedWishes.length > 0 && (
+              <div className="space-y-1.5 pt-2">
+                {archivedWishes.map(w => (
+                  <ListCard key={w.id} dimmed>
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-black ${
+                        w.fulfilledAt
+                          ? 'bg-primary/15 text-primary'
+                          : 'bg-gray-400/15 text-gray-500 dark:text-gray-400'
+                      }`}>
+                        {w.fulfilledAt ? '✦ 愿望 · 已实现' : '✦ 愿望 · 已收起'}
+                      </span>
+                      <span className="min-w-0 flex-1 truncate text-sm font-semibold text-gray-400 dark:text-gray-500">
+                        {w.title}
+                      </span>
+                      {w.fulfilledAt ? (
+                        <span className="shrink-0 text-[10px] text-gray-400 dark:text-gray-500">
+                          {new Date(w.fulfilledAt).toLocaleDateString('zh-CN', { month: 'long', day: 'numeric' })}
+                        </span>
+                      ) : (
+                        // 只有「收起」的能恢复；已实现的不给回头路——
+                        // 实现是不可逆的仪式，能撤销就不成其为仪式了（要改只能删了重写）
+                        <button
+                          type="button"
+                          onClick={() => void setWishStatus(w.id, 'active')}
+                          className="shrink-0 rounded-full border border-primary/40 px-2 py-0.5 text-[10px] font-black text-primary"
+                        >
+                          恢复
+                        </button>
+                      )}
+                    </div>
+                  </ListCard>
+                ))}
+              </div>
+            )}
+
+            {completedArchivedTodos.length === 0 && inactiveArchivedTodos.length === 0 && pendingDateTodos.length === 0 && archivedWishes.length === 0 && (
+              isP4 ? <P4EmptyBloom text="归档区暂无内容" /> : p3 ? <P3EmptySlab /> : <EmptyState text="归档区暂无内容" />
+            )}
+          </div>
+        </div>
+        {p3 && <GhostWords words={['LOG']} className="bottom-[6px] right-[8px] text-[84px]" />}
+      </div>
+
+      {/* 添加任务 FAB：替代原页头「+ 添加任务」按钮。
+          与记录子页 FAB 同制式（fixed bottom-24 right-5 z-40 w-14 h-14 圆形 bg-primary），
+          子页切换时两枚 FAB 静止视觉完全一致、不跳变 */}
+      {p3 ? (
+        /* P3R：右下蓝色斜切「接入」（设计稿 CTA 形态） */
+        <div className="fixed bottom-24 right-5 z-40 wide:bottom-8 wide:right-8">
+          <SlantButton
+            tone="primary"
+            ariaLabel={isWishPane ? '添加愿望' : '添加任务'}
+            className="text-[20px]"
+            style={{ paddingTop: 14, paddingBottom: 14, paddingLeft: 34, paddingRight: 34, boxShadow: '0 14px 28px rgba(27,87,255,0.32)' }}
+            onClick={() => {
+              triggerNavFeedback();
+              if (isWishPane) { setWishDraft(''); setWishAddOpen(true); return; }
+              setEditingTodoId(null);
+              resetForm();
+              setShowAdd(true);
+            }}
+          >
+            {isWishPane ? '许愿' : '接入'}
+          </SlantButton>
+        </div>
+      ) : (
+        <motion.button
+          whileTap={TAP}
+          onClick={() => {
+            triggerNavFeedback();
+            // 愿望面下 FAB 直接变成「添加愿望」（用户口径：切换后添加按钮也要跟着变）
+            if (isWishPane) { setWishDraft(''); setWishAddOpen(true); return; }
+            setEditingTodoId(null);
+            resetForm();
+            setShowAdd(true);
+          }}
+          aria-label={isWishPane ? '添加愿望' : '添加任务'}
+          className={`fixed bottom-24 right-5 wide:bottom-8 wide:right-8 z-40 flex items-center justify-center cursor-pointer ${
+            isP4
+              ? 'h-16 w-16 text-white' // p4-redraw：蓝色四角星 FAB（星形本体当按钮面）
+              : p5
+                ? 'h-16 w-16 text-white' // p5-redraw：纸边黑影红五角星
+                : 'w-14 h-14 rounded-full bg-primary text-white shadow-lg shadow-primary/30'
+          }`}
+        >
+          {isP4 && (
+            <P4Sparkle
+              size={64}
+              color="var(--ui-accent)"
+              className="absolute inset-0"
+              style={{ filter: 'drop-shadow(0 3px 0 rgba(19,19,19,0.3))' }}
+            />
+          )}
+          {p5 && <P5StarFab seed={11} />}
+          {/* 白色加号（与记录子页 FAB 的 PlusIcon 同款笔画） */}
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={isP4 || p5 ? 2.6 : 2} className={`relative ${isP4 ? 'w-5 h-5' : 'w-6 h-6'}`} aria-hidden="true">
+            <path d="M12 4.5v15m7.5-7.5h-15" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </motion.button>
+      )}
+
+      {/* 添加/编辑任务：SheetModal 底部抽屉——自带 backdrop 点关/ESC/Android back
+          （修审计"遮罩不可点关、无返回键处理"问题），exit 动画由其内部 AnimatePresence 承担 */}
+      {/* 添加愿望（FAB 在愿望面下的目的地）。刻意只要一个标题——
+          愿望是"远处的灯"，此刻多填字段只会让人写不出来；细节等它真的动起来再补。 */}
+      <SheetModal
+        isOpen={wishAddOpen}
+        onClose={() => setWishAddOpen(false)}
+        title="记下一个愿望"
+        footer={
+          <button
+            onClick={async () => {
+              const t = wishDraft.trim();
+              if (!t) return;
+              await addWish({ title: t, source: 'manual' });
+              setWishDraft('');
+              setWishAddOpen(false);
+              triggerSuccessFeedback();
+            }}
+            disabled={!wishDraft.trim()}
+            className="w-full rounded-2xl bg-primary py-3.5 text-sm font-bold text-white disabled:opacity-40 active:scale-[0.98]"
+          >
+            记下
+          </button>
+        }
+      >
+        <div className="space-y-2">
+          <p className="text-xs leading-relaxed text-gray-500 dark:text-gray-400">
+            它不会出现在今日任务里。记录时把事挂上去，你就能看见自己在靠近它。
+          </p>
+          <BufferedTextInput
+            value={wishDraft}
+            onCommit={setWishDraft}
+            debounceMs={150}
+            placeholder="想实现的事…"
+            aria-label="愿望标题"
+            className="w-full rounded-xl border border-gray-200 bg-white px-3 py-2.5 text-sm outline-none focus:border-primary dark:border-gray-600 dark:bg-gray-700 dark:text-white"
+          />
+        </div>
+      </SheetModal>
+
+      {/* ── 课表导入确认（FS3.4-②）：读出的条目逐条勾选，统一归入一个属性 ── */}
+      <SheetModal
+        isOpen={!!scheduleItems}
+        onClose={() => setScheduleItems(null)}
+        position="bottom"
+        title="课表导入 · 确认"
+        footer={
+          <div className="flex gap-3">
+            <button
+              onClick={() => setScheduleItems(null)}
+              className="flex-1 rounded-xl bg-gray-100 py-2.5 font-medium text-gray-700 dark:bg-gray-800 dark:text-gray-300"
+            >
+              取消
+            </button>
+            <button
+              onClick={() => void importSchedule()}
+              disabled={!(scheduleItems ?? []).some(i => i.on)}
+              className="flex-1 rounded-xl bg-primary py-2.5 font-medium text-white disabled:opacity-50"
+            >
+              导入 {(scheduleItems ?? []).filter(i => i.on).length} 项
+            </button>
+          </div>
+        }
+      >
+        <div className="space-y-4">
+          <p className="text-[11px] leading-relaxed text-gray-400 dark:text-gray-500">
+            带星期的条目会建成<b>按周重复</b>的任务，没有星期信息的建成<b>每日</b>任务；点数默认 +1，导入后可逐条编辑。
+          </p>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-xs font-bold text-gray-500 dark:text-gray-400">统一归入：</span>
+            {(['knowledge', 'guts', 'dexterity', 'kindness', 'charm'] as AttributeId[]).map(id => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => setScheduleAttr(id)}
+                className={`rounded-full px-2.5 py-1 text-xs font-bold ${
+                  scheduleAttr === id ? 'bg-primary text-white' : 'bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400'
+                }`}
+              >
+                {settings.attributeNames[id]}
+              </button>
+            ))}
+          </div>
+          <div className="max-h-[46vh] space-y-2 overflow-y-auto">
+            {(scheduleItems ?? []).map((it, i) => (
+              <button
+                key={i}
+                type="button"
+                onClick={() => setScheduleItems(rows => rows ? rows.map((r, j) => (j === i ? { ...r, on: !r.on } : r)) : rows)}
+                className={`flex w-full items-center gap-2.5 rounded-xl border px-3 py-2.5 text-left ${
+                  it.on ? 'border-primary/60 bg-primary/5 dark:bg-primary/10' : 'border-gray-200 opacity-55 dark:border-gray-700'
+                }`}
+              >
+                <span aria-hidden className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-md text-[11px] font-black ${it.on ? 'bg-primary text-white' : 'bg-gray-200 text-transparent dark:bg-gray-700'}`}>✓</span>
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-sm font-bold text-gray-800 dark:text-gray-100">{it.title}</span>
+                  <span className="mt-0.5 block text-[11px] text-gray-400 dark:text-gray-500">
+                    {it.weekdays.length ? it.weekdays.map(d => weekdayLabels[d]).join(' ') : '每日'}
+                    {it.time ? ` · ${it.time}` : ''}
+                  </span>
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+      </SheetModal>
+
+      <SheetModal
+        isOpen={showAdd}
+        onClose={closeForm}
+        position="bottom"
+        title={editingTodoId ? '编辑任务' : '添加任务'}
+        footer={
+          /* 协议铁律：取消恒在左，主操作（bg-primary）恒在右 */
+          p3 ? (
+            <div className="flex gap-3">
+              <SlantButton tone="ghost" onClick={closeForm} className="flex-1">取消</SlantButton>
+              <SlantButton tone="primary" magentaCorner onClick={handleSave} className="flex-1">
+                {editingTodoId ? '保存' : '添加'}
+              </SlantButton>
+            </div>
+          ) : (
+          <div className="flex gap-3">
+            <button
+              onClick={closeForm}
+              className="flex-1 bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 py-2.5 rounded-xl font-medium"
+            >
+              取消
+            </button>
+            <button
+              onClick={handleSave}
+              className="flex-1 bg-primary text-white py-2.5 rounded-xl font-medium"
+            >
+              {editingTodoId ? '保存' : '添加'}
+            </button>
+          </div>
+          )
+        }
+      >
+              <div className="space-y-5">
+                {/* ── 📷 课表批量导入入口（仅新建 + 配了视觉档时出现）────── */}
+                {!editingTodoId && scheduleVision && (
+                  <div>
+                    <input
+                      ref={scheduleFileRef}
+                      type="file"
+                      accept="image/*"
+                      className="hidden"
+                      onChange={e => {
+                        const f = e.target.files?.[0];
+                        e.target.value = '';
+                        if (f) void handleScheduleShot(f);
+                      }}
+                    />
+                    <button
+                      type="button"
+                      disabled={scheduleBusy}
+                      onClick={() => scheduleFileRef.current?.click()}
+                      className="w-full rounded-xl border border-dashed border-gray-300 px-3 py-2.5 text-left text-xs font-bold text-gray-500 disabled:opacity-60 dark:border-gray-600 dark:text-gray-400"
+                    >
+                      {scheduleBusy ? '📷 正在读取课表…' : '📷 拍一张课表 / 日程表，一次导入一批（走视觉档）'}
+                    </button>
+                    {scheduleErr && <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">{scheduleErr}</p>}
+                  </div>
+                )}
+                {/* ── ① 标题 ─────────────────────────────────────────── */}
+                <input
+                  type="text"
+                  value={form.title}
+                  onChange={(e) => { if (!editingPactTodo) setForm(prev => ({ ...prev, title: e.target.value })); }}
+                  readOnly={!!editingPactTodo}
+                  aria-readonly={!!editingPactTodo}
+                  placeholder={form.mode === 'big' ? '想搞定的一件大事…' : '今日要完成什么？'}
+                  className={`w-full px-3.5 py-3 text-[16px] font-semibold border border-gray-200 dark:border-gray-600 rounded-xl bg-gray-50 dark:bg-gray-800 dark:text-white focus:outline-none focus:ring-2 focus:ring-primary/30 ${editingPactTodo ? 'opacity-60' : ''}`}
+                />
+                {editingPactTodo && (
+                  <p className="-mt-3 rounded-xl bg-pink-500/10 px-3 py-2.5 text-xs leading-relaxed text-pink-700 dark:text-pink-300">
+                    {editingPactTodo.orgOp
+                      ? `这条待办是「${editingPactTodo.orgOp.orgName}」${editingPactTodo.orgOp.kind === 'big' ? '一场作战' : '一个目标'}里你的那一份：标题、截止日由它决定，这里只能改属性、分值和「重要」。不想参加了，到组织的作战区里点「这次不参加」。`
+                      : `这条待办跟着和 ${editingPactTodo.pact?.partnerName ?? 'Ta'} 的「一起进步」约定走：标题、每日重置、截止日和执行日期都由约定决定，这里只能改属性、分值和「重要」。要停下，到羁绊页结束这个约定。`}
+                  </p>
+                )}
+
+                {/* ── ② 模式三卡（三段式第二段；编辑中锁定防止子步/计数语义悬空） ── */}
+                <div>
+                  <div className="grid grid-cols-3 gap-2">
+                    {([
+                      { key: 'single', name: '单次', hint: '做完即归档', glyph: '✓' },
+                      { key: 'count', name: '计数', hint: '重复 N 次', glyph: '∞' },
+                      { key: 'big', name: 'BIG DEAL', hint: '大事拆小步', glyph: '◆' },
+                    ] as const).map(m => {
+                      const active = form.mode === m.key;
+                      return (
+                        <button
+                          key={m.key}
+                          type="button"
+                          disabled={!!editingTodoId && !active}
+                          onClick={() => setForm(prev => ({ ...prev, mode: m.key }))}
+                          className={`flex flex-col items-start gap-0.5 px-3 py-2.5 text-left transition-colors disabled:opacity-35 ${
+                            p3
+                              ? ''
+                              : isP4
+                                ? `rounded-[14px] border-[3px] border-[#131313] ${active ? 'bg-[#131313] text-[#ffe100]' : 'bg-[var(--p4-paper, #fff7b0)] text-[#131313]'}`
+                                : p5
+                                  ? `border-2 border-[#050505] ${active ? 'bg-[#c00008] text-white shadow-[3px_3px_0_#050505]' : 'bg-white text-[#131313]'}`
+                                  : `rounded-xl border ${active ? 'bg-primary text-white border-primary' : 'bg-gray-50 dark:bg-gray-800 text-gray-700 dark:text-gray-300 border-gray-200 dark:border-gray-600'}`
+                          }`}
+                          style={p3 ? {
+                            clipPath: 'polygon(10px 0, 100% 0, calc(100% - 10px) 100%, 0 100%)',
+                            background: active ? P3R.blue : P3R.panel,
+                            color: active ? '#fff' : P3R.ink,
+                            boxShadow: active ? 'none' : '0 4px 12px rgba(38,96,140,0.08)',
+                          } : undefined}
+                        >
+                          <span aria-hidden className="text-base font-black leading-none">{m.glyph}</span>
+                          <span className="text-[13px] font-black leading-tight">{m.name}</span>
+                          <span className="text-[10px] font-semibold leading-tight opacity-60">{m.hint}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {editingTodoId && (
+                    <p className="mt-1 text-[11px] text-gray-400 dark:text-gray-500">编辑中不可切换模式</p>
+                  )}
+                </div>
+
+                {/* 模式附属 · 计数 */}
+                {form.mode === 'count' && (
+                  <div className="space-y-2.5">
+                    <div className="flex items-center justify-between rounded-xl border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-800 px-3 py-2.5">
+                      <span className="text-sm font-medium text-gray-700 dark:text-gray-300">目标次数</span>
+                      <Stepper
+                        value={form.targetCount}
+                        min={1}
+                        max={99}
+                        aria-label="目标次数"
+                        onChange={(v) => setForm(prev => ({ ...prev, targetCount: v }))}
+                      />
+                    </div>
+                    <label className={`flex items-start gap-2.5 text-sm rounded-xl px-3 py-2.5 cursor-pointer ${
+                      form.isLongTerm
+                        ? 'bg-indigo-50 dark:bg-indigo-900/20 text-indigo-700 dark:text-indigo-300'
+                        : 'text-gray-600 dark:text-gray-300'
+                    }`}>
+                      <input
+                        type="checkbox"
+                        checked={form.isLongTerm}
+                        onChange={(e) => setForm(prev => ({ ...prev, isLongTerm: e.target.checked, repeatDaily: e.target.checked ? false : prev.repeatDaily }))}
+                        className="w-4 h-4 text-indigo-500 mt-0.5 rounded"
+                      />
+                      <div>
+                        <span className="font-medium">长期任务</span>
+                        <p className="text-xs opacity-70 mt-0.5">进度长期保留，不随时间刷新，直到完成为止</p>
+                      </div>
+                    </label>
+                  </div>
+                )}
+
+                {/* 模式附属 · BIG DEAL：现状 + 截止日 + 子步编辑器 + 帮我拆 */}
+                {form.mode === 'big' && (
+                  <div className="space-y-2.5 rounded-2xl border border-primary/25 bg-primary/5 dark:bg-primary/10 p-3">
+                    <input
+                      type="text"
+                      value={form.currentState}
+                      onChange={(e) => setForm(prev => ({ ...prev, currentState: e.target.value }))}
+                      placeholder="现在到哪一步了？一句话（可选，AI 拆解会参考）"
+                      className="w-full px-3 py-2 text-sm border border-gray-200 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 dark:text-white focus:outline-none focus:border-primary"
+                    />
+                    <div className="flex items-center gap-2">
+                      <span className="shrink-0 text-xs font-medium text-gray-500 dark:text-gray-400">截止日（可选）</span>
+                      <input
+                        type="date"
+                        value={form.deadline}
+                        min={todayDateKey}
+                        // 同一个 deadline 字段：切回单次 / 计数时也要守住「与每日重置互斥」
+                        onChange={(e) => setForm(prev => ({ ...prev, deadline: e.target.value, repeatDaily: e.target.value ? false : prev.repeatDaily }))}
+                        className="flex-1 px-2.5 py-1.5 text-sm border border-gray-200 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 dark:text-white"
+                      />
+                      {form.deadline && (
+                        <button type="button" onClick={() => setForm(prev => ({ ...prev, deadline: '' }))} className="text-xs text-gray-400 underline">清除</button>
+                      )}
+                    </div>
+
+                    <div className="space-y-1.5 pt-0.5">
+                      {form.steps.map((s, i) => (
+                        <div key={s.id ?? `new-${i}`} className="flex items-center gap-2">
+                          <span
+                            aria-hidden
+                            className={`flex h-4.5 w-4.5 h-[18px] w-[18px] shrink-0 items-center justify-center rounded-full border-2 text-[10px] font-black ${
+                              s.done ? 'border-primary bg-primary text-white' : 'border-gray-300 dark:border-gray-600 text-transparent'
+                            }`}
+                          >
+                            ✓
+                          </span>
+                          <input
+                            value={s.title}
+                            disabled={s.done}
+                            onChange={(e) => setForm(prev => {
+                              const next = [...prev.steps];
+                              next[i] = { ...next[i], title: e.target.value };
+                              return { ...prev, steps: next };
+                            })}
+                            placeholder="一个够得着的小步…"
+                            className={`min-w-0 flex-1 px-2.5 py-1.5 text-sm border rounded-lg outline-none ${
+                              s.done
+                                ? 'border-transparent bg-transparent text-gray-400 line-through dark:text-gray-500'
+                                : 'border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-800 dark:text-white focus:border-primary'
+                            }`}
+                          />
+                          {s.source === 'ai' && <span className="shrink-0 text-[10px] font-bold text-primary/60">AI</span>}
+                          {!s.done && (
+                            <button
+                              type="button"
+                              aria-label="删除子步"
+                              onClick={() => setForm(prev => ({ ...prev, steps: prev.steps.filter((_, j) => j !== i) }))}
+                              className="shrink-0 rounded p-1 text-gray-300 hover:text-red-400 dark:text-gray-600"
+                            >
+                              ✕
+                            </button>
+                          )}
+                        </div>
+                      ))}
+                      <div className="flex flex-wrap gap-2 pt-1">
+                        <button
+                          type="button"
+                          onClick={() => setForm(prev => ({ ...prev, steps: [...prev.steps, { title: '', source: 'manual' }] }))}
+                          className="rounded-full border border-gray-300 px-3 py-1 text-xs font-medium text-gray-500 dark:border-gray-600 dark:text-gray-400"
+                        >
+                          + 手写一步
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void runFormAI()}
+                          disabled={aiBusy || !form.title.trim()}
+                          className="rounded-full border border-primary/40 px-3 py-1 text-xs font-bold text-primary disabled:opacity-45"
+                        >
+                          {aiBusy ? '正在拆…' : '✦ AI 帮我拆'}
+                        </button>
+                      </div>
+                      {aiError && <p className="text-xs text-amber-600 dark:text-amber-400">{aiError}</p>}
+                      <p className="text-[11px] leading-relaxed text-gray-400 dark:text-gray-500">
+                        每完成一子步得主属性 +{form.points}；全部完成触发收官奖励（SP + 触及属性各 +1）
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {/* ── ③ 奖励：主属性 chips + 点数 + 副奖励 ── */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="text-sm font-medium text-gray-700 dark:text-gray-300">奖励 · 主属性</label>
+                    <Stepper
+                      value={form.points}
+                      min={1}
+                      max={5}
+                      aria-label="主属性点数"
+                      onChange={(v) => setForm(prev => ({ ...prev, points: v }))}
+                    />
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {ATTR_IDS.map(id => {
+                      const usedByExtra = form.extraBoosts.some(b => b.attribute === id);
+                      const active = form.attribute === id;
+                      return (
+                        <button
+                          key={id}
+                          type="button"
+                          disabled={usedByExtra}
+                          onClick={() => setForm(prev => ({ ...prev, attribute: id }))}
+                          className={`px-3 py-1.5 text-xs font-bold transition-colors disabled:opacity-35 ${
+                            p3
+                              ? ''
+                              : isP4
+                                ? `rounded-full border-2 border-[#131313] ${active ? 'bg-[#131313] text-[#ffe100]' : 'bg-white text-[#131313]'}`
+                                : p5
+                                  ? `border-2 border-[#050505] ${active ? 'bg-[#c00008] text-white' : 'bg-white text-[#131313]'}`
+                                  : `rounded-full ${active ? 'bg-primary text-white' : 'border border-gray-200 dark:border-gray-600 text-gray-600 dark:text-gray-300'}`
+                          }`}
+                          style={p3 ? {
+                            clipPath: 'polygon(8px 0, 100% 0, calc(100% - 8px) 100%, 0 100%)',
+                            background: active ? P3R.blue : P3R.panel,
+                            color: active ? '#fff' : P3R.ink,
+                          } : undefined}
+                        >
+                          {settings.attributeNames[id] ?? id}
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {/* 副奖励（最多 2 条） */}
+                  {(() => {
+                    const usedAttrs = new Set<string>([form.attribute, ...form.extraBoosts.map(b => b.attribute)]);
+                    const firstUnused = (ATTR_IDS.find(id => !usedAttrs.has(id)) ?? 'knowledge') as AttributeId;
+                    const canAddMore = form.extraBoosts.length < 2 && usedAttrs.size < ATTR_IDS.length;
+                    return (
+                      <div className="space-y-1.5">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs font-medium text-gray-500 dark:text-gray-400">副奖励（可选，最多 2 条）</span>
+                          {canAddMore && (
+                            <motion.button
+                              whileTap={{ scale: 0.88 }}
+                              type="button"
+                              onClick={() => setForm(prev => ({
+                                ...prev,
+                                extraBoosts: [...prev.extraBoosts, { attribute: firstUnused, points: 1 }],
+                              }))}
+                              className="w-6 h-6 rounded-full bg-primary text-white flex items-center justify-center text-base font-bold leading-none"
+                              title="添加副奖励"
+                            >
+                              +
+                            </motion.button>
+                          )}
+                        </div>
+                        {form.extraBoosts.map((boost, idx) => {
+                          const otherUsed = new Set<string>([
+                            form.attribute,
+                            ...form.extraBoosts.filter((_, i) => i !== idx).map(b => b.attribute),
+                          ]);
+                          return (
+                            <div key={idx} className="flex items-center gap-2 p-2.5 rounded-xl bg-primary/5 dark:bg-primary/10 border border-primary/20 dark:border-primary/30">
+                              <select
+                                value={boost.attribute}
+                                onChange={(e) => setForm(prev => {
+                                  const next = [...prev.extraBoosts];
+                                  next[idx] = { ...next[idx], attribute: e.target.value as AttributeId };
+                                  return { ...prev, extraBoosts: next };
+                                })}
+                                className="flex-1 px-2 py-1.5 text-sm border border-gray-200 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 dark:text-white focus:outline-none focus:border-primary"
+                              >
+                                {Object.entries(settings.attributeNames).map(([key, name]) =>
+                                  (!otherUsed.has(key) || boost.attribute === key) && (
+                                    <option key={key} value={key}>{name}</option>
+                                  )
+                                )}
+                              </select>
+                              <Stepper
+                                value={boost.points}
+                                min={1}
+                                max={5}
+                                aria-label="副奖励点数"
+                                onChange={(v) => setForm(prev => {
+                                  const next = [...prev.extraBoosts];
+                                  next[idx] = { ...next[idx], points: v };
+                                  return { ...prev, extraBoosts: next };
+                                })}
+                              />
+                              <motion.button
+                                whileTap={{ scale: 0.9 }}
+                                type="button"
+                                onClick={() => setForm(prev => ({
+                                  ...prev,
+                                  extraBoosts: prev.extraBoosts.filter((_, i) => i !== idx),
+                                }))}
+                                className="w-7 h-7 flex-shrink-0 rounded-full bg-red-100 dark:bg-red-900/30 text-red-500 flex items-center justify-center text-base font-bold"
+                              >
+                                −
+                              </motion.button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    );
+                  })()}
+                </div>
+
+                {/* ── ④ 更多设置（折叠：重要 / 每日 / 截止日 / 周几 / 启用 / 启用日期） ── */}
+                <div>
+                  <button
+                    type="button"
+                    onClick={() => setShowMore(prev => !prev)}
+                    className="w-full flex items-center justify-between text-left text-sm font-medium text-gray-700 dark:text-gray-300 py-1"
+                  >
+                    <span>更多设置</span>
+                    <motion.span animate={{ rotate: showMore ? 180 : 0 }} className="text-gray-400 text-xs">▼</motion.span>
+                  </button>
+                  <AnimatePresence initial={false}>
+                    {showMore && (
+                      <motion.div
+                        initial={{ height: 0, opacity: 0 }}
+                        animate={{ height: 'auto', opacity: 1 }}
+                        exit={{ height: 0, opacity: 0 }}
+                        className="overflow-hidden"
+                      >
+                        <div className="space-y-2.5 pt-2">
+                          {/* 重要标记（三频道皮沿用） */}
+                          {isP4 ? (
+                            <label
+                              className="flex cursor-pointer items-center gap-3 rounded-2xl p-3.5 transition-colors"
+                              style={{ background: form.important ? 'var(--p4-orange, #f9a11b)' : 'rgba(249, 161, 27, 0.55)' }}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={form.important}
+                                onChange={(e) => setForm(prev => ({ ...prev, important: e.target.checked }))}
+                                className="peer sr-only"
+                              />
+                              <span
+                                aria-hidden
+                                className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition-colors ${
+                                  form.important ? 'bg-[#131313]' : 'bg-white/70'
+                                }`}
+                              >
+                                <P4Sparkle size={14} color={form.important ? 'var(--ui-bg)' : '#131313'} />
+                              </span>
+                              <div>
+                                <span className="text-sm font-black text-[#131313]">标记为重要</span>
+                                <p className="mt-0.5 text-xs font-semibold text-[#131313]/70">重要任务将在首页置顶显示，并记录在历史中</p>
+                              </div>
+                            </label>
+                          ) : p3 ? (
+                            <label className="relative flex cursor-pointer items-center gap-3 px-3 py-3" style={{ background: 'var(--p3r-panel-glass, rgba(255,255,255,0.8))', borderBottom: '2px solid rgba(53,209,232,0.7)' }}>
+                              <input
+                                type="checkbox"
+                                checked={form.important}
+                                onChange={(e) => setForm(prev => ({ ...prev, important: e.target.checked }))}
+                                className="h-5 w-5"
+                                style={{ accentColor: 'var(--p3r-blue, #1b57ff)' }}
+                              />
+                              <span aria-hidden className="h-0 w-0 border-y-[5px] border-l-[9px] border-y-transparent" style={{ borderLeftColor: 'var(--p3r-magenta, #f0417f)' }} />
+                              <div>
+                                <span className="text-sm font-black text-[#0a1230]">标记为重要</span>
+                                <p className="mt-0.5 text-xs font-semibold text-[#8a97ad]">重要任务将在首页置顶显示，并记录在历史中</p>
+                              </div>
+                            </label>
+                          ) : (
+                            <label className="flex items-center gap-3 p-3 rounded-xl border border-amber-200 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={form.important}
+                                onChange={(e) => setForm(prev => ({ ...prev, important: e.target.checked }))}
+                                className="w-5 h-5 text-amber-500"
+                              />
+                              <div>
+                                <span className="text-sm font-medium text-amber-700 dark:text-amber-300">⭐ 标记为重要</span>
+                                <p className="text-xs text-amber-600/70 dark:text-amber-400/70 mt-0.5">重要任务将在首页置顶显示，并记录在历史中</p>
+                              </div>
+                            </label>
+                          )}
+
+                          {form.mode !== 'big' && !editingPactTodo && (
+                            <label className={`flex items-start gap-2.5 text-sm rounded-xl px-3 py-2.5 cursor-pointer ${
+                              form.repeatDaily
+                                ? 'bg-emerald-50 dark:bg-emerald-900/20 text-emerald-700 dark:text-emerald-300'
+                                : 'text-gray-600 dark:text-gray-300'
+                            }`}>
+                              <input
+                                type="checkbox"
+                                checked={form.repeatDaily}
+                                // 每日重置与截止日互斥：勾上就清掉截止日
+                                onChange={(e) => setForm(prev => ({ ...prev, repeatDaily: e.target.checked, isLongTerm: e.target.checked ? false : prev.isLongTerm, deadline: e.target.checked ? '' : prev.deadline }))}
+                                className="w-4 h-4 text-emerald-500 mt-0.5 rounded"
+                              />
+                              <div>
+                                <span className="font-medium">每日重置</span>
+                                <p className="text-xs opacity-70 mt-0.5">每天刷新任务，包括进度</p>
+                              </div>
+                            </label>
+                          )}
+
+                          {/* 截止日（DDL）：单次 / 计数任务；BIG DEAL 在模式区自带一个。与每日重置互斥：选了日期就取消每日重置。约定待办不给改 */}
+                          {form.mode !== 'big' && !editingPactTodo && (
+                            <div>
+                              <label htmlFor="todo-deadline" className="block text-sm font-medium mb-1.5 text-gray-700 dark:text-gray-300">截止日 DDL（可选）</label>
+                              <div className="flex items-center gap-2">
+                                <input
+                                  id="todo-deadline"
+                                  type="date"
+                                  value={form.deadline}
+                                  min={form.startDate && form.startDate > todayDateKey ? form.startDate : todayDateKey}
+                                  onChange={(e) => setForm(prev => ({ ...prev, deadline: e.target.value, repeatDaily: e.target.value ? false : prev.repeatDaily }))}
+                                  className="flex-1 px-3 py-2 border border-gray-200 dark:border-gray-600 rounded-xl bg-gray-50 dark:bg-gray-800 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-primary/30"
+                                />
+                                {form.deadline && (
+                                  <button type="button" onClick={() => setForm(prev => ({ ...prev, deadline: '' }))} className="text-xs text-gray-400 dark:text-gray-500 underline whitespace-nowrap">
+                                    清除
+                                  </button>
+                                )}
+                              </div>
+                              <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">首页和今日任务会显示「剩 N 天」；与「每日重置」只能二选一</p>
+                            </div>
+                          )}
+
+                          {form.mode !== 'big' && !editingPactTodo && (
+                            <div>
+                              <span className="block text-xs font-medium mb-1.5 text-gray-500 dark:text-gray-400">每周几执行（可选）</span>
+                              <div className="grid grid-cols-4 gap-1.5">
+                                {weekdayLabels.map((label, index) => (
+                                  <button
+                                    key={label}
+                                    type="button"
+                                    onClick={() => toggleWeekday(index)}
+                                    className={p3
+                                      ? 'px-2 py-1.5 text-xs font-black transition-colors'
+                                      : `px-2 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                                          form.weekdays.includes(index)
+                                            ? 'bg-primary text-white border-primary'
+                                            : 'bg-gray-50 dark:bg-gray-800 text-gray-700 dark:text-gray-300 border-gray-200 dark:border-gray-600'
+                                        }`}
+                                    style={p3 ? {
+                                      clipPath: 'polygon(7px 0, 100% 0, calc(100% - 7px) 100%, 0 100%)',
+                                      background: form.weekdays.includes(index) ? P3R.blue : P3R.cyanFaint,
+                                      color: form.weekdays.includes(index) ? '#fff' : P3R.ink,
+                                    } : undefined}
+                                  >
+                                    {label}
+                                  </button>
+                                ))}
+                              </div>
+                              {form.weekdays.length > 0 && (
+                                <button type="button" onClick={() => setForm(prev => ({ ...prev, weekdays: [] }))} className="mt-2 text-xs text-gray-400 dark:text-gray-500 underline">
+                                  清除选择
+                                </button>
+                              )}
+                            </div>
+                          )}
+
+                          {!editingPactTodo && (
+                          <div className="flex items-center justify-between py-1">
+                            <span className="text-sm text-gray-600 dark:text-gray-400">是否启用</span>
+                            <Toggle
+                              checked={form.isActive}
+                              onChange={(v) => setForm(prev => ({ ...prev, isActive: v }))}
+                              aria-label="是否启用"
+                            />
+                          </div>
+                          )}
+
+                          {!editingPactTodo && (
+                          <div>
+                            <label className="block text-sm font-medium mb-1.5 text-gray-700 dark:text-gray-300">指定启用日期（可选）</label>
+                            <div className="flex items-center gap-2">
+                              <input
+                                type="date"
+                                value={form.startDate}
+                                min={todayDateKey}
+                                onChange={(e) => setForm(prev => ({ ...prev, startDate: e.target.value }))}
+                                className="flex-1 px-3 py-2 border border-gray-200 dark:border-gray-600 rounded-xl bg-gray-50 dark:bg-gray-800 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-primary/30"
+                              />
+                              {form.startDate && (
+                                <button type="button" onClick={() => setForm(prev => ({ ...prev, startDate: '' }))} className="text-xs text-gray-400 dark:text-gray-500 underline whitespace-nowrap">
+                                  清除
+                                </button>
+                              )}
+                            </div>
+                            <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">设定后，该任务在指定日期前不会出现在今日任务中</p>
+                          </div>
+                          )}
+                        </div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
+              </div>
+      </SheetModal>
+
+      {/* BIG DEAL 二级面板（聚合卡统一落点） */}
+      <BigDealPanel todoId={dealPanelId} onClose={() => setDealPanelId(null)} />
+
+      {/* 抽签仪式 */}
+      <FateDrawSheet open={fateOpen} onClose={() => setFateOpen(false)} />
+      <QuestBoardSheet open={questOpen} onClose={() => setQuestOpen(false)} />
+
+      {/* ── §4.6 长按上下文菜单：全页单实例，按 menuTodoId 寻址目标任务。
+          关闭后 SheetModal 的 AnimatePresence 会用上一帧的子树播 exit，
+          所以 menuTodo 为空时传空 actions 也不会让退场内容闪空 ── */}
+      <ActionSheet
+        isOpen={!!menuTodo}
+        onClose={() => setMenuTodoId(null)}
+        title={menuTodo?.title}
+        actions={
+          menuTodo
+            ? isLinkedTodo(menuTodo)
+              // 约定 / 作战的待办：不能手动归档 / 删除，给一个去约定 / 作战那边的入口
+              ? [
+                  { label: '编辑（属性 / 分值）', icon: <EditIcon />, onClick: () => handleEdit(menuTodo.id) },
+                  { label: menuTodo.orgOp ? (menuTodo.orgOp.kind === 'big' ? '打开这场作战' : `打开这个${OP_KIND_LABEL.small}`) : '打开这个约定', icon: <ArchiveIcon />, onClick: () => openLinked(menuTodo) },
+                ]
+              : [
+                  { label: '编辑', icon: <EditIcon />, onClick: () => handleEdit(menuTodo.id) },
+                  { label: '归档', icon: <ArchiveIcon />, onClick: () => updateTodo(menuTodo.id, { isActive: false }) },
+                  // active 卡此前没有删除入口，按协议补上；真正删除走下方 ConfirmDialog
+                  { label: '删除', icon: <TrashIcon />, tone: 'danger', onClick: () => setPendingDeleteId(menuTodo.id) },
+                ]
+            : []
+        }
+      />
+
+      {/* ── 删除协议：所有删除入口（长按菜单 + 归档区快捷钮）汇于此单实例确认 ── */}
+      <ConfirmDialog
+        isOpen={!!pendingDeleteTodo}
+        tone="danger"
+        title="删除任务"
+        description={pendingDeleteTodo ? `任务「${pendingDeleteTodo.title}」将被永久删除，无法撤销。` : undefined}
+        confirmText="删除"
+        onConfirm={() => {
+          if (pendingDeleteTodo) deleteTodo(pendingDeleteTodo.id);
+          setPendingDeleteId(null);
+        }}
+        onCancel={() => setPendingDeleteId(null)}
+      />
+    </div>
+  );
+};

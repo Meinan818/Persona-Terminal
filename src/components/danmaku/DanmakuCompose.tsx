@@ -1,0 +1,130 @@
+/**
+ * DanmakuCompose — 弹幕投稿（先审后发）。
+ *
+ * 大事收官攒到「投稿机会」(settings.terminalDanmakuTokens，字段名沿用旧终端时代) 才能发；
+ * 匿名、先审后发。成功投稿才消费一次机会；失败（未登录 / 集合未建 / 校验不过）保留机会并提示。
+ * 原 F3 终端组件，终端退役（TASKS_MERGE_PRD 批5）后迁此，逻辑零改动。
+ */
+import { useRef, useState } from 'react';
+import { useAppStore } from '@/store';
+import { useShallow } from 'zustand/react/shallow';
+import { SheetModal } from '@/components/SheetModal';
+import { submitDanmaku, danmakuThemeOf, validateDanmaku, DANMAKU_MAX_LEN, DANMAKU_COOLDOWN_MS } from '@/services/danmaku';
+
+interface Props {
+  isOpen: boolean;
+  onClose: () => void;
+  /** 强制暗色（thief 频道暗房语境，透传给 SheetModal） */
+  forceDark?: boolean;
+}
+
+export const DanmakuCompose = ({ isOpen, onClose, forceDark }: Props) => {
+  const { settings, updateSettings, user } = useAppStore(useShallow(s => ({ settings: s.settings, updateSettings: s.updateSettings, user: s.user })));
+  const tokens = settings.terminalDanmakuTokens ?? 0;
+  const [text, setText] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [done, setDone] = useState(false);
+  const sendingRef = useRef(false); // 同步在途锁：busy 是异步 state，挡不住同一 tick 的双击
+
+  const len = [...text].length;
+  const canSend = validateDanmaku(text).ok && tokens > 0 && !busy;
+
+  const close = () => {
+    setText('');
+    setError('');
+    setDone(false);
+    onClose();
+  };
+
+  const submit = async () => {
+    if (sendingRef.current) return; // 防同 tick 双击重入（多发一条只扣一次）
+    setError('');
+    if (tokens <= 0) {
+      setError('暂时没有鼓励机会了');
+      return;
+    }
+    // 三天一发（PRD_V2.6 §3 反馈）：机会攒得再多也不能连着刷屏
+    const last = useAppStore.getState().settings.lastDanmakuSentAt;
+    if (last) {
+      const passed = Date.now() - new Date(last).getTime();
+      const left = DANMAKU_COOLDOWN_MS - passed;
+      if (left > 0) {
+        const days = Math.ceil(left / 86400000);
+        setError(`还要等 ${days} 天才能再发一条——留点时间给上一句`);
+        return;
+      }
+    }
+    sendingRef.current = true;
+    setBusy(true);
+    try {
+      await submitDanmaku(text, danmakuThemeOf(user?.theme));
+      // 成功才消费，且基于最新 store 值原子递减（避免与完成小步的 +1 互相覆盖丢点）
+      const cur = useAppStore.getState().settings.terminalDanmakuTokens ?? 0;
+      await updateSettings({
+        terminalDanmakuTokens: Math.max(0, cur - 1),
+        lastDanmakuSentAt: new Date().toISOString(),
+      });
+      setDone(true);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '发送失败');
+    } finally {
+      setBusy(false);
+      sendingRef.current = false;
+    }
+  };
+
+  return (
+    <SheetModal isOpen={isOpen} onClose={close} position="center" busy={busy} title="写一句鼓励" forceDark={forceDark}>
+      {done ? (
+        <div className="py-6 text-center">
+          <div className="mb-2 text-3xl">✦</div>
+          <p className="text-sm leading-relaxed text-gray-700 dark:text-gray-200">
+            已送出。过审后，它会出现在同样卡住的人面前。
+          </p>
+          {/* 说清楚"什么时候会知道结果"——不然用户只能反复回来看有没有变化。
+              过审提醒走开 App 时自查（FS4 C 路线：danmaku 匿名，服务端不知道该推给谁） */}
+          <p className="mt-1.5 text-[11px] leading-relaxed text-gray-400 dark:text-gray-500">
+            过审后下次打开时会告诉你。
+          </p>
+          <button
+            type="button"
+            onClick={close}
+            className="mt-5 rounded-full bg-primary px-6 py-2 text-sm font-semibold text-white"
+          >
+            好
+          </button>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          <p className="text-xs leading-relaxed text-gray-400 dark:text-gray-500">
+            匿名发送弹幕鼓励一同努力的人，审核通过将会发出，慎言即可。还剩 {tokens} 次机会。
+          </p>
+          <textarea
+            autoFocus
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            rows={3}
+            maxLength={DANMAKU_MAX_LEN + 10}
+            placeholder="比如：我也熬过来了，你可以的"
+            className="w-full resize-none rounded-xl border border-gray-200 bg-gray-50 px-3 py-2.5 text-sm outline-none focus:border-primary dark:border-gray-700 dark:bg-gray-800 dark:text-white"
+          />
+          <div className="flex items-center justify-between gap-3 text-xs">
+            <span className={`shrink-0 ${len > DANMAKU_MAX_LEN ? 'text-red-400' : 'text-gray-400 dark:text-gray-500'}`}>
+              {len}/{DANMAKU_MAX_LEN}
+            </span>
+            {error && <span className="text-right leading-snug text-red-400">{error}</span>}
+          </div>
+          <button
+            type="button"
+            onClick={submit}
+            disabled={!canSend}
+            className="w-full rounded-xl bg-primary py-2.5 text-sm font-semibold text-white disabled:opacity-50"
+          >
+            {busy ? '送出中…' : '送出鼓励'}
+          </button>
+        </div>
+      )}
+    </SheetModal>
+  );
+};

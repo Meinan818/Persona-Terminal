@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 echo ====================================
 echo Persona Growth Tracker - 安装向导
 echo ====================================

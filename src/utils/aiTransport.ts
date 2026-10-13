@@ -12,6 +12,7 @@
  */
 import { CapacitorHttp, type HttpOptions, type HttpResponse } from '@capacitor/core';
 import { isNative } from '@/utils/native';
+import { getAuthToken, isAuthenticated } from '@/services/velvetApi';
 
 let nativeHosts = new Set<string>();
 let forceNativeForTest = false;
@@ -93,7 +94,109 @@ export async function nativeFetch(url: string, init: RequestInit = {}): Promise<
   return new Response(text, { status, headers: h });
 }
 
-/** fetch 的替身：原生主机（或 force）走原生通道，其余照旧 */
-export function aiFetch(url: string, init: RequestInit = {}, force?: boolean): Promise<Response> {
+/** fetch 的替身：代理开关开启时改道后端；原生主机走原生通道，其余照旧 */
+export async function aiFetch(url: string, init: RequestInit = {}, force?: boolean): Promise<Response> {
+  const rewritten = rewriteForProxy(url, init);
+  if (rewritten) return fetch(rewritten.url, rewritten.init);
   return (force ?? isNativeHost(url)) ? nativeFetch(url, init) : fetch(url, init);
+}
+
+// ── 后端代理改道（钥匙不进浏览器）────────────────────────────────────────
+// 开关打开时，AI 请求不再直连服务商，而是发给自己登录的后端 /api/ai/*，由后端持有
+// API Key 转发。前端此时不需要带真 Key（后端按 X-Upstream-Provider 选服务端的 Key）。
+
+let proxyEnabled = false;
+let proxyBaseUrl = '';
+/** 服务端**实际**配了钥匙的服务商（来自 GET /api/ai/capabilities）；空 = 一家都没配 */
+let proxyProviders = new Set<string>();
+
+/** 由 aiClient 解析设置时调用：开关 + 后端地址（velvetApi 的 API_URL） */
+export function syncAiProxy(enabled: boolean, baseUrl: string): void {
+  proxyEnabled = enabled;
+  proxyBaseUrl = baseUrl.replace(/\/$/, '');
+}
+
+/** 由 aiClient 拉到能力清单后同步进来（见 ensureAiCapabilities） */
+export function syncProxyProviders(providers: string[]): void {
+  proxyProviders = new Set(providers);
+}
+
+/** 供诊断输出：服务端当前声明"配了钥匙"的服务商。空 = 一家都没配，请求都走直连 */
+export function proxyProvidersSnapshot(): string[] {
+  return [...proxyProviders];
+}
+
+export const aiProxyEnabled = (): boolean => proxyEnabled;
+
+/**
+ * 临时关掉代理跑一次，跑完无论成败都恢复原状。
+ *
+ * 用途：后端代理「服务端没配这家钥匙」时（502），调用方改走直连、用本机保存的 Key 再试一次。
+ * 聊天路径一直有这个回退（见 aiClient 的「代理 502 → 直连」）；测试连接当初漏了，
+ * 于是出现「聊天明明能用、点测试连接却报 HTTP 502 服务端未配置 XXX_API_KEY」。
+ */
+export async function withoutAiProxy<T>(run: () => Promise<T>): Promise<T> {
+  const wasEnabled = proxyEnabled;
+  const previousBaseUrl = proxyBaseUrl;
+  proxyEnabled = false;
+  proxyBaseUrl = '';
+  try {
+    return await run();
+  } finally {
+    proxyEnabled = wasEnabled;
+    proxyBaseUrl = previousBaseUrl;
+  }
+}
+
+/**
+ * 音频转写代理改道（FormData 专用）。
+ * 后端代理没有 /audio 端点时返回 null（直连兜底）；有则改发 /api/ai/audio。
+ */
+export function rewriteAudioForProxy(url: string, init: RequestInit): { url: string; init: RequestInit } {
+  const rewritten = rewriteForProxy(url, init);
+  if (rewritten && rewritten.url.endsWith('/api/ai/chat')) {
+    return { url: rewritten.url.replace('/api/ai/chat', '/api/ai/audio'), init: rewritten.init };
+  }
+  if (rewritten) return rewritten;
+  return { url, init };
+}
+
+/**
+ * 把直连服务商的 URL/请求头改写成代理形态。
+ * 返回 null = 不适用（调用方直连兜底）。
+ */
+export function rewriteForProxy(url: string, init: RequestInit): { url: string; init: RequestInit } | null {
+  if (!proxyEnabled || !proxyBaseUrl) return null;
+  const session = getAuthToken();
+  if (!isAuthenticated() || !session) throw new Error('登录状态已失效，请重新登录后使用代理');
+  try {
+    const u = new URL(url);
+    // 「拉模型列表」必须带用户自己的 Key 直连服务商，不能走代理：
+    //   · 代理会把 Authorization 换成后端 JWT（用户 Key 被删掉）；
+    //   · 后端按 BYOK 设计并不持有各家的 Key，真转发出去只会得到 404/502；
+    //   · 而且 GET /…/models 会被下面的改写规则并到 /api/ai/chat，而后端只有 POST 映射，
+    //     404 在错误分发里还会被鉴权过滤器当成匿名 → 前端拿到一个 401「密钥无效」的假象。
+    if (u.pathname.endsWith('/models')) return null;
+    // Anthropic 协议端点 …/v1/messages → 代理 /api/ai/messages；其余按 OpenAI 兼容 → /api/ai/chat
+    const path = u.pathname.endsWith('/messages') ? '/api/ai/messages' : '/api/ai/chat';
+    const headers = new Headers(init.headers ?? {});
+    const provider = headers.get('X-Upstream-Provider') ?? '';
+    // 服务端没配这家的钥匙 → 直连（用用户自己的 Key）。
+    // 硬走代理只会白撞一次 502「服务端未配置 XXX_API_KEY」，再靠调用方回退 —— 每次多一个来回。
+    if (!proxyProviders.has(provider)) return null;
+    const host = u.host;
+    headers.delete('Authorization');
+    headers.delete('x-api-key');
+    headers.delete('X-Upstream-Key-Ref');
+    headers.set('Authorization', `Bearer ${session}`);
+    headers.set('X-Upstream-Provider', provider);
+    if (provider === 'custom') {
+      headers.set('X-Upstream-Host', host);
+      const basePath = u.pathname.replace(/\/(?:chat\/completions|messages|audio\/transcriptions)\/?$/, '');
+      headers.set('X-Upstream-Base-Url', `${u.origin}${basePath}`);
+    }
+    return { url: `${proxyBaseUrl}${path}`, init: { ...init, headers } };
+  } catch {
+    return null;
+  }
 }

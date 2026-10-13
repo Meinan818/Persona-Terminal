@@ -34,7 +34,9 @@ import {
   RELAY_CAPACITY_HINT,
   getProviderConfig,
   type ApiProvider, type ApiProtocol, DEFAULT_PROVIDER, cleanApiKey } from '@/utils/aiProviders';
-import { aiFetch, isNativeHost, syncNativeHosts } from '@/utils/aiTransport';
+import { aiFetch, isNativeHost, syncNativeHosts, syncAiProxy, syncProxyProviders } from '@/utils/aiTransport';
+import { fetchAiCapabilities, getApiBaseUrl } from '@/services/velvetApi';
+import { hasBackendSession } from '@/services/sessionSource';
 import { effortFixFromMessage, isEnableThinkingMessage, isLegacyThinkingMessage, isUnsupportedTemperatureMessage, quirksFor, rememberQuirk, thinkingSuffixBase } from '@/utils/aiQuirks';
 import { anthropicEndpoint, anthropicHeaders, buildAnthropicBody, mapAnthropicStreamEvent, parseAnthropicResponse } from '@/utils/aiAnthropic';
 import { hostOf as diagHostOf, recordAIDiag } from '@/utils/aiDiagnostics';
@@ -130,6 +132,8 @@ export interface ChatOptions {
   relaySafe?: boolean;
   /** 内部：5xx 已经自动隔一下重试过一次（第 14 批） */
   retried5xx?: boolean;
+  /** 代理 502 后已尝试直连回退（防循环） */
+  retriedDirectFallback?: boolean;
 }
 
 /**
@@ -189,12 +193,40 @@ const THINKING_ALLOWANCE = 65_536;
 /** 非官方地址（中转站）的思维链余量：它们多按模型上限直接 400，64K 只会撞回来；12K 是用户定的口径 */
 const RELAY_THINKING_ALLOWANCE = 12_000;
 
+/** 是否已经拉到「服务端配了哪几家钥匙」。只在成功时置位，失败允许下次重试 */
+let capabilitiesLoaded = false;
+
+/**
+ * 让 aiTransport 知道服务端手上到底有哪几家的钥匙。
+ *
+ * 不这么做的代价：登录后所有 AI 请求都会先发给代理，而服务器按 BYOK 设计并不持有各家 Key，
+ * 于是每次都要先撞一次 502「服务端未配置 XXX_API_KEY」再回退直连——白跑一个来回。
+ * 不阻塞调用方：还没拿到清单时按「没配」处理（直连），拉到之后自然就准了。
+ */
+async function ensureAiCapabilities(): Promise<void> {
+  if (capabilitiesLoaded || !hasBackendSession()) return;
+  capabilitiesLoaded = true;
+  try {
+    const capabilities = await fetchAiCapabilities();
+    syncProxyProviders(capabilities.providers ?? []);
+  } catch {
+    capabilitiesLoaded = false;   // 网络抖动 / 会话刚失效 → 下次解析配置时再试
+  }
+}
+
+/** 解析 AI 配置时统一同步：走不走代理 + 服务端手上有哪些钥匙 */
+function syncAiRouting(): void {
+  syncAiProxy(hasBackendSession(), getApiBaseUrl());
+  void ensureAiCapabilities();
+}
+
 /**
  * 从 Settings 解析运行时 AI 配置；未配置 API key 时返回 null。
  * 取代散落在 battleAI / activityAI 等处各写一遍的 getAIConfig。
  */
 export function getAIConfig(settings: Settings): AIConfig | null {
   syncNativeHosts(settings.aiNativeHosts);
+  syncAiRouting();
   const apiKey = cleanApiKey(settings.summaryApiKey).key;
   if (!apiKey) return null;
   const { baseUrl, model } = resolveProvider(
@@ -263,6 +295,7 @@ function applyModelOverride(
   strict = false,
 ): AIConfig | null {
   syncNativeHosts(settings.aiNativeHosts);
+  syncAiRouting();
   const activeProvider = settings.summaryApiProvider ?? DEFAULT_PROVIDER;
   if (pv && pv !== activeProvider) {
     const prof = settings.aiProfiles?.[pv];
@@ -289,6 +322,7 @@ function applyModelOverride(
  */
 export function fallbackAIConfig(settings: Settings): AIConfig {
   syncNativeHosts(settings.aiNativeHosts);
+  syncAiRouting();
   return {
     ...resolveProvider(settings.summaryApiProvider, settings.summaryApiBaseUrl, settings.summaryModel),
     apiKey: cleanApiKey(settings.summaryApiKey).key,
@@ -432,10 +466,11 @@ async function postChat(cfg: AIConfig, body: string, signal: AbortSignal, kind: 
   const t0 = Date.now();
   const diag = { kind, tier: cfg.tier, provider: cfg.provider, host: diagHostOf(cfg.baseUrl), model: cfg.model, native: isNativeHost(cfg.baseUrl) };
   let resp: Response;
+  const providerHeader = { 'X-Upstream-Provider': cfg.provider ?? 'custom' } as Record<string, string>;
   try {
     resp = isAnthropic(cfg)
-      ? await aiFetch(anthropicEndpoint(cfg.baseUrl, 'messages'), { method: 'POST', headers: anthropicHeaders(cfg.apiKey, !!accept), body, signal })
-      : await aiFetch(`${cfg.baseUrl}/chat/completions`, { method: 'POST', headers: authHeaders(cfg, accept), body, signal });
+      ? await aiFetch(anthropicEndpoint(cfg.baseUrl, 'messages'), { method: 'POST', headers: { ...anthropicHeaders(cfg.apiKey, !!accept), ...providerHeader }, body, signal })
+      : await aiFetch(`${cfg.baseUrl}/chat/completions`, { method: 'POST', headers: { ...authHeaders(cfg, accept), ...providerHeader }, body, signal });
   } catch (e) {
     recordAIDiag({ ...diag, ok: false, status: 0, ms: Date.now() - t0, err: e instanceof Error ? (e.name === 'AbortError' ? '超时或取消' : e.message) : String(e) });
     throw e;
@@ -717,6 +752,15 @@ export async function chatComplete(
     if (isUnsupportedEffortError(e) && !opts.noReasoningEffort) {
       return await chatComplete(cfg, messages, { ...opts, noReasoningEffort: true });
     }
+    // ③' 代理 502（服务端没配该家钥匙 / 代理不可达）→ 自动回退直连服务商（用户 Key 仍在本地）
+    if (e instanceof HttpStatusError && e.status === 502 && !opts.retriedDirectFallback) {
+      syncAiProxy(false, '');
+      try {
+        return await chatComplete(cfg, messages, { ...opts, retriedDirectFallback: true });
+      } finally {
+        syncAiProxy(hasBackendSession(), getApiBaseUrl());
+      }
+    }
     // ④ 5xx（一个字都没收到）：隔一下再试一次——中转站临时没资源 / 网关抖一下常常第二发就好
     if (!opts.retried5xx && isRetryable5xx(e)) {
       await sleepAbortable(RETRY_5XX_DELAY_MS, opts.signal);
@@ -851,11 +895,19 @@ export async function* chatStream(
   let relaySafe = !!opts.relaySafe;
   let relaySafeTried = false;
   let retried5xx = !!opts.retried5xx;
+  /**
+   * 代理 502（服务端没配这家钥匙 / 代理不可达）→ 本次调用改用直连。
+   * 非流式的 chatComplete 一直有这条回退，流式这条当初漏了：塔罗、谏言、年度总结这类走流式的功能
+   * 会把 502 原样甩给用户（2026-10-14 用户实测「塔罗 AI 不能用：服务端未配置 DEEPSEEK_API_KEY」）。
+   */
+  let proxyless = false;
   let last: StreamOutcome = { produced: false, sawReasoning: false, finishReason: '' };
   /** 正常收完才置 true；调用方提前 break（generator.return）或中途抛错时仍是 false → finally 里掐断底层请求 */
   let completed = false;
   try {
     for (let attempt = 0; attempt < 3; attempt++) {
+      // 已判定代理不可用：本次调用的后续尝试固定直连（函数收尾时在 finally 里恢复）
+      if (proxyless) syncAiProxy(false, '');
       const extra: Record<string, unknown> = {};
       // 第三发关思考：thinking 字段只有官方 DeepSeek 认；走过中转站保险的别再加回来（第 14 批：以前保险去掉了它，这里又塞回去）
       if (attempt === 2 && cfg.provider === 'deepseek' && !relaySafe && !quirksFor(cfg.baseUrl, cfg.model).relaySafe && isOfficialHost(cfg.baseUrl)) extra.thinking = { type: 'disabled' };
@@ -888,6 +940,8 @@ export async function* chatStream(
         if (!relaySafe && !quirks.relaySafe && isHttp400(e) && !isModerationError(e) && !isOfficialHost(cfg.baseUrl)) { relaySafe = true; relaySafeTried = !isOverBudgetError(e); attempt--; continue; }
         if (budgetStep < 2 && isOverBudgetError(e)) { budgetStep++; attempt--; continue; }
         if (!noEffort && isUnsupportedEffortError(e)) { noEffort = true; attempt--; continue; }
+        // 代理 502 → 关代理、用本机 Key 直连重发（与 chatComplete 的同名回退对齐）
+        if (e instanceof HttpStatusError && e.status === 502 && !proxyless) { proxyless = true; attempt--; continue; }
         // 5xx 也是在发出去时就被拒（一个字节都没流过来）：隔一下再试一次
         if (!retried5xx && isRetryable5xx(e)) { retried5xx = true; await sleepAbortable(RETRY_5XX_DELAY_MS, ab.signal); attempt--; continue; }
         throw e;
@@ -912,6 +966,7 @@ export async function* chatStream(
   } catch (e) {
     rethrowAbortAware(e, ab, opts);
   } finally {
+    if (proxyless) syncAiProxy(hasBackendSession(), getApiBaseUrl());
     ab.cleanup();
     /**
      * 调用方提前退出（拟真流被用户打断 / 组件卸载 break 掉 for-await）时，for-await 会调

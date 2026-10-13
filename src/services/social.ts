@@ -8,7 +8,7 @@
  *  - 用户手动"刷新"时
  */
 
-import { pb, getUserId } from './pocketbase';
+import { getUserId, isAuthenticated } from './velvetApi';
 import { listFriendships, expireOutdatedPending } from './friends';
 import { listNotifications, markNotificationRead } from './notifications';
 import { listTodayPrayers } from './prayers';
@@ -26,6 +26,7 @@ import { useAppStore } from '@/store';
 import { getOnlineCardFace, clearOnlineCardFace } from './onlineCardFace';
 import { syncPacts } from './pactSync';
 import { syncOrgs } from './orgSync';
+import { flushCoopEvents } from './coopEvents';
 import { interpretLockedArcana, type ConfidantMatchResult } from '@/utils/confidantAI';
 import type { CoopBond, CoopShadow, Friendship, NotificationEntry } from '@/types';
 
@@ -67,7 +68,9 @@ export const loadSocial = (options: { force?: boolean } = {}): Promise<void> => 
 };
 
 const loadSocialOnce = async (options: { force?: boolean }): Promise<void> => {
-  if (!pb || !pb.authStore.isValid) return;
+  // 登录判据跟随「当前数据源」：自研后端登录（velvet.jwt 在）时 pb.authStore 恒空，
+  // 用 isAuthenticated() 统一口径，否则社交页在自研模式下一条数据都加载不出来。
+  if (!isAuthenticated()) return;
 
   const store = useCloudSocialStore.getState();
   if (!options.force && store.lastLoadedAt) {
@@ -78,9 +81,15 @@ const loadSocialOnce = async (options: { force?: boolean }): Promise<void> => {
   store.setLoading(true);
   store.setLastError(null);
   try {
+    await flushCoopEvents().catch(() => { /* 持久待发送队列保留，社交读取继续 */ });
     const [friendships, notifications, todayPrayers, coopBonds, rawShadows] = await Promise.all([
       listFriendships(),
-      listNotifications(),
+      // 通知中心尚未迁移到自研后端（第二阶段做）：自研登录态下它会抛「未登录」，
+      // 若任由它冒泡会把整条加载打挂、连好友列表都拿不到。降级为空列表，不阻断其它数据。
+      listNotifications().catch(err => {
+        console.warn('[velvet-social] notifications unavailable, degrade to empty', err);
+        return [] as NotificationEntry[];
+      }),
       listTodayPrayers(),
       listCoopBonds(),
       listCoopShadows(),

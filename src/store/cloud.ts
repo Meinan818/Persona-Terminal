@@ -1,15 +1,20 @@
 import { create } from 'zustand';
-import type { AuthRecord } from 'pocketbase';
-import { cloudEnabled, pb, getAuthRecord } from '@/services/pocketbase';
+import { cloudEnabled, getAuthRecord, onAuthChange, type VelvetRecord } from '@/services/velvetApi';
 import type { SyncDiff } from '@/services/sync';
+
+/**
+ * 云端用户记录。自研后端把档案扩展字段（nickname / total_lv / attribute_* …）与基础字段
+ * 放在同一层返回，所以这里在 VelvetRecord 之外允许未声明的扩展字段。
+ */
+export type CloudUser = VelvetRecord & Record<string, unknown>;
 
 export type SyncStatus = 'idle' | 'syncing' | 'success' | 'error' | 'offline';
 
 interface CloudState {
-  /** 是否配置了云端后端地址（.env.local 中的 VITE_PB_URL） */
+  /** 是否配置了云端后端地址（.env.local 中的 VITE_API_URL） */
   cloudEnabled: boolean;
   /** 当前登录的云端用户，null = 未登录 */
-  cloudUser: AuthRecord | null;
+  cloudUser: CloudUser | null;
   /** 最近一次同步的状态 */
   syncStatus: SyncStatus;
   /** 最近一次同步完成的时间，null = 从未同步 */
@@ -28,7 +33,7 @@ interface CloudState {
   setMergeOpen: (b: boolean) => void;
   openMerge: (hint: string[] | null) => void;
 
-  setCloudUser: (u: AuthRecord | null) => void;
+  setCloudUser: (u: CloudUser | null) => void;
   setSyncStatus: (s: SyncStatus) => void;
   setLastSyncAt: (d: Date | null) => void;
   setLastError: (e: string | null) => void;
@@ -36,16 +41,13 @@ interface CloudState {
   setLastSyncDirection: (d: 'push' | 'pull' | null) => void;
   setDiffWarning: (d: SyncDiff | null) => void;
 
-  /**
-   * 订阅 PocketBase authStore 变化，自动同步到本 store
-   * 应用启动时调用一次即可。返回取消订阅函数。
-   */
+  /** 订阅登录状态变化，自动同步到本 store。应用启动时调用一次即可，返回取消订阅函数 */
   initAuthListener: () => () => void;
 }
 
 export const useCloudStore = create<CloudState>(set => ({
   cloudEnabled,
-  cloudUser: getAuthRecord(),
+  cloudUser: getAuthRecord() as CloudUser | null,
   syncStatus: 'idle',
   lastSyncAt: null,
   lastError: null,
@@ -65,10 +67,14 @@ export const useCloudStore = create<CloudState>(set => ({
   setLastSyncDirection: lastSyncDirection => set({ lastSyncDirection }),
   setDiffWarning: diffWarning => set({ diffWarning }),
 
+  /**
+   * 订阅登录状态变化，自动同步到本 store。应用启动时调用一次即可，返回取消订阅函数。
+   * 直接订阅 velvetApi 的登录态（登录 / 登出 / 换号 / 跨标签页）。
+   */
   initAuthListener: () => {
-    if (!cloudEnabled || !pb) return () => {};
-    return pb.authStore.onChange((_token, record) => {
-      set({ cloudUser: record ?? null });
+    if (!cloudEnabled) return () => {};
+    return onAuthChange(record => {
+      set({ cloudUser: (record as CloudUser | null) ?? null, syncStatus: 'idle', lastError: null });
     });
   },
 }));

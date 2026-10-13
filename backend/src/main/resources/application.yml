@@ -1,0 +1,49 @@
+server:
+  port: 8080
+
+spring:
+  config:
+    import: optional:classpath:application-otp.yml
+  servlet:
+    multipart:
+      max-file-size: 2MB        # 头像上传上限（前端压到 ~80KB，留余量）
+      max-request-size: 4MB
+  datasource:
+    url: jdbc:mysql://localhost:3306/persona_terminal?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai
+    username: root
+    password: ${MYSQL_PASSWORD:root}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  jackson:
+    default-property-inclusion: non_null
+  # 数据库迁移（Flyway）：把「手工执行 schema.sql」改成版本化脚本，改动可追溯
+  # baseline-on-migrate + baseline-version=0：本机库在引入 Flyway 前已有表，
+  #   让它把现状当基线（0）后再执行 V1（V1 用 IF NOT EXISTS，对已有库是空操作）；
+  #   全新空库则直接从 V1 建起。两种情形都以「V1 已记录」结束。
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    baseline-version: 0
+    clean-disabled: true          # 禁止 flyway clean（防误删全库）
+    locations: classpath:db/migration
+
+# 上传文件存储根目录（头像存 {app.upload-dir}/avatars/{userId}.{ext}）
+app:
+  upload-dir: ${APP_UPLOAD_DIR:uploads}
+  # 重置密码邮件里的链接前缀（部署时设成正式域名，如 https://maskaria.example.com）
+  public-url: ${APP_PUBLIC_URL:http://localhost:5173}
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    db-config:
+      id-type: assign_id
+
+# JWT 配置（生产环境用环境变量覆盖）
+jwt:
+  secret: ${JWT_SECRET:velvet-dev-secret-key-change-me-in-production-0123456789abcdef}
+  expire-hours: 72
+
+logging:
+  level:
+    com.meinan818.personaterminal: debug

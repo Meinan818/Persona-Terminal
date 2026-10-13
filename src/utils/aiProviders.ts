@@ -3,7 +3,7 @@
  * 统一管理各 provider 的 baseUrl / defaultModel，避免分散在 store / Settings / SummaryModal 中重复
  * 所有 provider 均走 OpenAI 兼容的 /chat/completions 端点
  */
-import { aiFetch, hostOfUrl, nativeTransportAvailable } from '@/utils/aiTransport';
+import { aiFetch, aiProxyEnabled, hostOfUrl, nativeTransportAvailable, withoutAiProxy } from '@/utils/aiTransport';
 import { recordAIDiag } from '@/utils/aiDiagnostics';
 import { effortFixFromMessage, isEnableThinkingMessage, isLegacyThinkingMessage, isUnsupportedTemperatureMessage, quirksFor, rememberQuirk, thinkingSuffixBase } from '@/utils/aiQuirks';
 import { anthropicEndpoint, anthropicHeaders } from '@/utils/aiAnthropic';
@@ -493,7 +493,13 @@ export async function testAIConnection(opts: {
     try {
       const resp = await aiFetch(anthropic ? anthropicEndpoint(base, 'messages') : `${base}/chat/completions`, {
         method: 'POST',
-        headers: anthropic ? anthropicHeaders(apiKey) : { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+        headers: {
+          ...(anthropic ? anthropicHeaders(apiKey) : { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` }),
+          // 走自研后端代理时，后端靠这个头选服务商的 Key（aiTransport.rewriteForProxy 原样透传）。
+          // 漏了它会 400「缺少 X-Upstream-Provider 头」——真实对话一直带着，所以会出现
+          // 「聊天能用、测试连接却失败」这种看起来自相矛盾的现象。
+          'X-Upstream-Provider': opts.provider,
+        },
         body: buildBody(),
         signal: controller.signal,
       }, viaNative);
@@ -502,6 +508,12 @@ export async function testAIConnection(opts: {
       if (!resp.ok) {
         const text = await resp.text().catch(() => '');
         const detail = extractProviderErrorMessage(text).slice(0, 240).trim();
+        // 代理不可用（服务端没配这家钥匙）→ 关掉代理，用本机保存的 Key 直连重试一次。
+        // 聊天路径一直有这个回退（见 aiClient 的「代理 502 → 直连」注释），测试连接当初漏了，
+        // 于是出现「聊天明明能用、测试连接却报 502 服务端未配置环境变量」这种自相矛盾的现象。
+        if (resp.status === 502 && detail.includes('服务端未配置') && aiProxyEnabled()) {
+          return withoutAiProxy(() => attempt(base, forceNative));
+        }
         const hint = moderationHint(detail) || relayHint(detail, isOfficialHost(base)) || getHttpStatusHint(resp.status, opts.provider);
         const prefix = hint ? `${hint} (HTTP ${resp.status})` : `HTTP ${resp.status}`;
         const error = detail ? `${prefix}: ${detail}` : `${prefix}: ${resp.statusText}`;
@@ -681,7 +693,11 @@ export async function fetchAvailableModels(opts: {
     const anthropic = (opts.protocol ?? (opts.provider === 'custom' ? customProtocol() : 'openai')) === 'anthropic';
     if (!baseUrl) { clearTimeout(timeout); return { ok: false, error: '自定义服务商要先填 API 地址' }; }
     const resp = await aiFetch(anthropic ? anthropicEndpoint(baseUrl, 'models') : `${baseUrl}/models`, {
-      headers: anthropic ? anthropicHeaders(apiKey) : { Authorization: `Bearer ${apiKey}` },
+      headers: {
+        ...(anthropic ? anthropicHeaders(apiKey) : { Authorization: `Bearer ${apiKey}` }),
+        // 同上：代理侧按这个头选服务商的 Key，少了它拉模型列表会被 400 挡掉
+        'X-Upstream-Provider': opts.provider,
+      },
       signal: controller.signal,
     }, viaNative);
     clearTimeout(timeout);
@@ -690,6 +706,10 @@ export async function fetchAvailableModels(opts: {
     if (!resp.ok) {
       const body = await resp.text().catch(() => '');
       const detail = extractProviderErrorMessage(body).slice(0, 200).trim();
+      // 同上：代理没配这家钥匙时改走直连，别让拉模型列表也倒在同一个坑里
+      if (resp.status === 502 && detail.includes('服务端未配置') && aiProxyEnabled()) {
+        return withoutAiProxy(() => fetchAvailableModels(opts));
+      }
       const hint = resp.status === 404
         ? '该地址不支持 /models 列表接口，请手动填写模型名'
         : (relayHint(detail, isOfficialHost(baseUrl)) || getHttpStatusHint(resp.status, opts.provider));

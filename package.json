@@ -8,6 +8,8 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
     "cap:sync": "cap sync",
     "cap:open:android": "cap open android",
     "cap:run:android": "cap run android",
@@ -29,7 +31,6 @@
     "embla-carousel-react": "^8.6.0",
     "gsap": "^3.15.0",
     "motion": "^12.40.0",
-    "pocketbase": "^0.26.8",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "recharts": "^2.10.3",
@@ -45,11 +46,13 @@
     "@vitejs/plugin-react": "^4.2.1",
     "autoprefixer": "^10.4.16",
     "eruda": "^3.4.3",
+    "jsdom": "^29.1.1",
     "postcss": "^8.4.32",
     "tailwindcss": "^3.3.6",
     "tweakpane": "^4.0.5",
     "typescript": "^5.3.3",
     "vite": "^5.0.8",
-    "vite-plugin-pwa": "^0.17.4"
+    "vite-plugin-pwa": "^0.17.4",
+    "vitest": "^1.6.1"
   }
 }

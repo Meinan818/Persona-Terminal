@@ -2,10 +2,19 @@ import { CapacitorConfig } from '@capacitor/cli';
 
 const config: CapacitorConfig = {
   appId: 'com.meinan818.personaterminal',
-  appName: '面具终端',
+  appName: 'MASKARIA',
   webDir: 'dist',
   server: {
     androidScheme: 'https'
+  },
+  android: {
+    /**
+     * WebView 里的页面 origin 是 https://localhost，而自建后端目前是 http://<公网IP>，
+     * WebView 默认会把这种请求当成「混合内容」拦掉——打开就是这个开关放开。
+     * （系统层面的明文限制由 AndroidManifest 的 android:usesCleartextTraffic 放开。）
+     * 等后端挂上 HTTPS 域名后可以关掉。
+     */
+    allowMixedContent: true,
   },
   ios: {
     /**

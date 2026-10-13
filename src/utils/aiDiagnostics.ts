@@ -6,6 +6,7 @@
  * 存 localStorage（按设备，不上云、不进备份）；任何异常都吞掉——诊断不能影响正常请求。
  */
 import type { Settings } from '@/types';
+import { aiProxyEnabled, proxyProvidersSnapshot } from '@/utils/aiTransport';
 
 export type AIDiagKind = 'chat' | 'stream' | 'test' | 'models' | 'balance' | 'audio';
 
@@ -74,13 +75,16 @@ export function buildAIDiagnostics(settings: Settings, env: { version?: string; 
   const active = settings.summaryApiProvider ?? 'deepseek';
   const host = (url?: string) => (url ? hostOf(url) || url : '默认地址');
   const lines: string[] = [
-    `面具终端 AI 诊断 · ${new Date().toLocaleString('zh-CN')}`,
+    `MASKARIA AI 诊断 · ${new Date().toLocaleString('zh-CN')}`,
     `版本 ${env.version ?? '-'} · ${env.platform ?? '-'}`,
     `当前服务商：${active} · ${host(settings.summaryApiBaseUrl)} · 模型 ${settings.summaryModel || '默认'} · Key ${settings.summaryApiKey?.trim() ? '已填' : '未填'}`,
     `深思熟虑：${settings.navigatorProvider ?? '跟随'} · ${settings.navigatorModel || '跟随'}；助手：${settings.assistantProvider ?? '跟随'} · ${settings.assistantModel || '跟随'}`,
     `视觉：${settings.visionModel ? `${settings.visionProvider ?? active} · ${settings.visionModel}` : '未启用'}；听觉：${settings.audioModel ? `${settings.audioProvider ?? active} · ${settings.audioModel}` : '未启用'}`,
     `已存 Key 的服务商：${Object.entries(settings.aiProfiles ?? {}).filter(([, v]) => v?.key?.trim()).map(([k]) => k).join('、') || '无'}`,
     `走原生通道的主机：${(settings.aiNativeHosts ?? []).join('、') || '无'}`,
+    `后端代理：${aiProxyEnabled()
+      ? `已启用 · 服务端配了钥匙的服务商：${proxyProvidersSnapshot().join('、') || '无（请求都走直连）'}`
+      : '未启用（未登录 / 未配后端地址）'}`,
     '',
     `最近 ${MAX} 次请求（旧 → 新；不含内容和 Key）：`,
   ];

@@ -11,7 +11,8 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { pb } from '@/services/pocketbase';
+import * as velvetApi from '@/services/velvetApi';
+import { cloudEnabled } from '@/services/velvetApi';
 
 type Phase = 'form' | 'submitting' | 'success' | 'fatal';
 
@@ -71,11 +72,11 @@ export function ResetPasswordPage() {
 
   // Token / 环境前置校验
   useEffect(() => {
-    if (!pb) {
+    if (!cloudEnabled) {
       setPhase('fatal');
       setFatal({
         title: '云同步未启用',
-        detail: '当前构建未配置 VITE_PB_URL，重置密码需要云端支持。请联系开发者。',
+        detail: '当前构建没有配置云端地址，重置密码需要云端支持。请联系开发者。',
         showHome: true,
       });
       return;
@@ -93,7 +94,7 @@ export function ResetPasswordPage() {
   // 文档标题（这个页面生命周期短，副作用保留最小）
   useEffect(() => {
     const prev = document.title;
-    document.title = '重置密码 · 面具终端';
+    document.title = '重置密码 · MASKARIA';
     return () => { document.title = prev; };
   }, []);
 
@@ -113,13 +114,15 @@ export function ResetPasswordPage() {
 
     setPhase('submitting');
     try {
-      await pb!.collection('users').confirmPasswordReset(token, pwd, confirm);
+      // 令牌由后端签发、一次性、30 分钟有效（与登录/注册同一条链路）
+      await velvetApi.resetPassword(token, pwd);
       setPhase('success');
     } catch (err) {
       const { title, detail } = classifyError(err);
-      // 400 一类的"token 失效"属于终局错误，不让用户在同一页反复重试
+      // 令牌失效属于终局错误，不让用户在同一页反复重试。
+      // 401 是自研后端对"无效/过期令牌"的回答，400/404 是 PocketBase 时代的
       const status = (err as { status?: number })?.status;
-      if (status === 400 || status === 404) {
+      if (status === 400 || status === 401 || status === 404) {
         setPhase('fatal');
         setFatal({ title, detail, showHome: true });
       } else {
@@ -162,7 +165,7 @@ export function ResetPasswordPage() {
           <h1 className="text-xl font-bold tracking-wide">
             {phase === 'success' ? '密码已更新' : phase === 'fatal' ? (fatal?.title ?? '出错了') : '重置密码'}
           </h1>
-          <p className="mt-1 text-xs text-violet-200/60">面具终端 · Persona Terminal</p>
+          <p className="mt-1 text-xs text-violet-200/60">MASKARIA · MASKARIA</p>
         </div>
 
         {/* 主体 */}

@@ -4,7 +4,6 @@ import { AnimatePresence, motion } from 'motion/react';
 import { useAppStore, toLocalDateKey } from '@/store';
 import { useCloudStore } from '@/store/cloud';
 import { readLastSync, trySyncInBackground, resolveConflictKeepLocal, resolveConflictKeepCloud, acceptDiffKeepLocal, acceptDiffKeepCloud } from '@/services/sync';
-import { pb as pbClient } from '@/services/pocketbase';
 import { SyncStatusBadge } from '@/components/auth/SyncStatusBadge';
 import { ConflictDialog } from '@/components/auth/ConflictDialog';
 import { SyncMergeSheet } from '@/components/auth/SyncMergeSheet';
@@ -20,6 +19,7 @@ import { AchievementUnlockModal } from '@/components/AchievementUnlockModal';
 import { ACHIEVEMENT_UNLOCK_LINES } from '@/constants';
 import { SkillUnlockModal } from '@/components/SkillUnlockModal';
 import { db } from '@/db';
+import { isReloadNavigation } from '@/utils/navType';
 // 首页三个频道变体：中性/黄用这份（也是 default 路由的兜底，故静态），
 // 蓝/红各有一份 1:1 重绘稿——**一次会话只可能用到其中一份**，全静态导入等于
 // 让每个用户都下载并解析另外两套自己永远看不到的首页（v2.6.5 性能整改 C10）。
@@ -213,7 +213,10 @@ function App() {
   const uiChannel = useUiChannel();
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [showSplash, setShowSplash] = useState(true);
+  // 开屏动画只在**真正进入 App** 时放一遍；用户按 F5 / 下拉刷新不再重放。
+  // 依据浏览器 navigation type（reload / back_forward / prerender 判为"刷新"）。
+  // 惰性初始化：这个判定只该在挂载那一刻读一次，不能每次 render 重算。
+  const [showSplash, setShowSplash] = useState(() => !isReloadNavigation());
   // 启动看门狗（紧急修复 #1）：连续两次没走完 → 安全模式（轻开屏、不预热）+ 首页横幅可复制诊断
   const bootInfo = useMemo(() => getBootInfo(), []);
   const [bootNotice, setBootNotice] = useState(() => getBootInfo().safeMode);
@@ -222,8 +225,6 @@ function App() {
   const primedRef = useRef(false);
   // 记录上次打开时的日期，用于检测隔天回来
   const lastDateRef = useRef(toLocalDateKey());
-  /** 上次续期登录的时间：回前台每 6 小时最多续一次（以前只在冷启动续，App 常驻后台一两周就过期、同步悄悄空转） */
-  const lastAuthRefreshRef = useRef(Date.now());
   // Android 返回键：双击退出提示
   const [showBackToast, setShowBackToast] = useState(false);
   const lastBackPressRef = useRef(0);
@@ -337,7 +338,7 @@ function App() {
     return () => { cancelled = true; clearTimeout(kick); };
   }, [isLoading, showSplash, user]);
 
-  // 订阅云端登录状态变化（PocketBase token 刷新 / 登出）
+  // 订阅云端登录状态变化（登录 / 登出 / 换号 / 跨标签页）
   useEffect(() => {
     const unsub = useCloudStore.getState().initAuthListener();
     return unsub;
@@ -360,20 +361,6 @@ function App() {
       });
       return unsub;
     });
-  }, []);
-
-  // 启动时若已有有效 token，静默刷新一次以延长有效期（避免每次进入都要重登）
-  // 刷新失败（token 过期 / 服务端拒绝）→ 清除本地 token，用户下次再登录
-  useEffect(() => {
-    const client = pbClient;
-    if (!client || !client.authStore.isValid) return;
-    client
-      .collection('users')
-      .authRefresh()
-      .catch((err: { status?: number }) => {
-        // 只有服务端明确说 token 无效（401 / 403）才清；离线（status 0）、服务端抖（5xx）不该把人登出
-        if (err?.status === 401 || err?.status === 403) client.authStore.clear();
-      });
   }, []);
 
   // 点开通知：「成长总结写好了」直达那一份；一起进步的去首页 / 羁绊页（v2.7.0.6；仅原生平台有本地通知）
@@ -434,13 +421,6 @@ function App() {
 
     const handleVisibilityChange = async () => {
       if (document.visibilityState !== 'visible') return;
-      const client = pbClient;
-      if (client?.authStore.isValid && Date.now() - lastAuthRefreshRef.current > 6 * 3600_000) {
-        lastAuthRefreshRef.current = Date.now();
-        client.collection('users').authRefresh().catch((err: { status?: number }) => {
-          if (err?.status === 401 || err?.status === 403) client.authStore.clear();
-        });
-      }
       // 切回前台顺手刷新 social（好友 + 通知）；30 秒节流在 loadSocial 内部已做
       if (useCloudStore.getState().cloudUser) {
         import('@/services/social').then(({ loadSocial }) => {

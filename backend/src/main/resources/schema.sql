@@ -1,0 +1,13 @@
+-- ⚠ 本文件已不再作为建表来源（2026-10-13 起改用 Flyway 版本化迁移）。
+--
+-- 唯一权威的 schema 定义在：backend/src/main/resources/db/migration/
+--   例如 V1__baseline_schema.sql 就是本文件原内容迁移过去的。
+--
+-- 改表流程（丢弃「手工执行 schema.sql」的老做法）：
+--   1. 在 db/migration/ 新增 V<n>__描述.sql（n 递增），写 ALTER/CREATE 语句
+--   2. 重启后端，Flyway 自动检测并执行（未执行的版本）
+--   3. 用 `SELECT * FROM flyway_schema_history` 确认
+-- 不要直接改本文件——它不会再被执行，改了只会造成两份定义漂移。
+--
+-- 保留本文件名以兼容旧文档/脚本的引用。
+

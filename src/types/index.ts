@@ -1871,6 +1871,8 @@ export interface ConfidantEvent {
   userInput?: string;
   /** AI 给出的相处建议（仅 conversation 事件写入；展开时与 narrative 分别展示） */
   advice?: string;
+  /** 本机通知发送状态，不进入云快照；账号绑定避免换号误发。 */
+  broadcast?: { accountId: string; recipientId: string; deliveredAt?: string };
   createdAt: Date;
 }
 
@@ -2038,7 +2040,7 @@ export interface CounselArchive {
 
 // ── 在线社交 / 好友 / 通知 ─────────────────────────────────
 //
-// 这些类型完全承载在云端（PocketBase 集合），本地不存 Dexie 表，
+// 这些类型完全承载在云端（自研后端的社交 / 通知表），本地不存 Dexie 表，
 // 只在内存里保留 zustand state（useCloudSocialStore）。
 // 断网 / 对方长期离线时，对方的 profile 快照会留在 Confidant.linkedProfile 里。
 

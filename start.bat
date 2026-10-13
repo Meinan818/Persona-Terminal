@@ -14,12 +14,17 @@ if errorlevel 1 (
 )
 echo.
 
-echo [2/3] 安装依赖包...
-call npm install
-if errorlevel 1 (
-    echo 错误: 依赖安装失败
-    pause
-    exit /b 1
+echo [2/3] 检查依赖包...
+if exist node_modules\vitest (
+    echo 依赖已就绪，跳过安装（如需重装请删除 node_modules 文件夹）
+) else (
+    echo 首次运行，安装依赖包（几分钟）...
+    call npm install
+    if errorlevel 1 (
+        echo 错误: 依赖安装失败
+        pause
+        exit /b 1
+    )
 )
 echo.
 
@@ -31,5 +36,8 @@ echo 访问地址: http://localhost:5173
 echo 按 Ctrl+C 停止服务器
 echo ====================================
 echo.
+
+rem 邮箱验证码的凭据（MAIL_USERNAME / MAIL_PASSWORD）属于后端，通过环境变量传入，
+rem 不要写在本文件或任何入库文件里——见 COMPLIANCE.md 与 .gitignore
 
 call npm run dev

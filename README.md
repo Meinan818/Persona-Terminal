@@ -4,7 +4,7 @@
 
 <h1 align="center">MASKARIA · 面具庭园</h1>
 <p align="center"><em>把日子过成存档，把存档过成人样</em></p>
-<p align="center">当前 Android 正式版：<strong>v2.8.11</strong></p>
+<p align="center">当前 Android 正式版：<strong>v2.8.13</strong>（Web 已同步）</p>
 <p align="center"><sub>本仓库为公开展示快照，源码基线 v2.8.4；正式版构建与发布记录以开发仓库为准。</sub></p>
 
 <p align="center">

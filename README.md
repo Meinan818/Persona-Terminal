@@ -4,7 +4,8 @@
 
 <h1 align="center">MASKARIA · 面具庭园</h1>
 <p align="center"><em>把日子过成存档，把存档过成人样</em></p>
-<p align="center">当前 Android 正式版：<strong>v2.8.4</strong></p>
+<p align="center">当前 Android 正式版：<strong>v2.8.11</strong></p>
+<p align="center"><sub>本仓库为公开展示快照，源码基线 v2.8.4；正式版构建与发布记录以开发仓库为准。</sub></p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/React-18-61DAFB?style=flat-square&logo=react" />
@@ -249,7 +250,8 @@ npm run cap:build:android  # 打包
 
 ## 完成度
 
-前端 `npm test` **32 个测试文件 / 203 项**通过，`tsc --noEmit` 零报错；
+前端（开发仓库当前）`npm test` **44 个测试文件 / 281 项**通过，`tsc --noEmit` 零报错；
+本展示快照的源码基线为 **32 个测试文件 / 203 项**。
 后端 `mvn test` **159 项**通过（集成测试跑在独立测试库，不碰应用库）。
 数据库迁移 13 个版本，从空库到可用一键完成。
 
